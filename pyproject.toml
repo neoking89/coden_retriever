@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coden-retriever"
+version = "1.0.0"
+description = "Retriever for finding most relevant code"
+readme = "README.md"
+requires-python = ">=3.10, <3.13"
+license = {text = "MIT"}
+dependencies = [
+    "networkx>=3.0",
+    "tree-sitter>=0.23.0,<0.24",
+    "tree-sitter-languages>=1.10.0",
+    "model2vec>=0.1.0",
+    "pydantic>=2.0.0",
+    "watchdog>=4.0.0",
+    "fastmcp>=0.1.0",
+    "tiktoken>=0.5.0",
+    "tokenizers>=0.15.0",
+    "numpy",
+    "pydantic-ai-slim[mcp,openai]>=0.1.0",
+    "rich>=13.0.0",
+    "prompt_toolkit>=3.0.0",
+    "debugpy>=1.8.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+coden_retriever = ["models/embeddings/model2vec_embed_distill/*"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.0",
+    "pytest-asyncio>=1.3.0",
+    "ruff>=0.1.0",
+    "httpx>=0.27.0"
+]
+# Dynamic tools: pip install coden-retriever[dynamic-tools]
+# Then set CODEN_RETRIEVER_ENABLE_DYNAMIC_TOOLS=1
+dynamic-tools = []
+
+[project.scripts]
+coden = "coden_retriever.__main__:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

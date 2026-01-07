@@ -1,0 +1,61 @@
+services:
+  # MCP Server mode - exposes code analysis tools via HTTP
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: coden-retriever:latest
+    container_name: coden-mcp-server
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount your codebase for analysis
+      - ./workspace:/workspace:ro
+      # Persist cache for faster subsequent runs (~/.coden-retriever)
+      - coden-cache:/home/coden/.coden-retriever
+      # Persist configuration (model settings, etc.)
+      - coden-config:/home/coden/.coden-retriever
+    environment:
+      - CODEN_RETRIEVER_HOST=0.0.0.0
+      - CODEN_RETRIEVER_PORT=8000
+    # For connecting to host services (Ollama, llama-cpp-server)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Security: prevent privilege escalation
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # CLI mode - for one-off analysis commands
+  cli:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: coden-retriever:latest
+    volumes:
+      - ./workspace:/workspace:ro
+      - coden-cache:/home/coden/.coden-retriever
+      - coden-config:/home/coden/.coden-retriever
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Security: prevent privilege escalation
+    security_opt:
+      - no-new-privileges:true
+    profiles:
+      - cli
+    entrypoint: ["coden"]
+    # Override with your command, e.g.:
+    # docker compose run --rm cli /workspace --query "authentication"
+    command: ["/workspace"]
+
+volumes:
+  coden-cache:
+    name: coden-retriever-cache
+  coden-config:
+    name: coden-retriever-config
