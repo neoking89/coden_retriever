@@ -12,9 +12,9 @@ from dataclasses import dataclass
 from typing import Callable
 
 from ..cache import CachedIndices
+from ..constants import DEFAULT_MAX_PROJECTS
 from ..search import SearchEngine
 from ..watcher import FileWatcher
-from .protocol import MAX_PROJECTS_DEFAULT
 
 
 logger = logging.getLogger(__name__)
@@ -43,7 +43,7 @@ class ProjectCache:
 
     def __init__(
         self,
-        max_projects: int = MAX_PROJECTS_DEFAULT,
+        max_projects: int = DEFAULT_MAX_PROJECTS,
         on_evict: Callable[[str, CachedProject], None] | None = None,
     ):
         """Initialize the project cache.

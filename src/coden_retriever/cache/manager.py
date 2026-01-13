@@ -143,7 +143,7 @@ class CacheManager:
                 logger.warning("Cache load failed, performing full rebuild...")
                 return self._full_rebuild()
 
-        # Any changes → full rebuild (graph dependencies require complete data)
+        # Any changes -> full rebuild (graph dependencies require complete data)
         return self._incremental_update(changes, manifest)
 
     def get_changes(self) -> ChangeSet:

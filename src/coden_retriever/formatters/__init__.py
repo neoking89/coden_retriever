@@ -2,7 +2,14 @@
 
 from ..config import OutputFormat
 from .base import OutputFormatter
+from .cli_metrics import (
+    BaseCLIMetricFormatter,
+    CLIMetricFormatter,
+    SeverityTier,
+)
+from .clone_formatter import CloneFormatter
 from .directory_tree_formatter import generate_shallow_tree
+from .propagation_formatter import PropagationFormatter
 from .json_formatter import JSONFormatter
 from .markdown_formatter import MarkdownFormatter
 from .tree_formatter import TreeFormatter
@@ -28,4 +35,9 @@ __all__ = [
     "JSONFormatter",
     "get_formatter",
     "generate_shallow_tree",
+    "CLIMetricFormatter",
+    "BaseCLIMetricFormatter",
+    "SeverityTier",
+    "CloneFormatter",
+    "PropagationFormatter",
 ]

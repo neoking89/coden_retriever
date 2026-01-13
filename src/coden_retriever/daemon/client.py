@@ -12,12 +12,19 @@ import sys
 import time
 from pathlib import Path
 
+from ..constants import (
+    DEFAULT_CLIENT_TIMEOUT,
+    DEFAULT_DAEMON_HOST,
+    DEFAULT_DAEMON_PORT,
+    DEFAULT_HEAVY_ANALYSIS_TIMEOUT,
+    DEFAULT_DAEMON_TIMEOUT,
+)
 from .protocol import (
-    CLIENT_TIMEOUT,
-    DEFAULT_HOST,
-    DEFAULT_PORT,
     MESSAGE_DELIMITER,
-    SOCKET_TIMEOUT,
+    CloneDetectionParams,
+    FlagClearParams,
+    FlagParams,
+    PropagationCostParams,
     GraphAnalysisParams,
     Request,
     Response,
@@ -25,7 +32,8 @@ from .protocol import (
     StacktraceParams,
     TraceDependencyParams,
 )
-from .server import get_log_file, is_daemon_running
+from .server import get_log_file, is_daemon_running, get_pid_file
+
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +61,9 @@ class DaemonClient:
 
     def __init__(
         self,
-        host: str = DEFAULT_HOST,
-        port: int = DEFAULT_PORT,
-        timeout: float = SOCKET_TIMEOUT,
+        host: str = DEFAULT_DAEMON_HOST,
+        port: int = DEFAULT_DAEMON_PORT,
+        timeout: float = DEFAULT_DAEMON_TIMEOUT,
     ):
         self.host = host
         self.port = port
@@ -212,13 +220,34 @@ class DaemonClient:
         response = self._send_request("debug_stacktrace", params.to_dict())
         return self._validate_result(response.result)
 
+    def detect_clones(self, params: CloneDetectionParams) -> dict:
+        """Detect code clones using in-memory indices."""
+        response = self._send_request("detect_clones", params.to_dict())
+        return self._validate_result(response.result)
+
+    def propagation_cost(self, params: PropagationCostParams) -> dict:
+        """Compute propagation cost using in-memory indices."""
+        response = self._send_request("propagation_cost", params.to_dict())
+        return self._validate_result(response.result)
+
+    def flag_code(self, params: FlagParams) -> dict:
+        """Flag code objects with [CODEN] comments based on analysis."""
+        response = self._send_request("flag_code", params.to_dict())
+        return self._validate_result(response.result)
+
+    def flag_clear(self, params: FlagClearParams) -> dict:
+        """Remove all [CODEN] comments from source files."""
+        response = self._send_request("flag_clear", params.to_dict())
+        return self._validate_result(response.result)
+
 
 def _try_daemon_request(
     client_method: str,
     params,
-    host: str = DEFAULT_HOST,
-    port: int = DEFAULT_PORT,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
     auto_start: bool = True,
+    timeout: float = DEFAULT_CLIENT_TIMEOUT,
 ) -> dict | None:
     """
     Generic helper to execute a daemon request with auto-start support.
@@ -235,6 +264,7 @@ def _try_daemon_request(
         host: Daemon host
         port: Daemon port
         auto_start: Auto-start daemon if not running (default: True)
+        timeout: Request timeout in seconds (default: DEFAULT_CLIENT_TIMEOUT)
 
     Returns:
         Result dict, or None if daemon unavailable and couldn't start
@@ -249,7 +279,7 @@ def _try_daemon_request(
         except DaemonConnectionError:
             return None
 
-    client = DaemonClient(host=host, port=port, timeout=CLIENT_TIMEOUT)
+    client = DaemonClient(host=host, port=port, timeout=timeout)
 
     try:
         method = getattr(client, client_method)
@@ -260,8 +290,8 @@ def _try_daemon_request(
 
 def try_daemon_search(
     params: SearchParams,
-    host: str = DEFAULT_HOST,
-    port: int = DEFAULT_PORT,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
     auto_start: bool = True,
 ) -> dict | None:
     """
@@ -282,8 +312,8 @@ def try_daemon_search(
 
 def try_daemon_hotspots(
     params: GraphAnalysisParams,
-    host: str = DEFAULT_HOST,
-    port: int = DEFAULT_PORT,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
     auto_start: bool = True,
 ) -> dict | None:
     """
@@ -301,14 +331,175 @@ def try_daemon_hotspots(
     return _try_daemon_request("coupling_hotspots", params, host, port, auto_start)
 
 
-def stop_daemon(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> bool:
+def try_daemon_clones(
+    params: CloneDetectionParams,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
+    auto_start: bool = True,
+    timeout: float | None = None,
+) -> dict | None:
+    """
+    Try to detect clones via daemon, auto-starting if needed.
+
+    Args:
+        params: CloneDetectionParams with source_dir and options
+        host: Daemon host
+        port: Daemon port
+        auto_start: Auto-start daemon if not running (default: True)
+        timeout: Request timeout (default: uses config daemon_timeout or 60s)
+
+    Returns:
+        Clone detection result dict, or None if daemon unavailable
+    """
+    # Clone detection is compute-intensive, use longer timeout
+    # Default to config daemon_timeout, fallback to heavy analysis timeout
+    effective_timeout = timeout if timeout is not None else DEFAULT_HEAVY_ANALYSIS_TIMEOUT
+    return _try_daemon_request(
+        "detect_clones", params, host, port, auto_start,
+        timeout=effective_timeout
+    )
+
+
+def try_daemon_propagation_cost(
+    params: PropagationCostParams,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
+    auto_start: bool = True,
+) -> dict | None:
+    """
+    Try to compute propagation cost via daemon, auto-starting if needed.
+
+    Args:
+        params: PropagationCostParams with source_dir and options
+        host: Daemon host
+        port: Daemon port
+        auto_start: Auto-start daemon if not running (default: True)
+
+    Returns:
+        Propagation cost result dict, or None if daemon unavailable
+    """
+    # Propagation cost analysis can be heavy on large codebases
+    return _try_daemon_request(
+        "propagation_cost", params, host, port, auto_start,
+        timeout=DEFAULT_HEAVY_ANALYSIS_TIMEOUT
+    )
+
+
+def try_daemon_graph_analysis(
+    method: str,
+    params: GraphAnalysisParams,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
+    auto_start: bool = True,
+) -> dict | None:
+    """
+    Try to perform graph analysis via daemon, auto-starting if needed.
+
+    Args:
+        method: One of "change_impact_radius", "coupling_hotspots", "architectural_bottlenecks"
+        params: GraphAnalysisParams with source_dir and options
+        host: Daemon host
+        port: Daemon port
+        auto_start: Auto-start daemon if not running (default: True)
+
+    Returns:
+        Graph analysis result dict, or None if daemon unavailable
+    """
+    return _try_daemon_request(method, params, host, port, auto_start)
+
+
+def try_daemon_stacktrace(
+    params: StacktraceParams,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
+    auto_start: bool = True,
+) -> dict | None:
+    """
+    Try to debug stacktrace via daemon, auto-starting if needed.
+
+    Args:
+        params: StacktraceParams with stacktrace and source_dir
+        host: Daemon host
+        port: Daemon port
+        auto_start: Auto-start daemon if not running (default: True)
+
+    Returns:
+        Stacktrace analysis result dict, or None if daemon unavailable
+    """
+    return _try_daemon_request("debug_stacktrace", params, host, port, auto_start)
+
+
+def try_daemon_trace_dependency(
+    params: TraceDependencyParams,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
+    auto_start: bool = True,
+) -> dict | None:
+    """
+    Try to trace dependencies via daemon, auto-starting if needed.
+
+    Args:
+        params: TraceDependencyParams with identifier and source_dir
+        host: Daemon host
+        port: Daemon port
+        auto_start: Auto-start daemon if not running (default: True)
+
+    Returns:
+        Dependency trace result dict, or None if daemon unavailable
+    """
+    return _try_daemon_request("trace_dependency", params, host, port, auto_start)
+
+
+def try_daemon_flag(
+    params: FlagParams,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
+    auto_start: bool = True,
+) -> dict | None:
+    """
+    Try to flag code via daemon, auto-starting if needed.
+
+    Args:
+        params: FlagParams with source_dir and flag options
+        host: Daemon host
+        port: Daemon port
+        auto_start: Auto-start daemon if not running (default: True)
+
+    Returns:
+        Flag result dict, or None if daemon unavailable
+    """
+    return _try_daemon_request("flag_code", params, host, port, auto_start)
+
+
+def try_daemon_flag_clear(
+    params: FlagClearParams,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
+    auto_start: bool = True,
+) -> dict | None:
+    """
+    Try to clear flags via daemon, auto-starting if needed.
+
+    Args:
+        params: FlagClearParams with source_dir
+        host: Daemon host
+        port: Daemon port
+        auto_start: Auto-start daemon if not running (default: True)
+
+    Returns:
+        Flag clear result dict, or None if daemon unavailable
+    """
+    return _try_daemon_request("flag_clear", params, host, port, auto_start)
+
+
+def stop_daemon(host: str = DEFAULT_DAEMON_HOST, port: int = DEFAULT_DAEMON_PORT) -> bool:
     """
     Stop the daemon server.
 
     Returns:
         True if successfully stopped, False otherwise.
     """
-    client = DaemonClient(host=host, port=port, timeout=CLIENT_TIMEOUT)
+    client = DaemonClient(host=host, port=port, timeout=DEFAULT_CLIENT_TIMEOUT)
 
     try:
         client.shutdown()
@@ -324,19 +515,45 @@ def stop_daemon(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> bool:
         return False
 
 
-def _kill_daemon_process(pid: int) -> bool:
-    """Kill daemon process by PID (platform-specific)."""
+def _kill_daemon_process(pid: int, force: bool = False) -> bool:
+    """
+    Kill daemon process by PID (platform-specific).
+
+    Args:
+        pid: Process ID to kill
+        force: If True, use SIGKILL (Unix) for immediate termination.
+               On Windows, taskkill /F is always used regardless of this flag.
+
+    Returns:
+        True if kill signal was sent successfully, False otherwise
+    """
     try:
         if sys.platform == "win32":
-            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+            # Windows: taskkill /F is always a force kill
+            result = subprocess.run(
+                ["taskkill", "/F", "/PID", str(pid)],
+                capture_output=True, text=True
+            )
+            success = result.returncode == 0
         else:
-            os.kill(pid, signal.SIGTERM)
-        return True
-    except Exception:
+            # Unix: SIGKILL for force, SIGTERM for graceful
+            sig = signal.SIGKILL if force else signal.SIGTERM
+            os.kill(pid, sig)
+            success = True
+
+        # Only clean up PID file if kill succeeded
+        if success:
+            pid_file = get_pid_file()
+            if pid_file.exists():
+                pid_file.unlink()
+
+        return success
+
+    except (ProcessLookupError, PermissionError, OSError):
         return False
 
 
-def get_daemon_status(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> dict | None:
+def get_daemon_status(host: str = DEFAULT_DAEMON_HOST, port: int = DEFAULT_DAEMON_PORT) -> dict | None:
     """
     Get daemon status.
 
@@ -353,6 +570,7 @@ def get_daemon_status(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> dic
 
 DAEMON_START_TIMEOUT = 10.0
 DAEMON_START_POLL_INTERVAL = 0.1
+PORT_RELEASE_WAIT = 0.5  # Time for OS to release socket after process termination
 
 
 def _spawn_daemon_process(
@@ -433,8 +651,8 @@ def _spawn_daemon_process(
 
 
 def start_daemon_async(
-    host: str = DEFAULT_HOST,
-    port: int = DEFAULT_PORT,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
     max_projects: int = 5,
     enable_watch: bool = True,
 ) -> bool:
@@ -465,8 +683,8 @@ def start_daemon_async(
 
 
 def start_daemon_silent(
-    host: str = DEFAULT_HOST,
-    port: int = DEFAULT_PORT,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
     max_projects: int = 5,
     enable_watch: bool = True,
 ) -> bool:
@@ -530,12 +748,15 @@ def _wait_for_daemon(
 
 
 def ensure_daemon_running(
-    host: str = DEFAULT_HOST,
-    port: int = DEFAULT_PORT,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
     auto_start: bool = True,
 ) -> bool:
     """
     Ensure the daemon is running, starting it silently if needed.
+
+    Also detects and recovers from zombie daemons (process exists but
+    not responding).
 
     Args:
         host: Daemon host
@@ -553,7 +774,27 @@ def ensure_daemon_running(
     except DaemonConnectionError:
         pass
 
-    # Not running - start if allowed
+    # Ping failed - check if this is a zombie (process exists but not responding)
+    running, pid = is_daemon_running()
+
+    if running and pid:
+        # ZOMBIE DETECTED: Process exists but doesn't respond to ping
+        logger.warning(f"Zombie daemon detected (PID: {pid}), forcing termination...")
+
+        if not _kill_daemon_process(pid, force=True):
+            logger.error(f"Failed to kill zombie daemon (PID: {pid})")
+            return False
+
+        # Give OS time to release the port
+        time.sleep(PORT_RELEASE_WAIT)
+
+        # Verify the zombie is actually dead
+        still_running, _ = is_daemon_running()
+        if still_running:
+            logger.error(f"Zombie daemon (PID: {pid}) survived force kill")
+            return False
+
+    # Not running (or zombie was killed) - start if allowed
     if auto_start:
         return start_daemon_silent(host=host, port=port)
 

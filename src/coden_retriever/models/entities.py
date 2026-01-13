@@ -10,6 +10,9 @@ from pathlib import Path
 from ..config import Config
 from ..token_estimator import count_tokens
 
+# Pre-compiled pattern for CamelCase to words conversion (e.g., "ProjectCache" -> "Project Cache")
+_CAMEL_CASE_PATTERN = re.compile(r'([a-z])([A-Z])')
+
 
 @dataclass
 class DependencyContext:
@@ -27,7 +30,7 @@ class DependencyContext:
                 caller_strs.append(f"{name}")
             if len(self.callers) > max_items:
                 caller_strs.append(f"+{len(self.callers) - max_items} more")
-            parts.append(f"← called by: {', '.join(caller_strs)}")
+            parts.append(f"<- called by: {', '.join(caller_strs)}")
 
         if self.callees:
             callee_strs = []
@@ -35,7 +38,7 @@ class DependencyContext:
                 callee_strs.append(f"{name}")
             if len(self.callees) > max_items:
                 callee_strs.append(f"+{len(self.callees) - max_items} more")
-            parts.append(f"→ calls: {', '.join(callee_strs)}")
+            parts.append(f"-> calls: {', '.join(callee_strs)}")
 
         return " | ".join(parts) if parts else ""
 
@@ -162,7 +165,7 @@ class PathTraceResult:
             nodes_by_depth_lines.append(f"\n{depth_label}:")
             for name, etype, file_path, freq in nodes:
                 freq_str = f" - appears in {freq} path{'s' if freq > 1 else ''}" if freq > 1 else ""
-                nodes_by_depth_lines.append(f"  • {name} ({etype}, {file_path}){freq_str}")
+                nodes_by_depth_lines.append(f"  * {name} ({etype}, {file_path}){freq_str}")
 
         reachable_by_depth = "\n".join(nodes_by_depth_lines) if nodes_by_depth_lines else "No reachable nodes."
 
@@ -172,9 +175,9 @@ class PathTraceResult:
         for node_id, name, etype in sorted(unique_nodes, key=lambda x: x[1].lower()):
             file_path = self._extract_file_path(node_id)
             if etype == "class":
-                classes.append(f"  • {name} - {file_path}")
+                classes.append(f"  * {name} - {file_path}")
             else:
-                functions.append(f"  • {name} - {file_path}")
+                functions.append(f"  * {name} - {file_path}")
 
         all_nodes_lines = []
         all_nodes_lines.append(f"{len(unique_nodes)} unique nodes reachable from '{self.source}' (duplicates removed):\n")
@@ -283,7 +286,7 @@ class PathTraceResult:
 
         lines = []
         for i, path in enumerate(self.paths[:max_paths]):
-            path_str = " → ".join([f"{name}({etype})" for _, name, etype in path])
+            path_str = " -> ".join([f"{name}({etype})" for _, name, etype in path])
             lines.append(f"Path {i+1}: {path_str}")
 
         if len(self.paths) > max_paths:
@@ -298,7 +301,7 @@ class PathTraceResult:
 
         lines = [f"Reachable from {self.source}:"]
         for _, name, etype in self.reachable_nodes:
-            lines.append(f"  • {name} ({etype})")
+            lines.append(f"  * {name} ({etype})")
 
         return "\n".join(lines)
 
@@ -319,6 +322,7 @@ class CodeEntity:
     docstring: str | None = None
     parent_class: str | None = None
     cyclomatic_complexity: int | None = None
+    is_stub: bool = False
 
     @property
     def node_id(self) -> str:
@@ -411,7 +415,7 @@ class CodeEntity:
         if cache is not None:
             return cache
 
-        name_expanded = re.sub(r"([a-z])([A-Z])", r"\1 \2", self.name)
+        name_expanded = _CAMEL_CASE_PATTERN.sub(r"\1 \2", self.name)
         name_expanded = name_expanded.replace("_", " ")
 
         # Boost name by repeating it - helps entities with matching names rank higher
@@ -432,16 +436,40 @@ class CodeEntity:
     def semantic_searchable_text(self) -> str:
         """Text optimized for semantic search using tree-sitter AST.
 
-        Returns the signature (header) of the entity as determined by tree-sitter.
-        This includes decorators, type hints, and docstrings where applicable.
+        Returns expanded name + signature + bounded body content (first N lines)
+        to improve semantic matching on implementation-specific keywords.
+
+        Note: Docstrings were tested (Iteration 3) but caused regressions due to
+        semantic noise from verbose descriptions matching unrelated queries.
         """
         cache = self.__dict__.get('_semantic_searchable_text_cache')
         if cache is not None:
             return cache
 
-        result = self.signature
+        # Expand name for natural language matching (CamelCase/snake_case -> words)
+        name_expanded = _CAMEL_CASE_PATTERN.sub(r'\1 \2', self.name)
+        name_expanded = name_expanded.replace('_', ' ').lower()
+
+        sig = self.signature
+        body_lines = self._get_bounded_body_lines(max_lines=5)
+        result = f"{self.name} {name_expanded}\n{sig}"
+        if body_lines:
+            result += "\n" + body_lines
         object.__setattr__(self, '_semantic_searchable_text_cache', result)
         return result
+
+    def _get_bounded_body_lines(self, max_lines: int = 5) -> str:
+        """Extract first N lines of body content after the signature."""
+        if self.body_start is None:
+            return ""
+        lines = self.source_code.splitlines()
+        if not lines:
+            return ""
+        body_line_index = self.body_start - self.line_start
+        if body_line_index < 0 or body_line_index >= len(lines):
+            return ""
+        body_end_index = min(body_line_index + max_lines, len(lines))
+        return "\n".join(lines[body_line_index:body_end_index]).strip()
 
     @property
     def signature(self) -> str:

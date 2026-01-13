@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 from pydantic import Field
 
 from ..cache import CacheManager
-from ..daemon.client import DaemonClient, DaemonConnectionError, DaemonRequestError
+from ..daemon.client import try_daemon_graph_analysis as _daemon_graph_analysis
 from ..daemon.protocol import GraphAnalysisParams
 from ..token_estimator import count_tokens
 from ..graph_utils import (
@@ -59,37 +59,6 @@ def _validate_root_directory(root_directory: str) -> dict[str, Any] | None:
     if not os.path.isdir(root_directory):
         return {"error": f"Root directory not found: {root_directory}"}
     return None
-
-
-def _try_daemon_graph_analysis(
-    method: str,
-    params: GraphAnalysisParams,
-) -> dict[str, Any] | None:
-    """Try to perform graph analysis via daemon.
-
-    Args:
-        method: The daemon method to call ('architectural_bottlenecks', etc.)
-        params: GraphAnalysisParams with parameters for the analysis.
-
-    Returns:
-        Result dict if daemon available and succeeded, None otherwise.
-    """
-    try:
-        client = DaemonClient(timeout=5.0)
-        if method == "architectural_bottlenecks":
-            return client.architectural_bottlenecks(params)
-        elif method == "coupling_hotspots":
-            return client.coupling_hotspots(params)
-        elif method == "change_impact_radius":
-            return client.change_impact_radius(params)
-        else:
-            return None
-    except (DaemonConnectionError, DaemonRequestError) as e:
-        logger.debug(f"Daemon unavailable for {method}: {e}")
-        return None
-    except Exception as e:
-        logger.debug(f"Daemon error for {method}: {e}")
-        return None
 
 
 async def _load_cached_indices(root_directory: str) -> "CachedIndices":
@@ -178,7 +147,7 @@ async def change_impact_radius(
         min_importance=min_importance,
         token_limit=token_limit,
     )
-    daemon_result = _try_daemon_graph_analysis("change_impact_radius", daemon_params)
+    daemon_result = _daemon_graph_analysis("change_impact_radius", daemon_params, auto_start=False)
     if daemon_result is not None:
         return daemon_result
 
@@ -377,7 +346,7 @@ async def coupling_hotspots(
         exclude_private=exclude_private,
         token_limit=token_limit,
     )
-    daemon_result = _try_daemon_graph_analysis("coupling_hotspots", daemon_params)
+    daemon_result = _daemon_graph_analysis("coupling_hotspots", daemon_params, auto_start=False)
     if daemon_result is not None:
         return daemon_result
 
@@ -455,7 +424,7 @@ async def architectural_bottlenecks(
         exclude_tests=exclude_tests,
         token_limit=token_limit,
     )
-    daemon_result = _try_daemon_graph_analysis("architectural_bottlenecks", daemon_params)
+    daemon_result = _daemon_graph_analysis("architectural_bottlenecks", daemon_params, auto_start=False)
     if daemon_result is not None:
         return daemon_result
 

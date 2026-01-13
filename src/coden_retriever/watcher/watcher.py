@@ -7,7 +7,7 @@ Monitors source files for changes and triggers cache updates.
 import logging
 import threading
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from watchdog.events import (
     FileSystemEventHandler,
@@ -22,6 +22,9 @@ from watchdog.observers.polling import PollingObserver
 from ..config import Config
 from ..language import LANGUAGE_MAP
 from .debouncer import BatchedChanges, ChangeDebouncer, ChangeType, FileChange
+
+if TYPE_CHECKING:
+    from watchdog.observers.api import BaseObserver as ObserverType
 
 logger = logging.getLogger(__name__)
 
@@ -182,7 +185,7 @@ class FileWatcher:
         self.use_polling = use_polling
         self.polling_interval = polling_interval
 
-        self._observer: Observer | None = None
+        self._observer: ObserverType | None = None
         self._debouncer: ChangeDebouncer | None = None
         self._running = False
         self._lock = threading.Lock()

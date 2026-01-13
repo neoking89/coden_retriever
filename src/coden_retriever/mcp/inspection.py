@@ -387,7 +387,7 @@ async def read_source_ranges(
 
                 # Add separator for combined view
                 if all_output_lines:
-                    all_output_lines.append(f"{'─' * 40} [Range {idx + 1}: lines {clamped_start}-{clamped_end}]")
+                    all_output_lines.append(f"{'-' * 40} [Range {idx + 1}: lines {clamped_start}-{clamped_end}]")
                 else:
                     all_output_lines.append(f"[Range {idx + 1}: lines {clamped_start}-{clamped_end}]")
                 all_output_lines.extend(output_lines)

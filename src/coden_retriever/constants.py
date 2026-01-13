@@ -1,21 +1,42 @@
 """
 Constant definitions for coden-retriever.
 
-Contains invariant data sets used for filtering and classification.
+Contains:
+- Network constants (URLs, ports, hosts, timeouts)
+- Invariant data sets used for filtering and classification
+
 These are separated from config.py which contains tuning parameters.
 """
 
-# Functions that are utility sinks (high in-degree, low informational value)
-UTILITY_NAMES: set[str] = {
-    "print", "println", "printf", "eprint", "eprintln",
-    "log", "debug", "info", "warn", "error", "trace", "fatal",
-    "console", "assert", "panic", "exit", "len", "str", "int",
-    "float", "bool", "list", "dict", "set", "tuple", "range",
-    "open", "close", "read", "write", "append", "extend",
-    "get", "set", "has", "delete", "remove", "pop", "push",
-    "toString", "valueOf", "hasOwnProperty", "getElementById",
-    "querySelector", "addEventListener", "setTimeout", "setInterval",
-}
+# =============================================================================
+# Network Constants - Centralized URLs, ports, hosts, and timeouts
+# =============================================================================
+
+# Provider URLs (OpenAI-compatible endpoints)
+OLLAMA_DEFAULT_URL = "http://localhost:11434/v1"
+LLAMACPP_DEFAULT_URL = "http://localhost:8080/v1"
+
+# Provider default API keys (for local servers that don't need real keys)
+OLLAMA_DEFAULT_API_KEY = "ollama"
+LLAMACPP_DEFAULT_API_KEY = "not-needed"
+
+# Daemon server defaults
+DEFAULT_DAEMON_HOST = "127.0.0.1"
+DEFAULT_DAEMON_PORT = 19847
+DEFAULT_DAEMON_TIMEOUT = 30.0
+DEFAULT_CLIENT_TIMEOUT = 5.0
+DEFAULT_HEAVY_ANALYSIS_TIMEOUT = 60.0  # For clone detection, propagation, etc.
+DEFAULT_MAX_PROJECTS = 5
+
+# Debug server defaults (debugpy)
+DEFAULT_DEBUG_PORT = 5678
+
+# Agent defaults
+DEFAULT_MAX_RETRIES: int = 5
+
+# =============================================================================
+# Filtering and Classification Constants
+# =============================================================================
 
 # Ambiguous method names that should ONLY create edges when qualified lookup succeeds.
 # These are common method names (like dict.get, list.append) that would create
@@ -34,34 +55,4 @@ AMBIGUOUS_METHOD_NAMES: set[str] = {
     "load", "save", "dump", "parse",
     # Common property accessors
     "name", "value", "data", "result", "status", "type", "id",
-}
-
-# Directories to skip during indexing
-SKIP_DIRS: set[str] = {
-    "venv", "env", ".venv", ".env",
-    "node_modules", "bower_components",
-    ".git", ".svn", ".hg",
-    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
-    "dist", "build", "target", "out", "bin", "obj",
-    "vendor", "third_party", "external", "deps",
-    ".idea", ".vscode", ".vs",
-    "coverage", ".coverage", "htmlcov",
-    ".tox", ".nox",
-}
-
-# Files to skip during indexing
-SKIP_FILES: set[str] = {
-    "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-    "poetry.lock", "Pipfile.lock", "Cargo.lock",
-    "go.sum", "composer.lock", "Gemfile.lock",
-}
-
-# Important files to always consider
-IMPORTANT_FILES: set[str] = {
-    "README.md", "README.txt", "README.rst", "README",
-    "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg",
-    "package.json", "Cargo.toml", "go.mod", "pom.xml",
-    "Makefile", "CMakeLists.txt", "Dockerfile",
-    "main.py", "app.py", "index.js", "index.ts", "main.go",
-    "main.rs", "Main.java", "Program.cs",
 }

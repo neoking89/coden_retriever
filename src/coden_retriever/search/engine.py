@@ -798,12 +798,12 @@ class SearchEngine:
         has_semantic = results and "semantic" in results[0].components
 
         if has_semantic:
-            header = f"{'Rank':<4} │ {'Score':<8} │ {'BM25':<6} │ {'Sem':<6} │ {'PR':<8} │ {'BT':<8} │ {'Lines':<5} │ {'Entity'}"
+            header = f"{'Rank':<4} | {'Score':<8} | {'BM25':<6} | {'Sem':<6} | {'PR':<8} | {'BT':<8} | {'Lines':<5} | {'Entity'}"
         else:
-            header = f"{'Rank':<4} │ {'Score':<8} │ {'BM25':<6} │ {'PR':<8} │ {'BT':<8} │ {'Lines':<5} │ {'Entity'}"
+            header = f"{'Rank':<4} | {'Score':<8} | {'BM25':<6} | {'PR':<8} | {'BT':<8} | {'Lines':<5} | {'Entity'}"
 
         print(header, file=sys.stderr)
-        print("─" * 120 if has_semantic else "─" * 100, file=sys.stderr)
+        print("-" * 120 if has_semantic else "-" * 100, file=sys.stderr)
 
         for r in results[:limit]:
             name = r.entity.qualified_name
@@ -823,20 +823,20 @@ class SearchEngine:
 
             if has_semantic:
                 print(
-                    f"{r.rank:<4} │ {r.score:<8.4f} │ {r.components.get('bm25', 0):<6.2f} │ "
-                    f"{r.components.get('semantic', 0):<6.3f} │ {r.components.get('pr', 0):<8.5f} │ "
-                    f"{r.components.get('bt', 0):<8.5f} │ {r.entity.line_count:<5} │ {name}{flag_str}",
+                    f"{r.rank:<4} | {r.score:<8.4f} | {r.components.get('bm25', 0):<6.2f} | "
+                    f"{r.components.get('semantic', 0):<6.3f} | {r.components.get('pr', 0):<8.5f} | "
+                    f"{r.components.get('bt', 0):<8.5f} | {r.entity.line_count:<5} | {name}{flag_str}",
                     file=sys.stderr
                 )
             else:
                 print(
-                    f"{r.rank:<4} │ {r.score:<8.4f} │ {r.components.get('bm25', 0):<6.2f} │ "
-                    f"{r.components.get('pr', 0):<8.5f} │ {r.components.get('bt', 0):<8.5f} │ "
-                    f"{r.entity.line_count:<5} │ {name}{flag_str}",
+                    f"{r.rank:<4} | {r.score:<8.4f} | {r.components.get('bm25', 0):<6.2f} | "
+                    f"{r.components.get('pr', 0):<8.5f} | {r.components.get('bt', 0):<8.5f} | "
+                    f"{r.entity.line_count:<5} | {name}{flag_str}",
                     file=sys.stderr
                 )
 
-        print("─" * 120 if has_semantic else "─" * 100, file=sys.stderr)
+        print("-" * 120 if has_semantic else "-" * 100, file=sys.stderr)
         print(file=sys.stderr)
 
     def format_stats(self, results: list[SearchResult], limit: int = 20) -> str:
@@ -855,12 +855,12 @@ class SearchEngine:
         has_semantic = results and "semantic" in results[0].components
 
         if has_semantic:
-            header = f"{'Rank':<4} │ {'Score':<8} │ {'BM25':<6} │ {'Sem':<6} │ {'PR':<8} │ {'BT':<8} │ {'Lines':<5} │ {'Entity'}"
+            header = f"{'Rank':<4} | {'Score':<8} | {'BM25':<6} | {'Sem':<6} | {'PR':<8} | {'BT':<8} | {'Lines':<5} | {'Entity'}"
         else:
-            header = f"{'Rank':<4} │ {'Score':<8} │ {'BM25':<6} │ {'PR':<8} │ {'BT':<8} │ {'Lines':<5} │ {'Entity'}"
+            header = f"{'Rank':<4} | {'Score':<8} | {'BM25':<6} | {'PR':<8} | {'BT':<8} | {'Lines':<5} | {'Entity'}"
 
         lines.append(header)
-        lines.append("─" * 120 if has_semantic else "─" * 100)
+        lines.append("-" * 120 if has_semantic else "-" * 100)
 
         for r in results[:limit]:
             name = r.entity.qualified_name
@@ -893,18 +893,18 @@ class SearchEngine:
 
             if has_semantic:
                 lines.append(
-                    f"{r.rank:<4} │ {colored_score:<8} │ {r.components.get('bm25', 0):<6.2f} │ "
-                    f"{r.components.get('semantic', 0):<6.3f} │ {r.components.get('pr', 0):<8.5f} │ "
-                    f"{r.components.get('bt', 0):<8.5f} │ {r.entity.line_count:<5} │ {colored_entity}"
+                    f"{r.rank:<4} | {colored_score:<8} | {r.components.get('bm25', 0):<6.2f} | "
+                    f"{r.components.get('semantic', 0):<6.3f} | {r.components.get('pr', 0):<8.5f} | "
+                    f"{r.components.get('bt', 0):<8.5f} | {r.entity.line_count:<5} | {colored_entity}"
                 )
             else:
                 lines.append(
-                    f"{r.rank:<4} │ {colored_score:<8} │ {r.components.get('bm25', 0):<6.2f} │ "
-                    f"{r.components.get('pr', 0):<8.5f} │ {r.components.get('bt', 0):<8.5f} │ "
-                    f"{r.entity.line_count:<5} │ {colored_entity}"
+                    f"{r.rank:<4} | {colored_score:<8} | {r.components.get('bm25', 0):<6.2f} | "
+                    f"{r.components.get('pr', 0):<8.5f} | {r.components.get('bt', 0):<8.5f} | "
+                    f"{r.entity.line_count:<5} | {colored_entity}"
                 )
 
-        lines.append("─" * 120 if has_semantic else "─" * 100)
+        lines.append("-" * 120 if has_semantic else "-" * 100)
         lines.append("")
         return "\n".join(lines)
 

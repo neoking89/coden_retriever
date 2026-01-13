@@ -14,7 +14,7 @@ from pydantic import Field
 
 from ..cache import CacheManager
 from ..config import OutputFormat
-from ..daemon.client import DaemonClient, DaemonConnectionError, DaemonRequestError
+from ..daemon.client import try_daemon_search as _daemon_search, try_daemon_trace_dependency as _daemon_trace_dependency
 from ..daemon.protocol import SearchParams, TraceDependencyParams
 from ..formatters import get_formatter
 from ..formatters.base import OutputFormatter
@@ -24,36 +24,6 @@ from .inspection import git_history_context, read_source_range, read_source_rang
 from .stacktrace import debug_stacktrace
 
 logger = logging.getLogger(__name__)
-
-
-def _try_daemon_search(params: SearchParams) -> dict | None:
-    """Try to perform a search via daemon, return None if daemon not available."""
-    try:
-        client = DaemonClient()
-        return client.search(params)
-    except (DaemonConnectionError, DaemonRequestError):
-        return None
-
-
-def _try_daemon_find(params: SearchParams) -> dict | None:
-    """Try to find identifier via daemon, return None if daemon not available."""
-    try:
-        client = DaemonClient()
-        return client.find(params)
-    except (DaemonConnectionError, DaemonRequestError):
-        return None
-
-
-def _try_daemon_trace_dependency(params: TraceDependencyParams) -> dict | None:
-    """Try to trace dependencies via daemon, return None if daemon not available."""
-    try:
-        client = DaemonClient(timeout=5.0)
-        return client.trace_dependency(params)
-    except (DaemonConnectionError, DaemonRequestError):
-        return None
-    except Exception as e:
-        logger.debug(f"Daemon error for trace_dependency: {e}")
-        return None
 
 
 async def _create_engine(root_directory: str, enable_semantic: bool = False) -> SearchEngine:
@@ -106,7 +76,7 @@ async def _code_search_impl(
             dir_tree=show_tree,
             stats=True,
         )
-        daemon_result = await asyncio.to_thread(_try_daemon_search, params)
+        daemon_result = await asyncio.to_thread(_daemon_search, params, auto_start=False)
 
         if daemon_result is not None:
             # Daemon returned results - reformat for MCP response
@@ -315,7 +285,7 @@ async def code_map(
             dir_tree=show_tree,
             stats=True,
         )
-        daemon_result = await asyncio.to_thread(_try_daemon_search, params)
+        daemon_result = await asyncio.to_thread(_daemon_search, params, auto_start=False)
 
         if daemon_result is not None:
             # Daemon returned results - reformat for MCP response
@@ -442,7 +412,7 @@ async def find_identifier(
             dir_tree=show_tree,
             stats=True,
         )
-        daemon_result = await asyncio.to_thread(_try_daemon_find, params)
+        daemon_result = await asyncio.to_thread(_daemon_search, params, auto_start=False)
 
         if daemon_result is not None:
             # Daemon returned results - return formatted output
@@ -696,7 +666,7 @@ async def trace_dependency_path(
         max_depth=max_depth,
         limit_paths=limit_paths,
     )
-    daemon_result = _try_daemon_trace_dependency(daemon_params)
+    daemon_result = _daemon_trace_dependency(daemon_params, auto_start=False)
     if daemon_result is not None:
         return daemon_result
 

@@ -10,8 +10,119 @@ import time
 import traceback
 from pathlib import Path
 import io
+import asyncio
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ThresholdConfig:
+    """Configuration for a CLI threshold argument."""
+    name: str  # CLI argument name without -- (e.g., "clone-threshold")
+    default: float
+    analysis_flag: str  # Short flag (e.g., "-C")
+    analysis_name: str  # Human-readable name (e.g., "Code Clones")
+    short_help: str  # Brief help for search parser
+    detailed_help: str  # Full help for flag parser (includes range, examples)
+    example_value: float  # Value to use in examples
+    validate_0_1: bool = True  # If True, validate range 0.0-1.0
+
+
+# Threshold definitions - update these to change help text everywhere
+THRESHOLD_CONFIGS = {
+    "risk": ThresholdConfig(
+        name="risk-threshold",
+        default=50.0,
+        analysis_flag="-H",
+        analysis_name="Hotspots",
+        short_help="Hotspot min risk score (raw score, typically 50-200+)",
+        detailed_help="Hotspots (-H): min risk score for flagging. Raw score = coupling * log(complexity). Default: 50",
+        example_value=50.0,
+        validate_0_1=False,
+    ),
+    "propagation": ThresholdConfig(
+        name="propagation-threshold",
+        default=0.25,
+        analysis_flag="-P",
+        analysis_name="Propagation Cost",
+        short_help="Propagation cost threshold (0.0-1.0)",
+        detailed_help="Propagation (-P): min internal coupling %% for flagging modules. Range: 0-1. Default: 0.25 (25%%)",
+        example_value=0.25,
+    ),
+    "clone": ThresholdConfig(
+        name="clone-threshold",
+        default=0.95,
+        analysis_flag="-C",
+        analysis_name="Code Clones",
+        short_help="Clone similarity threshold (0.0-1.0)",
+        detailed_help="Clones (-C): min semantic similarity for flagging. Range: 0-1. Default: 0.95 (very similar)",
+        example_value=0.90,
+    ),
+    "echo": ThresholdConfig(
+        name="echo-threshold",
+        default=0.85,
+        analysis_flag="-E",
+        analysis_name="Echo Comments",
+        short_help="Echo comment similarity threshold (0.0-1.0)",
+        detailed_help="Echo Comments (-E): semantic similarity threshold. Range: 0-1. Default: 0.85. Stricter (0.95) = near-identical only, Looser (0.75) = more detections",
+        example_value=0.85,
+    ),
+}
+
+
+def _validate_threshold(value: str) -> float:
+    """Validate threshold is between 0.0 and 1.0."""
+    fval = float(value)
+    if not (0.0 <= fval <= 1.0):
+        raise argparse.ArgumentTypeError(f"threshold must be between 0.0 and 1.0, got {fval}")
+    return fval
+
+
+def _validate_positive_float(value: str) -> float:
+    """Validate threshold is a positive number (no upper bound)."""
+    fval = float(value)
+    if fval < 0:
+        raise argparse.ArgumentTypeError(f"threshold must be non-negative, got {fval}")
+    return fval
+
+
+def normalize_limit(limit: int | None) -> int | None:
+    """Convert negative values to None (unlimited) for limit arguments.
+
+    This allows users to explicitly request all results via -n -1.
+    Any negative value is treated as unlimited for robustness.
+    """
+    if limit is not None and limit < 0:
+        return None
+    return limit
+
+
+def add_threshold_argument(
+    parser: argparse.ArgumentParser | argparse._ArgumentGroup,
+    config: ThresholdConfig,
+    use_detailed_help: bool = False,
+) -> None:
+    """Add a threshold argument to a parser using centralized config.
+
+    Args:
+        parser: The argparse parser or argument group to add to
+        config: ThresholdConfig with argument settings
+        use_detailed_help: If True, use detailed_help; otherwise use short_help
+    """
+    help_text = config.detailed_help if use_detailed_help else config.short_help
+    validator = _validate_threshold if config.validate_0_1 else _validate_positive_float
+    parser.add_argument(
+        f"--{config.name}",
+        type=validator,
+        default=config.default,
+        metavar="FLOAT",
+        help=help_text,
+    )
+
+
+# =============================================================================
 
 from .cache import CacheManager
+from .cli_metrics_contract import apply_defensive_limit, print_metric_output
 from .config import get_central_cache_root, get_project_cache_dir
 from .config import OutputFormat
 from .config_loader import (
@@ -20,6 +131,8 @@ from .config_loader import (
     save_config,
     get_config_file,
     reset_config,
+    set_config_value,
+    SETTING_LOCATIONS,
     _config_to_dict,
 )
 from .daemon.client import (
@@ -28,14 +141,25 @@ from .daemon.client import (
     stop_daemon,
     try_daemon_search,
     try_daemon_hotspots,
+    try_daemon_clones,
+    try_daemon_propagation_cost,
+    try_daemon_flag,
+    try_daemon_flag_clear,
 )
 from .daemon.protocol import (
     WINDOWS_CREATE_NEW_PROCESS_GROUP,
     WINDOWS_DETACHED_PROCESS,
+    CloneDetectionParams,
+    FlagClearParams,
+    FlagParams,
     GraphAnalysisParams,
+    PropagationCostParams,
     SearchParams,
 )
 from .daemon.server import get_log_file, is_daemon_running, run_daemon
+from .formatters import CloneFormatter, PropagationFormatter
+from .formatters.cli_metrics import FALSE_POSITIVE_WARNING
+from .formatters.flag_formatter import FlagFormatter
 from .formatters.terminal_style import get_terminal_style
 from .pipeline import SearchConfig, SearchPipeline
 
@@ -96,6 +220,58 @@ def print_search_output(
         print(formatted_output)
 
 
+def format_semantic_search_header(query: str) -> str:
+    """Format a header indicating semantic search mode is active.
+
+    Args:
+        query: The search query being used
+
+    Returns:
+        Formatted semantic search header string
+    """
+    lines = [
+        "=" * 60,
+        "SEMANTIC SEARCH MODE",
+        "-" * 60,
+        "Using Model2Vec embeddings for semantic similarity matching.",
+        f'Query: "{query}"',
+        "=" * 60,
+    ]
+    return "\n".join(lines)
+
+
+def format_hotspots_parameters_header(
+    risk_threshold: float,
+    exclude_tests: bool,
+    limit: int | None,
+) -> str:
+    """Format parameter summary header for hotspots analysis.
+
+    Args:
+        risk_threshold: Risk score threshold
+        exclude_tests: Whether tests are excluded
+        limit: Result limit (None = show all)
+
+    Returns:
+        Formatted parameter header string
+    """
+    lines = []
+    lines.append("=" * 80)
+    lines.append("HOTSPOTS ANALYSIS PARAMETERS")
+    lines.append("=" * 80)
+    lines.append(f"Risk Threshold: >= {risk_threshold}")
+    lines.append(f"Exclude Tests: {exclude_tests}")
+
+    if limit is None:
+        lines.append("[!] Result Limit: ALL (may be slow for large repos)")
+    else:
+        lines.append(f"[!] Result Limit: TOP {limit} -- more results may exist (use -n -1 for all)")
+
+    lines.append(FALSE_POSITIVE_WARNING)
+    lines.append("=" * 80)
+    return "\n".join(lines)
+
+
 def format_hotspots_output(
     hotspots: list[dict],
     output_format: str = "tree",
@@ -112,7 +288,6 @@ def format_hotspots_output(
         Formatted string for display
     """
     if output_format == "json":
-        import json
         return json.dumps(hotspots, indent=2)
 
     if not hotspots:
@@ -128,9 +303,9 @@ def format_hotspots_output(
     lines = []
 
     # Table header
-    header = f"{'Rank':<4} │ {'Risk':<7} │ {'Coupling':<13} │ {'CC':<4} │ {'Category':<12} │ {'Lines':<5} │ {'Entity'}"
+    header = f"{'Rank':<4} | {'Risk':<7} | {'Coupling':<13} | {'CC':<4} | {'Category':<12} | {'Lines':<5} | {'Entity'}"
     lines.append(header)
-    lines.append("─" * 110)
+    lines.append("-" * 110)
 
     for i, h in enumerate(display_hotspots, 1):
         # Calculate display rank (accounts for reverse)
@@ -166,10 +341,10 @@ def format_hotspots_output(
         coupling_str = f"{fan_in}in/{fan_out}out"
 
         lines.append(
-            f"{rank:<4} │ {colored_risk} │ {coupling_str:<13} │ {complexity:<4} │ {category:<12} │ {line_count:<5} │ {colored_entity}"
+            f"{rank:<4} | {colored_risk} | {coupling_str:<13} | {complexity:<4} | {category:<12} | {line_count:<5} | {colored_entity}"
         )
 
-    lines.append("─" * 110)
+    lines.append("-" * 110)
     return "\n".join(lines)
 
 
@@ -194,21 +369,25 @@ def format_hotspots_stats(summary: dict) -> str:
 
     lines = [
         "",
-        "═" * 80,
-        f"Hotspots Analysis │ {total:,} functions analyzed │ {above_threshold:,} above threshold",
-        "─" * 80,
+        "=" * 80,
+        f"Hotspots Analysis | {total:,} functions analyzed | {above_threshold:,} above threshold",
+        "-" * 80,
         f"Risk: avg {summary.get('average_risk_score', 0):.1f} / max {summary.get('max_risk_score', 0):.1f}",
         f"Coupling: avg {summary.get('average_coupling_score', 0):.1f} / max {summary.get('highest_coupling_score', 0)}",
         f"Complexity: avg {summary.get('average_complexity', 1):.1f} / max {summary.get('max_complexity', 1)}",
-        "─" * 80,
-        f"Categories: Danger Zone: {danger} │ Traffic Jam: {traffic} │ Local Mess: {local} │ Low Risk: {low}",
+        "-" * 80,
+        f"Categories: Danger Zone: {danger} | Traffic Jam: {traffic} | Local Mess: {local} | Low Risk: {low}",
+        "-" * 80,
+        "Legend: Danger Zone = high coupling + high complexity (hardest to maintain)",
+        "        Traffic Jam = high coupling, low complexity (architectural bottleneck)",
+        "        Local Mess = low coupling, high complexity (hard to test/understand)",
     ]
 
     if summary.get("token_budget_exceeded"):
-        lines.append("─" * 80)
+        lines.append("-" * 80)
         lines.append("Note: Results truncated due to token budget")
 
-    lines.append("═" * 80)
+    lines.append("=" * 80)
     return "\n".join(lines)
 
 
@@ -233,6 +412,611 @@ def print_hotspots_output(
         if stats_output:
             print(stats_output, file=sys.stderr)
         print(formatted_output)
+
+
+def _get_clone_mode(args: argparse.Namespace) -> str:
+    """Determine clone detection mode from CLI flags."""
+    clone_semantic = getattr(args, "clone_semantic", False)
+    clone_syntactic = getattr(args, "clone_syntactic", False)
+
+    if clone_semantic and clone_syntactic:
+        return "combined"  # Both flags = combined (explicit)
+    if clone_semantic:
+        return "semantic"
+    if clone_syntactic:
+        return "syntactic"
+    return "combined"  # Default
+
+
+def handle_clones_command(args: argparse.Namespace, root_path: Path, config) -> int:
+    """Handle clone detection command using CloneFormatter for output."""
+    args.limit = normalize_limit(args.limit)
+    start_time = time.time()
+    formatter = CloneFormatter()
+
+    # Determine clone mode
+    mode = _get_clone_mode(args)
+    line_threshold = getattr(args, "line_threshold", 0.70)
+    func_threshold = getattr(args, "func_threshold", 0.50)
+    semantic_weight = getattr(args, "semantic_weight", 0.65)
+    syntactic_weight = getattr(args, "syntactic_weight", 0.35)
+
+    # Print parameter header before results
+    from .formatters.clone_formatter import format_clone_parameters_header
+    header = format_clone_parameters_header(
+        mode=mode,
+        similarity_threshold=args.clone_threshold,
+        line_threshold=line_threshold,
+        func_threshold=func_threshold,
+        min_lines=args.min_lines,
+        limit=args.limit,
+        exclude_tests=True,
+    )
+    print(header)
+    print()  # Blank line
+
+    params = CloneDetectionParams(
+        source_dir=str(root_path),
+        mode=mode,
+        similarity_threshold=args.clone_threshold,
+        line_threshold=line_threshold,
+        func_threshold=func_threshold,
+        limit=args.limit,
+        exclude_tests=True,
+        min_lines=args.min_lines,
+        token_limit=args.tokens,  # None = no limit for CLI
+        semantic_weight=semantic_weight,
+        syntactic_weight=syntactic_weight,
+    )
+
+    # Use daemon_timeout from config (adjustable via: coden config set daemon_timeout <seconds>)
+    # Default 60s for heavy analysis; increase if clone detection times out on large repos
+    daemon_result = try_daemon_clones(
+        params, host=config.daemon.host, port=config.daemon.port,
+        timeout=max(config.daemon.daemon_timeout, 60.0)
+    )
+
+    if daemon_result is not None:
+        if "error" in daemon_result:
+            logger.error(f"Clone detection error: {daemon_result['error']}")
+            return 1
+
+        all_clones = daemon_result.get("clones", [])
+        summary = daemon_result.get("summary", {})
+
+        # Apply defensive limit (ensures contract compliance)
+        clones = apply_defensive_limit(all_clones, args.limit)
+
+        formatted_output = formatter.format_items(clones, args.format, args.reverse)
+        stats_output = formatter.format_stats(summary) if args.stats else None
+        print_metric_output(formatted_output, stats_output, args.reverse)
+        elapsed_ms = (time.time() - start_time) * 1000
+        if args.verbose:
+            print(f"\n[Daemon mode] Clone detection time: {elapsed_ms:.1f}ms, Pairs: {len(clones)}", file=sys.stderr)
+        return 0
+
+    logger.warning("Daemon not available, falling back to direct analysis...")
+    try:
+        from .mcp.clone_detection import detect_clones as mcp_detect_clones
+
+        result = asyncio.run(mcp_detect_clones(
+            root_directory=str(root_path),
+            mode=mode,
+            similarity_threshold=args.clone_threshold,
+            line_threshold=line_threshold,
+            func_threshold=func_threshold,
+            limit=args.limit,
+            exclude_tests=True,
+            min_lines=args.min_lines,
+            token_limit=args.tokens,  # None = no limit for CLI
+            semantic_weight=semantic_weight,
+            syntactic_weight=syntactic_weight,
+        ))
+
+        if "error" in result:
+            logger.error(f"Clone detection error: {result['error']}")
+            return 1
+
+        all_clones = result.get("clones", [])
+        summary = result.get("summary", {})
+
+        # Apply defensive limit (ensures contract compliance)
+        clones = apply_defensive_limit(all_clones, args.limit)
+
+        formatted_output = formatter.format_items(clones, args.format, args.reverse)
+        stats_output = formatter.format_stats(summary) if args.stats else None
+        print_metric_output(formatted_output, stats_output, args.reverse)
+        elapsed_ms = (time.time() - start_time) * 1000
+        if args.verbose:
+            print(f"\n[Direct mode] Clone detection time: {elapsed_ms:.1f}ms, Pairs: {len(clones)}", file=sys.stderr)
+        return 0
+
+    except Exception as e:
+        logger.error(f"Clone detection failed: {e}")
+        if args.verbose:
+            traceback.print_exc()
+        return 1
+
+
+def handle_echo_comments_command(args: argparse.Namespace, root_path: Path, config) -> int:
+    """Handle echo comment detection command (read-only analysis or file modification with --remove-comments)."""
+    args.limit = normalize_limit(args.limit)
+    start_time = time.time()
+
+    try:
+        from .cache import CacheManager
+
+        cache = CacheManager(root_path)
+        indices = cache.load_or_rebuild()
+
+        # Print parameter header before results (only for read-only analysis, not for --remove-comments)
+        if not args.remove_comments:
+            from .formatters.flag_formatter import format_echo_parameters_header
+            header = format_echo_parameters_header(
+                echo_threshold=args.echo_threshold,
+                exclude_tests=not args.include_tests,
+                limit=args.limit,
+            )
+            print(header)
+            print()  # Blank line
+
+        # If --remove-comments is specified, use flag_code for file modification
+        if args.remove_comments:
+            from .mcp.flag_insertion import flag_code
+
+            result = flag_code(
+                entities=indices.entities,
+                graph=indices.graph,
+                pagerank=indices.pagerank,
+                source_dir=str(root_path),
+                echo_comments=True,
+                echo_threshold=args.echo_threshold,
+                dry_run=args.dry_run,
+                backup=args.backup,
+                verbose=args.verbose,
+                exclude_tests=not args.include_tests,
+                remove_comments=True,
+            )
+
+            if "error" in result:
+                logger.error(f"Echo comment removal failed: {result['error']}")
+                return 1
+
+            # Print the output (formatted by flag_code)
+            from .formatters.flag_formatter import FlagFormatter
+            formatter = FlagFormatter()
+            formatted_output = formatter.format_items(result.get("items", []), args.format, args.reverse)
+
+            stats_output = None
+            if args.stats:
+                stats_lines = [
+                    "",
+                    "=" * 80,
+                    f"Echo Comment Removal | {result.get('flagged_count', 0)} items",
+                    "-" * 80,
+                    f"Files modified: {result.get('files_modified', 0)}",
+                    f"Comments removed: {result.get('flagged_count', 0)}",
+                    "=" * 80,
+                ]
+                stats_output = "\n".join(stats_lines)
+
+            print_metric_output(formatted_output, stats_output, args.reverse)
+
+            elapsed_ms = (time.time() - start_time) * 1000
+            if args.verbose:
+                print(f"\nEcho comment removal time: {elapsed_ms:.1f}ms", file=sys.stderr)
+            return 0
+
+        # Read-only analysis (original behavior)
+        from .mcp.echo_comments import compute_echo_comments
+        from .formatters.flag_formatter import FlagFormatter
+        formatter = FlagFormatter()
+
+        result = compute_echo_comments(
+            entities=indices.entities,
+            echo_threshold=args.echo_threshold,
+            token_limit=args.tokens,  # None = no limit for CLI
+            include_tests=args.include_tests,
+            include_private=False,
+        )
+
+        if "error" in result:
+            logger.error(f"Echo comment detection error: {result['error']}")
+            return 1
+
+        all_echo_comments = result.get("echo_comments", [])
+        summary = result.get("summary", {})
+
+        # Apply defensive limit (ensures contract compliance)
+        echo_comments = apply_defensive_limit(all_echo_comments, args.limit)
+
+        # Convert echo_comments to flag format for display
+        items = []
+        for echo in echo_comments:
+            items.append({
+                "type": "echo",
+                "file": echo.get("file_path"),  # Note: formatter expects "file" not "file_path"
+                "line": echo.get("line"),
+                "name": echo.get("context_identifier"),
+                "similarity_score": echo.get("similarity_score"),
+                "comment_text": echo.get("comment_text"),
+                "severity": echo.get("severity"),
+            })
+
+        formatted_output = formatter.format_items(items, args.format, args.reverse)
+
+        # Create custom stats output for echo analysis
+        if args.stats:
+            total_comments = summary.get("total_comments_found", 0)
+            # Use original count before limiting for ratio calculation
+            total_echo_count = len(all_echo_comments)
+            echo_ratio = total_echo_count / total_comments if total_comments > 0 else 0
+            distribution = summary.get("distribution", {})
+
+            stats_lines = [
+                "",
+                "=" * 80,
+                f"Echo Comment Analysis | {len(echo_comments):,} shown ({total_echo_count:,} total)",
+                "-" * 80,
+                f"Total comments analyzed: {total_comments:,}",
+                f"Echo ratio: {echo_ratio * 100:.1f}%",
+                f"Files affected: {summary.get('files_affected', 0)}",
+                f"Avg similarity: {summary.get('avg_similarity', 0) * 100:.1f}%",
+                "-" * 80,
+                "Distribution:",
+                f"  CRITICAL (>95%): {distribution.get('critical', 0)}",
+                f"  HIGH (90-95%): {distribution.get('high', 0)}",
+                f"  ELEVATED (85-90%): {distribution.get('elevated', 0)}",
+                f"  MODERATE (<85%): {distribution.get('moderate', 0)}",
+                "=" * 80,
+            ]
+            stats_output = "\n".join(stats_lines)
+        else:
+            stats_output = None
+
+        # Print with contract-compliant ordering
+        print_metric_output(formatted_output, stats_output, args.reverse)
+
+        elapsed_ms = (time.time() - start_time) * 1000
+        if args.verbose:
+            print(f"\nEcho comment detection time: {elapsed_ms:.1f}ms, Found: {len(echo_comments)}", file=sys.stderr)
+        return 0
+
+    except Exception as e:
+        logger.error(f"Echo comment detection failed: {e}")
+        if args.verbose:
+            traceback.print_exc()
+        return 1
+
+
+def _filter_propagation_by_threshold(result: dict, threshold: float) -> dict:
+    """Filter propagation result to only show modules above threshold.
+
+    Args:
+        result: Propagation cost result dict
+        threshold: Minimum internal_coupling (0-1) to include
+
+    Returns:
+        Filtered result with module_breakdown filtered by threshold
+    """
+    if "module_breakdown" not in result:
+        return result
+
+    filtered = result.copy()
+    filtered["module_breakdown"] = [
+        m for m in result["module_breakdown"]
+        if m.get("internal_coupling", 0) >= threshold
+    ]
+    return filtered
+
+
+def handle_propagation_command(args: argparse.Namespace, root_path: Path, config) -> int:
+    """Handle propagation cost command using PropagationFormatter for output."""
+    args.limit = normalize_limit(args.limit)
+    start_time = time.time()
+    formatter = PropagationFormatter()
+
+    # Print parameter header before results
+    from .formatters.propagation_formatter import format_propagation_parameters_header
+    header = format_propagation_parameters_header(
+        propagation_threshold=args.propagation_threshold,
+        exclude_tests=True,
+        limit=args.limit,
+    )
+    print(header)
+    print()  # Blank line
+
+    params = PropagationCostParams(
+        source_dir=str(root_path),
+        include_breakdown=args.breakdown,
+        show_critical_paths=args.critical_paths,
+        exclude_tests=True,
+        token_limit=args.tokens,  # None = no limit for CLI
+    )
+
+    daemon_result = try_daemon_propagation_cost(params, host=config.daemon.host, port=config.daemon.port)
+
+    if daemon_result is not None:
+        if "error" in daemon_result:
+            logger.error(f"Propagation cost error: {daemon_result['error']}")
+            return 1
+
+        # Filter module_breakdown by threshold
+        filtered_result = _filter_propagation_by_threshold(daemon_result, args.propagation_threshold)
+
+        formatted_output = formatter.format_items([filtered_result], args.format, args.reverse)
+        stats_output = formatter.format_stats(filtered_result) if args.stats else None
+        print_metric_output(formatted_output, stats_output, args.reverse)
+        elapsed_ms = (time.time() - start_time) * 1000
+        if args.verbose:
+            pc = daemon_result.get('propagation_cost', 0)
+            print(f"[Daemon mode] Propagation cost: {pc*100:.2f}% ({elapsed_ms:.1f}ms)", file=sys.stderr)
+        return 0
+
+    logger.warning("Daemon not available, falling back to direct analysis...")
+    try:
+        from .mcp.propagation_cost import propagation_cost as mcp_propagation_cost
+
+        result = asyncio.run(mcp_propagation_cost(
+            root_directory=str(root_path),
+            include_breakdown=args.breakdown,
+            show_critical_paths=args.critical_paths,
+            exclude_tests=True,
+            token_limit=args.tokens,  # None = no limit for CLI
+        ))
+
+        if "error" in result:
+            logger.error(f"Propagation cost error: {result['error']}")
+            return 1
+
+        filtered_result = _filter_propagation_by_threshold(result, args.propagation_threshold)
+
+        formatted_output = formatter.format_items([filtered_result], args.format, args.reverse)
+        stats_output = formatter.format_stats(filtered_result) if args.stats else None
+        print_metric_output(formatted_output, stats_output, args.reverse)
+        elapsed_ms = (time.time() - start_time) * 1000
+        if args.verbose:
+            pc = result.get('propagation_cost', 0)
+            print(f"[Direct mode] Propagation cost: {pc*100:.2f}% ({elapsed_ms:.1f}ms)", file=sys.stderr)
+        return 0
+
+    except Exception as e:
+        logger.error(f"Propagation cost analysis failed: {e}")
+        if args.verbose:
+            traceback.print_exc()
+        return 1
+
+
+def _print_propagation_output(formatted_output: str, stats_output: str | None, reverse: bool) -> None:
+    """Print propagation output with proper ordering based on reverse flag."""
+    if reverse:
+        print(formatted_output)
+        if stats_output:
+            print(stats_output, file=sys.stderr)
+    else:
+        if stats_output:
+            print(stats_output, file=sys.stderr)
+        print(formatted_output)
+
+
+def _print_flag_output(formatted_output: str, stats_output: str | None, reverse: bool) -> None:
+    """Print flag output with proper ordering based on reverse flag."""
+    if reverse:
+        print(formatted_output)
+        if stats_output:
+            print(stats_output, file=sys.stderr)
+    else:
+        if stats_output:
+            print(stats_output, file=sys.stderr)
+        print(formatted_output)
+
+
+def handle_flag_command(args: argparse.Namespace, root_path: Path, config) -> int:
+    """Handle flag command to insert [CODEN] comments."""
+    args.limit = normalize_limit(args.limit)
+    start_time = time.time()
+    formatter = FlagFormatter()
+
+    if not root_path.exists():
+        print(f"Error: Path does not exist: {root_path}", file=sys.stderr)
+        return 1
+    if not root_path.is_dir():
+        print(f"Error: Path is not a directory: {root_path}", file=sys.stderr)
+        return 1
+
+    # Check if at least one analysis type is selected
+    if not (args.hotspots or args.propagation or args.clones or args.echo_comments):
+        print("Error: At least one analysis flag (-H, -P, -C, or -E) is required.", file=sys.stderr)
+        return 1
+
+    # Determine active flags for parameter header
+    active_flags = []
+    if args.hotspots:
+        active_flags.append("-H")
+    if args.propagation:
+        active_flags.append("-P")
+    if args.clones:
+        active_flags.append("-C")
+    if args.echo_comments:
+        active_flags.append("-E")
+
+    # Print parameter header
+    from .formatters.flag_formatter import format_parameters_header
+
+    header = format_parameters_header(
+        active_flags=active_flags,
+        risk_threshold=args.risk_threshold,
+        propagation_threshold=args.propagation_threshold,
+        clone_threshold=args.clone_threshold,
+        echo_threshold=args.echo_threshold,
+        limit=args.limit,
+        dry_run=args.dry_run,
+    )
+    print(header)
+    print()  # Blank line
+
+    params = FlagParams(
+        source_dir=str(root_path),
+        hotspots=args.hotspots,
+        propagation=args.propagation,
+        clones=args.clones,
+        echo_comments=args.echo_comments,
+        risk_threshold=args.risk_threshold,
+        propagation_threshold=args.propagation_threshold,
+        clone_threshold=args.clone_threshold,
+        echo_threshold=args.echo_threshold,
+        dry_run=args.dry_run,
+        backup=args.backup,
+        verbose=args.verbose,
+        exclude_tests=not args.include_tests,
+        remove_comments=args.remove_comments,
+        output_format=args.format,
+        limit=args.limit,
+    )
+
+    daemon_result = try_daemon_flag(params, host=config.daemon.host, port=config.daemon.port)
+
+    if daemon_result is not None:
+        if "error" in daemon_result:
+            logger.error(f"Flag command error: {daemon_result['error']}")
+            return 1
+
+        items = daemon_result.get("items", [])
+
+        # Apply limit ONLY in dry-run mode
+        if args.dry_run and args.limit is not None:
+            items = items[: args.limit]
+
+        formatted_output = formatter.format_items(items, args.format, args.reverse)
+        stats_output = formatter.format_stats(daemon_result) if args.stats else None
+        _print_flag_output(formatted_output, stats_output, args.reverse)
+        elapsed_ms = (time.time() - start_time) * 1000
+        if args.verbose:
+            count = daemon_result.get("flagged_count", 0)
+            files = daemon_result.get("files_modified", 0)
+            mode = "preview" if args.dry_run else "applied"
+            print(f"\n[Daemon mode] Flagged {count} objects in {files} files ({mode}) in {elapsed_ms:.1f}ms", file=sys.stderr)
+        return 0
+
+    logger.warning("Daemon not available, falling back to direct analysis...")
+    try:
+        from .mcp.flag_insertion import flag_code
+        from .cache import CacheManager
+
+        cache = CacheManager(root_path)
+        indices = cache.load_or_rebuild()
+
+        clone_mode = _get_clone_mode(args)
+        result = flag_code(
+            entities=indices.entities,
+            graph=indices.graph,
+            pagerank=indices.pagerank,
+            source_dir=str(root_path),
+            hotspots=args.hotspots,
+            propagation=args.propagation,
+            clones=args.clones,
+            echo_comments=args.echo_comments,
+            risk_threshold=args.risk_threshold,
+            propagation_threshold=args.propagation_threshold,
+            clone_threshold=args.clone_threshold,
+            echo_threshold=args.echo_threshold,
+            clone_mode=clone_mode,
+            line_threshold=getattr(args, "line_threshold", 0.70),
+            func_threshold=getattr(args, "func_threshold", 0.50),
+            dry_run=args.dry_run,
+            backup=args.backup,
+            verbose=args.verbose,
+            exclude_tests=not args.include_tests,
+            remove_comments=args.remove_comments,
+        )
+
+        if "error" in result:
+            logger.error(f"Flag command error: {result['error']}")
+            return 1
+
+        items = result.get("items", [])
+
+        # Apply limit ONLY in dry-run mode
+        if args.dry_run and args.limit is not None:
+            items = items[: args.limit]
+
+        formatted_output = formatter.format_items(items, args.format, args.reverse)
+        stats_output = formatter.format_stats(result) if args.stats else None
+        _print_flag_output(formatted_output, stats_output, args.reverse)
+        elapsed_ms = (time.time() - start_time) * 1000
+        if args.verbose:
+            count = result.get("flagged_count", 0)
+            files = result.get("files_modified", 0)
+            mode = "preview" if args.dry_run else "applied"
+            print(f"\n[Direct mode] Flagged {count} objects in {files} files ({mode}) in {elapsed_ms:.1f}ms", file=sys.stderr)
+        return 0
+
+    except Exception as e:
+        logger.error(f"Flag command failed: {e}")
+        if args.verbose:
+            traceback.print_exc()
+        return 1
+
+
+def handle_flag_clear_command(args: argparse.Namespace, root_path: Path, config) -> int:
+    """Handle flag clear command to remove [CODEN] comments."""
+    start_time = time.time()
+    formatter = FlagFormatter()
+
+    # Validate root path
+    if not root_path.exists():
+        print(f"Error: Path does not exist: {root_path}", file=sys.stderr)
+        return 1
+    if not root_path.is_dir():
+        print(f"Error: Path is not a directory: {root_path}", file=sys.stderr)
+        return 1
+
+    params = FlagClearParams(
+        source_dir=str(root_path),
+        dry_run=args.dry_run,
+        verbose=args.verbose,
+    )
+
+    daemon_result = try_daemon_flag_clear(params, host=config.daemon.host, port=config.daemon.port)
+
+    if daemon_result is not None:
+        if "error" in daemon_result:
+            logger.error(f"Flag clear error: {daemon_result['error']}")
+            return 1
+
+        stats_output = formatter.format_clear_stats(daemon_result)
+        print(stats_output)
+        elapsed_ms = (time.time() - start_time) * 1000
+        if args.verbose:
+            print(f"\n[Daemon mode] Clear completed in {elapsed_ms:.1f}ms", file=sys.stderr)
+        return 0
+
+    logger.warning("Daemon not available, falling back to direct analysis...")
+    try:
+        from .mcp.flag_insertion import flag_clear
+
+        result = flag_clear(
+            source_dir=str(root_path),
+            dry_run=args.dry_run,
+            verbose=args.verbose,
+        )
+
+        if "error" in result:
+            logger.error(f"Flag clear error: {result['error']}")
+            return 1
+
+        stats_output = formatter.format_clear_stats(result)
+        print(stats_output)
+        elapsed_ms = (time.time() - start_time) * 1000
+        if args.verbose:
+            print(f"\n[Direct mode] Clear completed in {elapsed_ms:.1f}ms", file=sys.stderr)
+        return 0
+
+    except Exception as e:
+        logger.error(f"Flag clear failed: {e}")
+        if args.verbose:
+            traceback.print_exc()
+        return 1
 
 
 def _daemon_start(host: str, port: int, max_projects: int, idle_timeout: str | None, verbose: bool, no_watch: bool = False) -> int:
@@ -436,71 +1220,36 @@ def handle_config_command(args: list[str]) -> int:
 
     elif args[0] == "set" and len(args) >= 3:
         # config set <key> <value>
-        # Keys: model.default, agent.max_steps, daemon.port, etc.
+        # Supports both "section.key" format (e.g., agent.debug) and flat keys (e.g., debug)
         key_path = args[1]
         value = args[2]
 
         config = load_config()
         parts = key_path.split(".")
 
-        if len(parts) != 2:
-            print(f"Invalid key format: {key_path}. Use section.key (e.g., model.default)", file=sys.stderr)
+        # Determine the actual key to look up
+        if len(parts) == 2:
+            section, key = parts
+            # Validate section matches expected location
+            if key in SETTING_LOCATIONS:
+                expected_section = SETTING_LOCATIONS[key][0]
+                if section != expected_section:
+                    print(f"Key '{key}' belongs to section '{expected_section}', not '{section}'", file=sys.stderr)
+                    return 1
+        elif len(parts) == 1:
+            key = parts[0]
+        else:
+            print(f"Invalid key format: {key_path}. Use key or section.key (e.g., debug or agent.debug)", file=sys.stderr)
             return 1
 
-        section, key = parts
-
-        try:
-            if section == "model":
-                if key == "default":
-                    config.model.default = value
-                elif key == "base_url":
-                    config.model.base_url = value if value.lower() != "null" else None
-                else:
-                    print(f"Unknown key: {key_path}", file=sys.stderr)
-                    return 1
-            elif section == "agent":
-                if key == "max_steps":
-                    config.agent.max_steps = int(value)
-                elif key == "max_retries":
-                    config.agent.max_retries = int(value)
-                elif key == "debug":
-                    config.agent.debug = value.lower() in ("true", "1", "yes")
-                else:
-                    print(f"Unknown key: {key_path}", file=sys.stderr)
-                    return 1
-            elif section == "daemon":
-                if key == "host":
-                    config.daemon.host = value
-                elif key == "port":
-                    config.daemon.port = int(value)
-                elif key == "socket_timeout":
-                    config.daemon.socket_timeout = float(value)
-                elif key == "max_projects":
-                    config.daemon.max_projects = int(value)
-                else:
-                    print(f"Unknown key: {key_path}", file=sys.stderr)
-                    return 1
-            elif section == "search":
-                if key == "default_tokens":
-                    config.search.default_tokens = int(value)
-                elif key == "default_limit":
-                    config.search.default_limit = int(value)
-                elif key == "semantic_model_path":
-                    config.search.semantic_model_path = value if value.lower() != "null" else None
-                else:
-                    print(f"Unknown key: {key_path}", file=sys.stderr)
-                    return 1
-            else:
-                print(f"Unknown section: {section}. Valid sections: model, agent, daemon, search", file=sys.stderr)
-                return 1
-
-            save_config(config)
-            print(f"Set {key_path} = {value}")
-            return 0
-
-        except ValueError as e:
-            print(f"Invalid value for {key_path}: {e}", file=sys.stderr)
+        success, error = set_config_value(config, key, value)
+        if not success:
+            print(error, file=sys.stderr)
             return 1
+
+        save_config(config)
+        print(f"Set {key} = {value}")
+        return 0
 
     else:
         print("Usage: coden config [show|path|reset|set <key> <value>]")
@@ -512,7 +1261,7 @@ def handle_config_command(args: list[str]) -> int:
         print("\nKeys:")
         print("  model.default, model.base_url")
         print("  agent.max_steps, agent.max_retries, agent.debug")
-        print("  daemon.host, daemon.port, daemon.socket_timeout, daemon.max_projects")
+        print("  daemon.host, daemon.port, daemon.daemon_timeout, daemon.max_projects")
         print("  search.default_tokens, search.default_limit, search.semantic_model_path")
         return 1
 
@@ -633,6 +1382,50 @@ def handle_cache_command(args: list[str]) -> int:
         return 1
 
 
+def handle_reset_command() -> int:
+    """Handle reset command: clear all caches, stop daemon, reset config."""
+    exit_code = 0
+    config = get_config()
+
+    # 1. Clear all caches
+    print("Clearing all caches...")
+    count, errors = CacheManager.clear_all_caches()
+    if count > 0:
+        print(f"  Cleared {count} project cache(s)")
+    else:
+        print("  No caches to clear")
+    for error in errors:
+        print(f"  Warning: {error}", file=sys.stderr)
+        exit_code = 1
+
+    # 2. Stop daemon
+    print("Stopping daemon...")
+    running, pid = is_daemon_running()
+    if not running:
+        print("  Daemon is not running")
+    else:
+        if stop_daemon(config.daemon.host, config.daemon.port):
+            print(f"  Daemon stopped (was PID: {pid})")
+        else:
+            print(f"  Failed to stop daemon (PID: {pid})", file=sys.stderr)
+            exit_code = 1
+
+    # 3. Reset configuration
+    print("Resetting configuration...")
+    if reset_config():
+        print("  Configuration reset to defaults")
+    else:
+        print("  Failed to reset configuration", file=sys.stderr)
+        exit_code = 1
+
+    if exit_code == 0:
+        print("\nReset complete.")
+    else:
+        print("\nReset completed with warnings.", file=sys.stderr)
+
+    return exit_code
+
+
 class DefaultValueHelpFormatter(argparse.RawDescriptionHelpFormatter):
     """Argparse help formatter that appends default values to each argument help."""
 
@@ -737,8 +1530,103 @@ def create_daemon_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def create_flag_parser(config) -> argparse.ArgumentParser:
+    """Create parser for flag command with clear subcommand."""
+    parser = argparse.ArgumentParser(
+        prog="coden flag",
+        description="Insert [CODEN] comments in source code based on analysis results",
+        formatter_class=DefaultValueHelpFormatter,
+    )
+
+    subparsers = parser.add_subparsers(dest="flag_action", help="Flag action")
+
+    # Main flag command (default)
+    flag_parser = subparsers.add_parser(
+        "add",
+        help="Add [CODEN] flags to code (default if path given)"
+    )
+    _add_flag_arguments(flag_parser, config)
+
+    # Clear subcommand
+    clear_parser = subparsers.add_parser(
+        "clear",
+        help="Remove all [CODEN] flags from code"
+    )
+    clear_parser.add_argument("root", nargs="?", default=".",
+                              help="Repository root directory")
+    clear_parser.add_argument("--dry-run", action="store_true",
+                              help="Preview changes without modifying files")
+    clear_parser.add_argument("-v", "--verbose", action="store_true",
+                              help="Verbose output")
+    clear_parser.add_argument("-f", "--format", default="tree",
+                              choices=["tree", "json"],
+                              help="Output format")
+    clear_parser.add_argument("-r", "--reverse", action="store_true",
+                              help="Reverse output order")
+    clear_parser.add_argument("--stats", action="store_true",
+                              help="Show summary statistics")
+
+    return parser
+
+
+def _add_flag_arguments(parser: argparse.ArgumentParser, config) -> None:
+    """Add common flag arguments to a parser."""
+    parser.add_argument("root", nargs="?", default=".",
+                        help="Repository root directory")
+
+    # Analysis type flags
+    analysis_group = parser.add_argument_group("Analysis Types (at least one required)")
+    analysis_group.add_argument("-H", "--hotspots", action="store_true",
+                                help="Flag coupling hotspots")
+    analysis_group.add_argument("-P", "--propagation", action="store_true",
+                                help="Flag high propagation cost functions")
+    analysis_group.add_argument("-C", "--clones", action="store_true",
+                                help="Flag code clones")
+    analysis_group.add_argument("--clone-semantic", action="store_true",
+                                help="Clone detection: semantic only (Model2Vec embeddings)")
+    analysis_group.add_argument("--clone-syntactic", action="store_true",
+                                help="Clone detection: syntactic only (line-by-line Jaccard)")
+    analysis_group.add_argument("--line-threshold", type=float, default=0.70,
+                                help="Line similarity threshold for syntactic clones")
+    analysis_group.add_argument("--func-threshold", type=float, default=0.50,
+                                help="Function match threshold for syntactic clones")
+    analysis_group.add_argument("--semantic-weight", type=float, default=0.65,
+                                help="Weight for semantic similarity in combined score")
+    analysis_group.add_argument("--syntactic-weight", type=float, default=0.35,
+                                help="Weight for syntactic similarity in combined score")
+    analysis_group.add_argument("-E", "--echo-comments", action="store_true",
+                                help="Detect and flag echo comments - comments that merely restate what the code already says (e.g., '# Calculate total' above calculate_total())")
+
+    # Threshold options (uses centralized THRESHOLD_CONFIGS for maintainability)
+    threshold_group = parser.add_argument_group("Threshold Options")
+    for threshold_config in THRESHOLD_CONFIGS.values():
+        add_threshold_argument(threshold_group, threshold_config, use_detailed_help=True)
+
+    # Behavior options
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Preview changes without modifying files")
+    parser.add_argument("--backup", action="store_true",
+                        help="Create .coden-backup files before modifying")
+    parser.add_argument("--remove-comments", action="store_true",
+                        help="Delete detected echo comments entirely instead of flagging with [CODEN] markers (use with -E)")
+    parser.add_argument("--include-tests", action="store_true",
+                        help="Include test files in analysis. By default, test files are excluded to focus on production code")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Verbose output")
+    parser.add_argument("-f", "--format", default="tree",
+                        choices=["tree", "json"],
+                        help="Output format")
+    parser.add_argument("-r", "--reverse", action="store_true",
+                        help="Reverse output order (highest severity last)")
+    parser.add_argument("--stats", action="store_true",
+                        help="Show summary statistics")
+    parser.add_argument("-n", "--limit", type=int, default=config.search.default_limit,
+                        help="Limit results (default: 20, use -n -1 for all; dry-run preview only)")
+
+
 def run_direct_search(args: argparse.Namespace, root_path: Path, cache: CacheManager, app_config) -> int:
     """Run search directly (fallback when daemon not available)."""
+    args.limit = normalize_limit(args.limit)
     try:
         # Create search config from CLI args
         config = SearchConfig(
@@ -772,6 +1660,10 @@ def run_direct_search(args: argparse.Namespace, root_path: Path, cache: CacheMan
 
         # Execute pipeline
         result = pipeline.execute()
+
+        if args.enable_semantic and args.query:
+            print(format_semantic_search_header(args.query))
+            print()
 
         # Print output in correct order based on reverse flag
         print_search_output(
@@ -844,6 +1736,8 @@ Subcommands:
   daemon                Manage daemon (start, stop, status)
   cache                 Manage caches (list, clear, status)
   config                Manage configuration (show, set, reset)
+  flag                  Add/remove [CODEN] comments based on analysis
+  reset                 Reset everything (clear caches, stop daemon, reset config)
 
 Examples:
   coden                              # Context map of current directory
@@ -851,10 +1745,21 @@ Examples:
   coden -q "database" -sr --stats    # Semantic search, reversed, with stats
   coden --find UserAuth --show-deps  # Find identifier with dependencies
   coden -H -r --stats -n 20          # Top 20 refactoring hotspots
+  coden -C --clone-threshold 0.90          # Find code clones (90% similarity)
+  coden -C --clone-semantic               # Semantic-only clone detection (Model2Vec)
+  coden -C --clone-syntactic              # Syntactic-only clone detection (Jaccard)
+  coden -C --semantic-weight 0.5          # Adjust combined mode weights
+  coden -P --breakdown               # Architecture health with module breakdown
+  coden -P --critical-paths --stats  # Propagation cost with critical paths
+  coden -E --echo-threshold 0.85     # Detect echo comments (redundant comments)
+  coden -E --remove-comments         # Remove echo comments directly (no preview)
+  coden -E --remove-comments --dry-run  # Preview echo comment removal
+  coden flag -E --remove-comments    # Alternative: use flag subcommand
+  coden flag -C --dry-run            # Preview clone flags without modifying
+  coden flag -HPCE --backup          # Flag all issues with backup files
+  coden flag clear                   # Remove all [CODEN] comments
   coden serve                        # MCP server (stdio)
-  coden serve --transport http -p 8000  # MCP server (HTTP)
   coden -a                           # Interactive agent
-  coden agent -m ollama:qwen2.5-coder:14b
         """
     )
 
@@ -868,10 +1773,46 @@ Examples:
                         help="Find specific identifier")
     parser.add_argument("-H", "--hotspots", action="store_true",
                         help="Find refactoring hotspots (high coupling + complexity)")
+    parser.add_argument("-C", "--clones", action="store_true",
+                        help="Detect code clones - find semantically similar functions for refactoring")
+    parser.add_argument("--clone-semantic", action="store_true",
+                        help="Clone detection: semantic only (Model2Vec embeddings)")
+    parser.add_argument("--clone-syntactic", action="store_true",
+                        help="Clone detection: syntactic only (line-by-line Jaccard)")
+    parser.add_argument("--line-threshold", type=float, default=0.70,
+                        help="Line similarity threshold for syntactic clone detection (0.0-1.0, default: 0.70)")
+    parser.add_argument("--func-threshold", type=float, default=0.50,
+                        help="Function match threshold for syntactic clone detection (0.0-1.0, default: 0.50)")
+    parser.add_argument("--semantic-weight", type=float, default=0.65,
+                        help="Weight for semantic similarity in combined score (0.0-1.0, default: 0.65)")
+    parser.add_argument("--syntactic-weight", type=float, default=0.35,
+                        help="Weight for syntactic similarity in combined score (0.0-1.0, default: 0.35)")
+    parser.add_argument("-P", "--propagation", action="store_true",
+                        help="Analyze propagation cost (architecture coupling)")
+    parser.add_argument("-E", "--echo-comments", action="store_true",
+                        help="Detect echo comments - comments that merely restate what the code already says")
+    parser.add_argument("--breakdown", action="store_true",
+                        help="Include per-module breakdown (with -P)")
+    parser.add_argument("--critical-paths", action="store_true",
+                        help="Show most connected paths (with -P)")
+
+    # Threshold options for all analysis modes (uses centralized THRESHOLD_CONFIGS)
+    add_threshold_argument(parser, THRESHOLD_CONFIGS["risk"], use_detailed_help=False)
+    add_threshold_argument(parser, THRESHOLD_CONFIGS["propagation"], use_detailed_help=False)
+    add_threshold_argument(parser, THRESHOLD_CONFIGS["clone"], use_detailed_help=False)
+    add_threshold_argument(parser, THRESHOLD_CONFIGS["echo"], use_detailed_help=False)
+    def _validate_min_lines(value):
+        ival = int(value)
+        if ival < 1:
+            raise argparse.ArgumentTypeError(f"min-lines must be at least 1, got {ival}")
+        return ival
+    parser.add_argument("--min-lines", type=_validate_min_lines, default=3,
+                        metavar="INT",
+                        help="Minimum function lines to consider (default: 3, minimum: 1)")
     parser.add_argument("--tokens", type=int, default=None,
                         help="Token budget (default: unlimited, only -n/--limit controls result count)")
     parser.add_argument("-n", "--limit", type=int, default=config.search.default_limit,
-                        help="Max results")
+                        help="Max results (default: 20, use -n -1 for all)")
     parser.add_argument("-f", "--format", choices=["xml", "markdown", "tree", "json"],
                         default="tree", help="Output format")
     parser.add_argument("--show-deps", action="store_true",
@@ -886,6 +1827,16 @@ Examples:
                         help="Enable semantic search (Model2Vec)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Verbose logging")
+
+    # File modification options (for -E with --remove-comments)
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Preview changes without modifying files (use with -E --remove-comments)")
+    parser.add_argument("--backup", action="store_true",
+                        help="Create .coden-backup files before modifying (use with -E --remove-comments)")
+    parser.add_argument("--remove-comments", action="store_true",
+                        help="Delete detected echo comments entirely instead of just displaying them (use with -E)")
+    parser.add_argument("--include-tests", action="store_true",
+                        help="Include test files in analysis (use with -E). By default, test files are excluded")
     return parser
 
 
@@ -917,7 +1868,6 @@ def handle_agent_command(args: argparse.Namespace, config) -> int:
 
     try:
         from .agent import run_interactive
-        import asyncio
     except ImportError:
         logger.error("pydantic-ai not installed. Run: pip install coden-retriever[agent]")
         return 1
@@ -965,16 +1915,24 @@ def handle_hotspots_command(args: argparse.Namespace, root_path: Path, config) -
     Returns:
         Exit code (0 for success, 1 for failure)
     """
-    import time as time_module
+    args.limit = normalize_limit(args.limit)
+    start_time = time.time()
 
-    start_time = time_module.time()
+    # Print parameter header before results
+    header = format_hotspots_parameters_header(
+        risk_threshold=args.risk_threshold,
+        exclude_tests=True,
+        limit=args.limit,
+    )
+    print(header)
+    print()  # Blank line
 
     # Create GraphAnalysisParams for hotspots
     params = GraphAnalysisParams(
         source_dir=str(root_path),
         limit=args.limit,
         exclude_tests=True,
-        token_limit=args.tokens if args.tokens else 4000,
+        token_limit=args.tokens,  # None = no limit for CLI
         min_coupling_score=10,
         exclude_private=False,
     )
@@ -983,8 +1941,17 @@ def handle_hotspots_command(args: argparse.Namespace, root_path: Path, config) -
     daemon_result = try_daemon_hotspots(params, host=config.daemon.host, port=config.daemon.port)
 
     if daemon_result is not None:
-        hotspots = daemon_result.get("hotspots", [])
+        all_hotspots = daemon_result.get("hotspots", [])
         summary = daemon_result.get("summary", {})
+
+        # Filter by threshold (only include hotspots above risk threshold)
+        threshold_filtered = [
+            h for h in all_hotspots
+            if h.get("risk_score", 0) >= args.risk_threshold
+        ]
+
+        # Apply defensive limit (ensures contract compliance)
+        hotspots = apply_defensive_limit(threshold_filtered, args.limit)
 
         # Format output
         formatted_output = format_hotspots_output(
@@ -996,10 +1963,10 @@ def handle_hotspots_command(args: argparse.Namespace, root_path: Path, config) -
         # Format stats if requested
         stats_output = format_hotspots_stats(summary) if args.stats else None
 
-        # Print output
-        print_hotspots_output(formatted_output, stats_output, args.reverse)
+        # Print output with contract-compliant ordering
+        print_metric_output(formatted_output, stats_output, args.reverse)
 
-        elapsed_ms = (time_module.time() - start_time) * 1000
+        elapsed_ms = (time.time() - start_time) * 1000
         if args.verbose:
             print(f"\n[Daemon mode] Hotspots time: {elapsed_ms:.1f}ms, "
                   f"Results: {len(hotspots)}", file=sys.stderr)
@@ -1008,7 +1975,6 @@ def handle_hotspots_command(args: argparse.Namespace, root_path: Path, config) -
     # If daemon not available, try direct mode via MCP tool
     logger.warning("Daemon not available, falling back to direct analysis...")
     try:
-        import asyncio
         from .mcp.graph_analysis import coupling_hotspots
 
         result = asyncio.run(coupling_hotspots(
@@ -1017,11 +1983,20 @@ def handle_hotspots_command(args: argparse.Namespace, root_path: Path, config) -
             min_coupling_score=10,
             exclude_tests=True,
             exclude_private=False,
-            token_limit=args.tokens if args.tokens else 4000,
+            token_limit=args.tokens,  # None = no limit for CLI
         ))
 
-        hotspots = result.get("hotspots", [])
+        all_hotspots = result.get("hotspots", [])
         summary = result.get("summary", {})
+
+        # Filter by threshold (only include hotspots above risk threshold)
+        threshold_filtered = [
+            h for h in all_hotspots
+            if h.get("risk_score", 0) >= args.risk_threshold
+        ]
+
+        # Apply defensive limit (ensures contract compliance)
+        hotspots = apply_defensive_limit(threshold_filtered, args.limit)
 
         formatted_output = format_hotspots_output(
             hotspots,
@@ -1029,9 +2004,9 @@ def handle_hotspots_command(args: argparse.Namespace, root_path: Path, config) -
             reverse=args.reverse,
         )
         stats_output = format_hotspots_stats(summary) if args.stats else None
-        print_hotspots_output(formatted_output, stats_output, args.reverse)
+        print_metric_output(formatted_output, stats_output, args.reverse)
 
-        elapsed_ms = (time_module.time() - start_time) * 1000
+        elapsed_ms = (time.time() - start_time) * 1000
         if args.verbose:
             print(f"\n[Direct mode] Hotspots time: {elapsed_ms:.1f}ms, "
                   f"Results: {len(hotspots)}", file=sys.stderr)
@@ -1046,6 +2021,7 @@ def handle_hotspots_command(args: argparse.Namespace, root_path: Path, config) -
 
 def handle_search_command(args: argparse.Namespace, config) -> int:
     """Handle search (default) mode."""
+    args.limit = normalize_limit(args.limit)
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
@@ -1054,9 +2030,21 @@ def handle_search_command(args: argparse.Namespace, config) -> int:
         logger.error(f"Invalid root path: {args.root}")
         return 1
 
+    # Handle propagation mode separately
+    if args.propagation:
+        return handle_propagation_command(args, root_path, config)
+
+    # Handle clones mode separately
+    if args.clones:
+        return handle_clones_command(args, root_path, config)
+
     # Handle hotspots mode separately
     if args.hotspots:
         return handle_hotspots_command(args, root_path, config)
+
+    # Handle echo comments mode separately
+    if args.echo_comments:
+        return handle_echo_comments_command(args, root_path, config)
 
     # Create cache manager (use config for model_path)
     cache = CacheManager(
@@ -1085,6 +2073,10 @@ def handle_search_command(args: argparse.Namespace, config) -> int:
     daemon_result = try_daemon_search(params, host=config.daemon.host, port=config.daemon.port)
 
     if daemon_result is not None:
+        if args.enable_semantic and args.query:
+            print(format_semantic_search_header(args.query))
+            print()
+
         print_search_output(
             formatted_output=daemon_result.get("output", ""),
             tree_output=None,
@@ -1147,11 +2139,35 @@ def main() -> int:
                 return 1
             return handle_daemon_command(args)
 
+        if cmd == "flag":
+            flag_parser = create_flag_parser(config)
+            # Check if there's a subcommand or just a path
+            remaining_args = sys.argv[2:]
+            if remaining_args and remaining_args[0] == "clear":
+                args = flag_parser.parse_args(remaining_args)
+                root_path = Path(args.root).resolve()
+                return handle_flag_clear_command(args, root_path, config)
+            else:
+                # Default to "add" action - parse as if "add" was specified
+                # Create a simple parser for the add command
+                add_parser = argparse.ArgumentParser(
+                    prog="coden flag",
+                    description="Insert [CODEN] comments in source code based on analysis results",
+                    formatter_class=DefaultValueHelpFormatter,
+                )
+                _add_flag_arguments(add_parser, config)
+                args = add_parser.parse_args(remaining_args)
+                root_path = Path(args.root).resolve()
+                return handle_flag_command(args, root_path, config)
+
         if cmd == "config":
             return handle_config_command(sys.argv[2:])
 
         if cmd == "cache":
             return handle_cache_command(sys.argv[2:])
+
+        if cmd == "reset":
+            return handle_reset_command()
 
     # Default: search mode
     parser = create_search_parser(config)

@@ -17,11 +17,13 @@ from typing import AsyncIterator, Optional
 
 from pydantic_ai.mcp import MCPServerStdio
 
+from ..constants import DEFAULT_MAX_RETRIES
+
 
 def create_mcp_server(
     disabled_tools: Optional[list[str]] = None,
     timeout: Optional[float] = None,
-    max_retries: int = 3,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> MCPServerStdio:
     """Create an MCP server instance for coden-retriever.
 
@@ -31,7 +33,7 @@ def create_mcp_server(
     Args:
         disabled_tools: Optional list of tool names to disable.
         timeout: Optional timeout in seconds.
-        max_retries: Maximum retry attempts for tool calls (default: 3).
+        max_retries: Maximum retry attempts for tool calls (default: DEFAULT_MAX_RETRIES).
 
     Returns:
         Configured MCPServerStdio instance.
@@ -57,14 +59,14 @@ def create_mcp_server(
 async def mcp_server_context(
     disabled_tools: Optional[list[str]] = None,
     timeout: Optional[float] = None,
-    max_retries: int = 3,
+    max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> AsyncIterator[MCPServerStdio]:
     """Context manager for MCP server with automatic cleanup.
 
     Args:
         disabled_tools: Optional list of tool names to disable.
         timeout: Optional timeout in seconds.
-        max_retries: Maximum retry attempts for tool calls (default: 3).
+        max_retries: Maximum retry attempts for tool calls (default: DEFAULT_MAX_RETRIES).
 
     Yields:
         Connected MCPServerStdio instance.

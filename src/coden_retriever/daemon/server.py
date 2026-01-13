@@ -20,19 +20,21 @@ from pathlib import Path
 
 from ..cache import CacheManager, CachedIndices
 from ..config import CENTRAL_CACHE_DIR
+from ..constants import (
+    DEFAULT_DAEMON_HOST,
+    DEFAULT_DAEMON_PORT,
+    DEFAULT_MAX_PROJECTS,
+    DEFAULT_DAEMON_TIMEOUT,
+)
 from ..search import SearchEngine
 from ..watcher import BatchedChanges, FileWatcher
 from .handlers import create_handler_registry
 from .project_cache import ProjectCache
 from .protocol import (
-    DEFAULT_HOST,
-    DEFAULT_PORT,
     IDLE_CHECK_INTERVAL,
     MAX_MESSAGE_SIZE,
-    MAX_PROJECTS_DEFAULT,
     MESSAGE_DELIMITER,
     RECV_BUFFER_SIZE,
-    SOCKET_TIMEOUT,
     ErrorCode,
     Request,
     Response,
@@ -75,7 +77,7 @@ class DaemonRequestHandler(socketserver.StreamRequestHandler):
         buffer = b""
 
         try:
-            self.request.settimeout(SOCKET_TIMEOUT)
+            self.request.settimeout(DEFAULT_DAEMON_TIMEOUT)
 
             while True:
                 try:
@@ -120,9 +122,9 @@ class DaemonServer:
 
     def __init__(
         self,
-        host: str = DEFAULT_HOST,
-        port: int = DEFAULT_PORT,
-        max_projects: int = MAX_PROJECTS_DEFAULT,
+        host: str = DEFAULT_DAEMON_HOST,
+        port: int = DEFAULT_DAEMON_PORT,
+        max_projects: int = DEFAULT_MAX_PROJECTS,
         idle_timeout: int | None = None,
         verbose: bool = False,
         enable_watch: bool = True,
@@ -474,9 +476,9 @@ def remove_pid_file(pid_file: Path | None = None) -> None:
 
 
 def run_daemon(
-    host: str = DEFAULT_HOST,
-    port: int = DEFAULT_PORT,
-    max_projects: int = MAX_PROJECTS_DEFAULT,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
+    max_projects: int = DEFAULT_MAX_PROJECTS,
     idle_timeout: int | None = None,
     verbose: bool = False,
     foreground: bool = False,

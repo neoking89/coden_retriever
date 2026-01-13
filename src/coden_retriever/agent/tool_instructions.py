@@ -5,46 +5,81 @@ They are included by default in the system prompt (tool_instructions=True).
 
 Design Principles:
 - Explicit tool names: Instructions reference exact tool names to prevent hallucination
-- Synergy-focused: Emphasizes logical progression from broad → narrow
+- Synergy-focused: Emphasizes logical progression from broad to narrow
 - Mode-aware: Base instructions work for both CODING and STUDY modes
 """
 
 CODE_AGENT_TOOL_INSTRUCTIONS = """
 <tool_workflow>
-## Core Principle: BROAD → NARROW
+## Core Principle: BROAD TO NARROW
 Always start with architectural overview, then narrow down to specifics.
 
-## Intent → Strategy
+## Intent-Based Workflows
 
-| Intent | Signals | Tool Flow |
-|--------|---------|-----------|
-| Exploration | "How does X work?", "Explain architecture" | `code_map` → `code_search(mode="semantic")` → `read_source_range` |
-| Lookup | "Find class X", "Who calls Y?" | `find_identifier` → `trace_dependency_path` |
-| Reading | "Show me the code" | `find_identifier` → `read_source_range` (not full files) |
-| Debugging | "Fix error", stacktrace | `debug_stacktrace` → `read_source_range` → Suggest fix |
-| Modification | "Fix this", "Refactor" | `read_source_range` → `edit_file` → Verify |
-| Git/History | "Who changed this?" | `find_hotspots` → `code_evolution` |
-| Refactoring | "What should I refactor?", "Find complex code" | `coupling_hotspots` → `architectural_bottlenecks` → `read_source_range` |
-| Impact Analysis | "What breaks if I change X?" | `change_impact_radius` → `read_source_range` |
+For EXPLORATION ("How does X work?", "Explain architecture"):
+1. First call code_map for overview
+2. Then call code_search with mode="semantic" for related code
+3. Finally call read_source_range for specific details
+
+For LOOKUP ("Find class X", "Who calls Y?"):
+1. First call find_identifier to locate the symbol
+2. Then call trace_dependency_path to see connections
+
+For READING ("Show me the code"):
+1. First call find_identifier to locate the target
+2. Then call read_source_range for specific lines (not full files)
+
+For DEBUGGING ("Fix error", stacktrace present):
+1. First call debug_stacktrace to analyze the error
+2. Then call read_source_range for relevant code
+3. Finally suggest the fix
+
+For MODIFICATION ("Fix this", "Refactor"):
+1. First call read_source_range to understand current code
+2. Then call edit_file to make changes
+3. Finally verify the changes
+
+For GIT/HISTORY ("Who changed this?"):
+1. First call find_hotspots to identify active areas
+2. Then call code_evolution for change history
+
+For REFACTORING ("What should I refactor?", "Find complex code"):
+1. First call coupling_hotspots for high fan-in/fan-out areas
+2. Then call architectural_bottlenecks for architectural risks
+3. Finally call read_source_range for details
+
+For IMPACT ANALYSIS ("What breaks if I change X?"):
+1. First call change_impact_radius to find affected code
+2. Then call read_source_range for affected locations
 
 ## Tool Selection
 
-| You Know | Tool |
-|----------|------|
-| Exact symbol name (e.g. `AuthManager`) | `find_identifier(identifier="AuthManager")` |
-| Conceptual description (e.g. "auth logic") | `code_search(query="auth logic", mode="semantic")` |
-| Literal text (e.g. "TODO") | `code_search(query="TODO", mode="keyword")` |
-| Nothing specific | `code_map` first |
-| Need refactoring targets | `coupling_hotspots` (high fan-in x fan-out) |
-| Need architectural risks | `architectural_bottlenecks` (high betweenness) |
-| Need blast radius of a change | `change_impact_radius(symbol_name="...")` |
+| You Know | Tool to Use |
+|----------|-------------|
+| Exact symbol name | find_identifier |
+| Conceptual description | code_search with mode="semantic" |
+| Literal text pattern | code_search with mode="keyword" |
+| Nothing specific | code_map |
+| Need refactoring targets | coupling_hotspots |
+| Need architectural risks | architectural_bottlenecks |
+| Need blast radius of a change | change_impact_radius |
 
 ## Rules
-1. **Batch calls**: Multiple independent tool calls in ONE turn
-2. **Absolute paths**: Always use full paths from working directory
-3. **Cite sources**: Format `path/file.py:42`
-4. **On failure**: Try different terms, never repeat same failing query
-5. **No waste**: Use `read_source_range` for specific lines, not full files
+1. **Sequential workflow**: Execute tools in SEQUENTIAL order. Wait for each result before proceeding.
+2. **ONE tool per call**: Each tool call must use exactly ONE tool name.
+3. **Absolute paths**: Always use full paths from working directory
+4. **Cite sources**: Format path/file.py:42
+5. **On failure**: Try different terms, never repeat same failing query
+6. **No waste**: Use read_source_range for specific lines, not full files
+
+## When to STOP and Respond
+Stop calling tools and answer the user when:
+- You have enough information to answer the question
+- The requested modification succeeded (edit_file returned success)
+- You found the specific code, symbol, or file requested
+- All workflow steps for the intent are complete
+
+Do NOT call tools indefinitely. Respond once you have sufficient context.
 </tool_workflow>
 
 <debugging_strategy>
@@ -52,26 +87,29 @@ Always start with architectural overview, then narrow down to specifics.
 Use for runtime issues (wrong values, None mysteries). Skip for syntax/import errors.
 
 ### Interactive Debug Session (Python only!)
-Tools: `debug_session` (launch/stop), `debug_action` (step/continue), `debug_state` (breakpoints/eval/variables)
+Tools: debug_session (launch/stop), debug_action (step/continue), debug_state (breakpoints/eval/variables)
 
 ### Workflow
-1. `debug_session(action='launch', program='path/to/script.py', stop_on_entry=True)` → pauses at first line
-2. `debug_state(action='set_breakpoint', file_path='path/to/script.py', lines=[36])` → set breakpoint
-3. `debug_action(action='continue')` → run to breakpoint, auto-returns code + variables + stack
-4. `debug_state(action='eval', expression='variable_name')` → inspect specific values
-5. `debug_action(action='step_over')` → step through code, auto-returns context
-6. `debug_session(action='stop')` → cleanup
-Patterns: crash at N → breakpoint at N-1; wrong return → breakpoint at return line
+1. Call debug_session with action='launch', program='path/to/script.py', stop_on_entry=True. This pauses at first line.
+2. Call debug_state with action='set_breakpoint', file_path='path/to/script.py', lines=[36]. This sets breakpoint.
+3. Call debug_action with action='continue'. This runs to breakpoint and auto-returns code, variables, and stack.
+4. Call debug_state with action='eval', expression='variable_name'. This inspects specific values.
+5. Call debug_action with action='step_over'. This steps through code and auto-returns context.
+6. Call debug_session with action='stop'. This cleans up.
+
+Patterns:
+- If crash at line N, set breakpoint at line N-1
+- If wrong return value, set breakpoint at return line
 
 ### Breakpoint Injection (Python/Javascript/Typescript)
-Tools: `add_breakpoint`, `inject_trace`, `remove_injections`
+Tools: add_breakpoint, inject_trace, remove_injections
 
 | Extension | Breakpoint | Trace |
 |-----------|------------|-------|
-| .py | `breakpoint()` | `print()` |
-| .js/.ts/.jsx/.tsx/.mjs/.cjs | `debugger;` | `console.log()` |
+| .py | breakpoint() | print() |
+| .js/.ts/.jsx/.tsx/.mjs/.cjs | debugger; | console.log() |
 
-Always call `remove_injections(remove_all=True)` when done.
+Always call remove_injections with remove_all=True when done.
 </debugging_strategy>
 """
 
@@ -79,17 +117,40 @@ STUDY_MODE_TOOL_INSTRUCTIONS = """
 <study_tool_strategy>
 ## Tool Selection by Experience Level
 
-| Level | Start With | Then Use | Avoid |
-|-------|------------|----------|-------|
-| EXPLORER | `code_map` | `code_search(mode="semantic")`, `read_source_range` | Deep call graphs |
-| LEARNER | `find_identifier`, `trace_dependency_path` | `code_search` for connections | Overwhelming detail |
-| PRACTITIONER | `find_identifier`, `trace_dependency_path` | `read_source_range` (specific lines) | Over-explaining basics |
-| EXPERT | `trace_dependency_path`, `find_hotspots` | `code_evolution`, precise line ranges | Architecture overviews |
+For EXPLORER level users:
+1. Start with code_map for high-level overview
+2. Then use code_search for broader context
+3. Then use read_source_range for specific code
+4. Avoid: Deep call graphs (too complex)
+
+For LEARNER level users:
+1. Start with find_identifier to locate symbols
+2. Then use trace_dependency_path for connections
+3. Then use code_search to find related code
+4. Avoid: Overwhelming detail
+
+For PRACTITIONER level users:
+1. Start with find_identifier for direct lookup
+2. Then use trace_dependency_path for dependencies
+3. Then use read_source_range for specific lines only
+4. Avoid: Over-explaining basics
+
+For EXPERT level users:
+1. Start with trace_dependency_path for connections
+2. Then use find_hotspots for active areas
+3. Then use code_evolution for history
+4. Avoid: Architecture overviews (already known)
 
 ## Common Patterns
-- "How does X work?": `find_identifier` → `read_source_range` → `trace_dependency_path`
-- "Where is X used?": `find_identifier` → sample 2-3 callers with `read_source_range`
-- Batch related lookups in one turn for efficiency
+
+For "How does X work?":
+1. First call find_identifier to locate the symbol
+2. Then call read_source_range to read the code
+3. Then call trace_dependency_path for dependencies
+
+For "Where is X used?":
+1. First call find_identifier to find the symbol
+2. Then call read_source_range to sample 2-3 callers
 </study_tool_strategy>
 """
 

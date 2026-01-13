@@ -171,12 +171,12 @@ def format_step_rich(step: ReActStep) -> Group:
     # Observation (in a bordered panel)
     if step.observation:
         if step.observation.success:
-            status = "✓"
+            status = "[ok]"
             content = step.observation.result or ""
             style = "observation.success"
             border_style = "dim green"
         else:
-            status = "✗"
+            status = "[x]"
             content = step.observation.error or ""
             style = "observation.error"
             border_style = "dim red"
@@ -416,7 +416,7 @@ def print_warning(message: str) -> None:
         message: The warning message to display.
     """
     warning_text = Text()
-    warning_text.append("⚠️  Warning: ", style="warning")
+    warning_text.append("[!] Warning: ", style="warning")
     warning_text.append(message, style="warning")
     console.print(warning_text)
 
@@ -527,7 +527,7 @@ def print_fatal_error(e: BaseException, show_traceback: bool = True) -> None:
     if show_traceback:
         # Print full traceback for debugging
         console.print()
-        console.print("[dim]─── Traceback ───[/dim]")
+        console.print("[dim]--- Traceback ---[/dim]")
 
         # For ExceptionGroup, format all nested exceptions
         if hasattr(e, 'exceptions') and e.exceptions:

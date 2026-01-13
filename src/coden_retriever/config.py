@@ -1,15 +1,12 @@
 """
 Configuration module for coden-retriever.
 
-Contains enums, tuning parameters, and dynamic configuration settings.
-Invariant constant sets are in constants.py.
+Contains enums, tuning parameters, and configuration settings.
 """
 import hashlib
 import os
 from enum import Enum
 from pathlib import Path
-
-from .constants import IMPORTANT_FILES, SKIP_DIRS, SKIP_FILES, UTILITY_NAMES
 
 CENTRAL_CACHE_DIR = ".coden-retriever"
 
@@ -91,10 +88,37 @@ class Config:
         "usage": 1.0,     # Variable/type usage
     }
 
-    # Reference constants from constants.py for backwards compatibility
-    UTILITY_NAMES: set[str] = UTILITY_NAMES
-    SKIP_DIRS: set[str] = SKIP_DIRS
-    SKIP_FILES: set[str] = SKIP_FILES
+    # Functions that are utility sinks (high in-degree, low informational value)
+    UTILITY_NAMES: set[str] = {
+        "print", "println", "printf", "eprint", "eprintln",
+        "log", "debug", "info", "warn", "error", "trace", "fatal",
+        "console", "assert", "panic", "exit", "len", "str", "int",
+        "float", "bool", "list", "dict", "set", "tuple", "range",
+        "open", "close", "read", "write", "append", "extend",
+        "get", "set", "has", "delete", "remove", "pop", "push",
+        "toString", "valueOf", "hasOwnProperty", "getElementById",
+        "querySelector", "addEventListener", "setTimeout", "setInterval",
+    }
+
+    # Directories to skip during indexing
+    SKIP_DIRS: set[str] = {
+        "venv", "env", ".venv", ".env",
+        "node_modules", "bower_components",
+        ".git", ".svn", ".hg",
+        "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+        "dist", "build", "target", "out", "bin", "obj",
+        "vendor", "third_party", "external", "deps",
+        ".idea", ".vscode", ".vs",
+        "coverage", ".coverage", "htmlcov",
+        ".tox", ".nox",
+    }
+
+    # Files to skip during indexing
+    SKIP_FILES: set[str] = {
+        "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+        "poetry.lock", "Pipfile.lock", "Cargo.lock",
+        "go.sum", "composer.lock", "Gemfile.lock",
+    }
 
     # BM25 hyperparameters
     BM25_K1: float = 1.5
@@ -150,8 +174,15 @@ class Config:
     MAX_CODE_LINES: int = 50
     TREE_INDENT: str = "  "
 
-    # Reference constant from constants.py for backwards compatibility
-    IMPORTANT_FILES: set[str] = IMPORTANT_FILES
+    # Important files to always consider
+    IMPORTANT_FILES: set[str] = {
+        "README.md", "README.txt", "README.rst", "README",
+        "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg",
+        "package.json", "Cargo.toml", "go.mod", "pom.xml",
+        "Makefile", "CMakeLists.txt", "Dockerfile",
+        "main.py", "app.py", "index.js", "index.ts", "main.go",
+        "main.rs", "Main.java", "Program.cs",
+    }
 
     # Semantic search settings
     SEMANTIC_SCORE_THRESHOLD: float = 0.1  # Minimum similarity score to include

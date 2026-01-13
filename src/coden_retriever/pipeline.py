@@ -14,6 +14,7 @@ from .config import OutputFormat
 from .formatters import get_formatter
 from .formatters.base import OutputFormatter
 from .search.engine import SearchEngine
+from .token_estimator import count_tokens
 
 
 @dataclass
@@ -179,8 +180,6 @@ class SearchPipeline:
             self.config.show_deps,
         )
 
-        # Calculate actual tokens used
-        from .token_estimator import count_tokens
         used_tokens = 100  # Base overhead
         for result in filtered:
             code = result.entity.get_context_snippet()

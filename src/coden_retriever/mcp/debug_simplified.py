@@ -328,10 +328,10 @@ async def debug_action(
        - Wrong type? (e.g., str instead of int) - find the source
 
     2. COMMON PATTERNS:
-       - "TypeError: 'NoneType'" → Step back to find where None came from
-       - "KeyError: 'x'" → Check dict contents with debug_state(action='eval', expression='dict.keys()')
-       - "IndexError" → Eval 'len(list)' to see actual size vs expected
-       - Wrong output → Step through loop iterations, check accumulator variables
+       - "TypeError: 'NoneType'" -> Step back to find where None came from
+       - "KeyError: 'x'" -> Check dict contents with debug_state(action='eval', expression='dict.keys()')
+       - "IndexError" -> Eval 'len(list)' to see actual size vs expected
+       - Wrong output -> Step through loop iterations, check accumulator variables
 
     3. STEPPING STRATEGY:
        - step_over: When you trust a function works correctly
@@ -341,11 +341,11 @@ async def debug_action(
 
     4. EXAMPLE DEBUG SESSION:
        Bug: "calculate_total returns 0 instead of expected sum"
-       → Set breakpoint at return statement
-       → continue to breakpoint
-       → Check 'total' variable - is it 0? Why?
-       → Step back through loop - is it even executing?
-       → Eval 'len(items)' - empty list? That's the bug!
+       -> Set breakpoint at return statement
+       -> continue to breakpoint
+       -> Check 'total' variable - is it 0? Why?
+       -> Step back through loop - is it even executing?
+       -> Eval 'len(items)' - empty list? That's the bug!
     """
     try:
         client = get_dap_client()
@@ -481,9 +481,9 @@ async def debug_state(
 
     CONDITIONAL BREAKPOINTS:
        Use 'condition' parameter to only break when something is wrong:
-       - condition="len(items) == 0"  → Break only when list is empty
-       - condition="user is None"     → Break only when user lookup failed
-       - condition="i > 100"          → Break after 100 iterations
+       - condition="len(items) == 0"  -> Break only when list is empty
+       - condition="user is None"     -> Break only when user lookup failed
+       - condition="i > 100"          -> Break after 100 iterations
 
     EVAL EXPRESSION TIPS:
        - Check object attributes: "obj.__dict__"

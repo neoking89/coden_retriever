@@ -130,8 +130,8 @@ class StreamEventHandler:
         # Display truncated result
         if result_content:
             result_preview = self._truncate_result(str(result_content), max_len=300)
-            self.state.streamed_text += f"[dim]   → {escape(result_preview)}[/dim]\n"
-        self.state.streamed_text += "[bold green]   ✓ Done[/bold green]\n"
+            self.state.streamed_text += f"[dim]   -> {escape(result_preview)}[/dim]\n"
+        self.state.streamed_text += "[bold green]   [ok] Done[/bold green]\n"
         self._notify_update()
 
     def _format_tool_args(self, tool_args: Any, max_value_len: int = 50) -> str:

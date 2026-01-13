@@ -16,12 +16,16 @@ from rich.table import Table
 from ..cache import CacheManager
 from ..config import get_central_cache_root, get_project_cache_dir
 from ..config_loader import (
+    SETTING_LOCATIONS,
     SETTING_METADATA,
+    assign_config_value,
     get_config_file,
     load_config,
+    parse_config_value,
     reload_config,
     reset_config,
     save_config,
+    validate_config_value,
 )
 from .debug_logger import create_debug_logger
 from .rich_console import Panel, console
@@ -246,6 +250,13 @@ def cmd_config(args: list[str], context: "CommandContext") -> str:
             "max_tokens": str(max_tokens) if max_tokens is not None else "(model default)",
             "timeout": str(timeout),
             "api_key": "***" if api_key else "(not set)",
+            "host": config.daemon.host,
+            "port": str(config.daemon.port),
+            "daemon_timeout": str(config.daemon.daemon_timeout),
+            "max_projects": str(config.daemon.max_projects),
+            "default_tokens": str(config.search.default_tokens),
+            "default_limit": str(config.search.default_limit),
+            "semantic_model_path": config.search.semantic_model_path or "(default)",
         }
         settings = [
             (meta.key, runtime_values[meta.key], meta.long_desc)
@@ -270,75 +281,35 @@ def cmd_config(args: list[str], context: "CommandContext") -> str:
 
     if subcmd == "set" and len(args) >= 3:
         key = args[1].lower()
-        value = " ".join(args[2:])
+        value_str = " ".join(args[2:])
 
-        # Parse and validate value
-        if key not in SETTING_METADATA:
-            console.print(f"[red]Unknown setting: {key}[/red]")
-            console.print(f"[dim]Valid keys: {', '.join(sorted(SETTING_METADATA.keys()))}[/dim]")
+        # Parse value using centralized function
+        success, parsed_value, error = parse_config_value(key, value_str)
+        if not success:
+            console.print(f"[red]{error}[/red]")
             return "config_error"
 
-        # Type conversion based on metadata
-        meta = SETTING_METADATA[key]
-        if meta.value_type == "int":
-            try:
-                value = int(value)
-            except ValueError:
-                console.print(f"[red]{key} must be an integer[/red]")
-                return "config_error"
-        elif meta.value_type == "float":
-            try:
-                value = float(value)
-                # Validate range constraints
-                if key == "tool_filter_threshold":
-                    if not (0.0 <= value <= 1.0):
-                        console.print(f"[red]{key} must be between 0.0 and 1.0[/red]")
-                        return "config_error"
-                elif key == "temperature":
-                    if not (0.0 <= value <= 2.0):
-                        console.print(f"[red]{key} must be between 0.0 and 2.0[/red]")
-                        return "config_error"
-                elif key == "timeout":
-                    if value <= 0:
-                        console.print(f"[red]{key} must be greater than 0[/red]")
-                        return "config_error"
-            except ValueError:
-                console.print(f"[red]{key} must be a valid number[/red]")
-                return "config_error"
-        elif meta.value_type == "bool":
-            value = value.lower() in ("true", "1", "yes", "on")
+        # Validate value using centralized function
+        is_valid, error = validate_config_value(key, parsed_value)
+        if not is_valid:
+            console.print(f"[red]{error}[/red]")
+            return "config_error"
 
-        # Update context and config
-        setattr(context, key, value)
+        # Handle special case for base_url "(auto)"
+        if key == "base_url" and value_str == "(auto)":
+            parsed_value = None
 
-        # Persist to config
-        if key == "model":
-            config.model.default = value
-        elif key == "base_url":
-            config.model.base_url = value if value != "(auto)" else None
-        elif key == "max_steps":
-            config.agent.max_steps = value
-        elif key == "max_retries":
-            config.agent.max_retries = value
-        elif key == "debug":
-            config.agent.debug = value
-        elif key == "tool_instructions":
-            config.agent.tool_instructions = value
-        elif key == "ask_tool_permission":
-            config.agent.ask_tool_permission = value
-        elif key == "dynamic_tool_filtering":
-            config.agent.dynamic_tool_filtering = value
-        elif key == "tool_filter_threshold":
-            config.agent.tool_filter_threshold = value
-        # Model generation parameters
-        elif key == "temperature":
-            config.model.generation.temperature = value
-        elif key == "max_tokens":
-            config.model.generation.max_tokens = value
-        elif key == "timeout":
-            config.model.generation.timeout = value
-        elif key == "api_key":
-            config.model.generation.api_key = value if value else None
+        # Update context (for runtime settings that exist on context)
+        if hasattr(context, key):
+            setattr(context, key, parsed_value)
+
+        # Persist to config using centralized function
+        if key in SETTING_LOCATIONS:
+            assign_config_value(config, key, parsed_value)
+        else:
+            # Key exists in metadata but not in locations - display-only setting
+            console.print(f"[yellow]Warning: {key} is read-only[/yellow]")
+            return "config_error"
 
         if not save_config(config):
             console.print("[red]Warning: Failed to save config to disk[/red]")
@@ -346,7 +317,7 @@ def cmd_config(args: list[str], context: "CommandContext") -> str:
         # Update the global config cache so get_config() returns fresh values
         reload_config()
 
-        display_value = "***" if key == "api_key" and value else value
+        display_value = "***" if key == "api_key" and parsed_value else parsed_value
         console.print()
         console.print(f"[green]{key}[/green] = [cyan]{display_value}[/cyan]")
 
@@ -360,7 +331,8 @@ def cmd_config(args: list[str], context: "CommandContext") -> str:
         # Settings that require agent rebuild (applied immediately)
         rebuild_required = (
             "tool_instructions", "tool_filter_threshold",
-            "temperature", "max_tokens", "timeout", "api_key"
+            "temperature", "max_tokens", "timeout", "api_key",
+            "max_retries", "max_steps"
         )
 
         if key in rebuild_required:

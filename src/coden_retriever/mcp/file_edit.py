@@ -14,7 +14,7 @@ before they can be edited or overwritten. This prevents accidental overwrites.
 
 Security Note:
     By default, these tools can write to any absolute path the process has access to.
-    For sandboxed environments, configure ALLOWED_PATHS to restrict write locations.
+    For sandboxed environments, configure allowed paths via set_allowed_paths().
 
 Architecture Note:
     This module uses SOLID-compliant classes from file_edit_core.py:
@@ -22,8 +22,6 @@ Architecture Note:
     - PathPermissions: Path boundary checking and permission management
     - UndoManager: One-step undo buffer management
     - PatternMatcher: Regex pattern matching for SEARCH/REPLACE blocks
-
-    Backwards-compatible facade functions are provided for the original API.
 """
 import asyncio
 import difflib
@@ -35,7 +33,6 @@ from typing import TYPE_CHECKING, Annotated, Any
 from pydantic import Field
 
 from .file_edit_core import (
-    DEFAULT_MAX_CACHE_SIZE,
     get_file_cache,
     get_path_permissions,
     get_pattern_matcher,
@@ -47,44 +44,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Re-export MAX_CACHE_SIZE for backwards compatibility
-MAX_CACHE_SIZE = DEFAULT_MAX_CACHE_SIZE
-
 
 # =============================================================================
-# Backwards-Compatible Facade Functions
+# Helper Functions
 # =============================================================================
-# These functions maintain the original API while delegating to the new classes.
 
 
-def _init_allowed_paths_from_env() -> list[str]:
-    """Initialize ALLOWED_PATHS from environment variable if set.
-
-    Path separator logic:
-    - On Windows, paths like C:\\foo contain a colon, so we use os.pathsep (;)
-    - On Unix, we also use os.pathsep (:) for consistency with PATH conventions
-    - This ensures cross-platform compatibility without misinterpreting drive letters
-
-    Note: This function is kept for backwards compatibility. New code should use
-    PathPermissions.from_env() directly.
-    """
-    env_paths = os.environ.get("CODEN_RETRIEVER_ALLOWED_PATHS", "")
-    if env_paths:
-        return [p.strip() for p in env_paths.split(os.pathsep) if p.strip()]
-    return []
-
-
-# For backwards compatibility, ALLOWED_PATHS is kept as a module-level variable.
-# It is updated via set_allowed_paths() to stay in sync with PathPermissions.
-ALLOWED_PATHS: list[str] = []
-
-
-def _resolve_path(path: str) -> str:
-    """Resolve a path to absolute form.
-
-    As mandated by Amp and Antigravity protocols: all paths must be absolute.
-    """
-    return str(Path(path).resolve())
 
 
 def _validate_path_for_write(file_path: str) -> tuple[str, dict[str, Any] | None]:
@@ -128,10 +93,7 @@ def set_allowed_paths(paths: list[str]) -> None:
         paths: List of directory paths. Only files under these directories
                can be written. Empty list removes restrictions.
     """
-    global ALLOWED_PATHS
     get_path_permissions().set_allowed_paths(paths)
-    # Keep module-level variable in sync for backwards compatibility
-    ALLOWED_PATHS = get_path_permissions().get_allowed_paths()
 
 
 def get_allowed_paths() -> list[str]:

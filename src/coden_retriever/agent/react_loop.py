@@ -265,7 +265,7 @@ def format_step_for_display(step: ReActStep) -> str:
         lines.append(f"  Action: {step.action.tool_name}({args_str})")
 
     if step.observation:
-        status = "✓" if step.observation.success else "✗"
+        status = "[ok]" if step.observation.success else "[x]"
         content = step.observation.result or step.observation.error
         lines.append(f"  Observation: {status} {content}")
 

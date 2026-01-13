@@ -84,7 +84,6 @@ def generate_shallow_tree(
     max_items_per_dir: int = 15,
     collapse_threshold: int = 8,
     max_lines: int = 60,
-    use_ascii: bool = True,
 ) -> str:
     """
     Generate a compact, shallow directory tree for system prompt injection.
@@ -104,7 +103,6 @@ def generate_shallow_tree(
         max_items_per_dir: Max items to show per directory before collapsing (default: 15)
         collapse_threshold: If more than this many items, show summary (default: 8)
         max_lines: Maximum total lines in output (default: 60)
-        use_ascii: Use ASCII characters for compatibility (default: True)
 
     Returns:
         Compact tree string suitable for LLM context
@@ -116,8 +114,8 @@ def generate_shallow_tree(
     lines: list[str] = [f"{root_name}/"]
     truncated = False
 
-    # Tree drawing characters - pre-computed for speed
-    BRANCH, LAST, PIPE, SPACE = ("+-- ", "`-- ", "|   ", "    ") if use_ascii else ("├── ", "└── ", "│   ", "    ")
+    # Tree drawing characters - ASCII-safe for shell compatibility
+    BRANCH, LAST, PIPE, SPACE = ("+-- ", "`-- ", "|   ", "    ")
 
     # Pre-fetch skip sets for O(1) lookup
     skip_dirs = Config.SKIP_DIRS
@@ -390,8 +388,8 @@ class DirectoryTreeFormatter:
 
             for i, entry in enumerate(entries):
                 is_last = (i == len(entries) - 1)
-                connector = "└── " if is_last else "├── "
-                child_prefix = "    " if is_last else "│   "
+                connector = "`-- " if is_last else "+-- "
+                child_prefix = "    " if is_last else "|   "
 
                 if entry.is_dir():
                     output.append(f"{prefix}{connector}📂 {entry.name}/")
@@ -424,7 +422,7 @@ class DirectoryTreeFormatter:
                         file_prefix = prefix + child_prefix
                         for j, (entity, score) in enumerate(file_entities):
                             ent_is_last = (j == len(file_entities) - 1)
-                            ent_connector = "└── " if ent_is_last else "├── "
+                            ent_connector = "`-- " if ent_is_last else "+-- "
                             # Colored, clickable entity using Rich
                             ent_display = style.format_tree_entity(
                                 name=entity.name,

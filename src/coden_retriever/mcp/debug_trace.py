@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 
 from pydantic import Field
 
+from ..constants import DEFAULT_DEBUG_PORT
+
 if TYPE_CHECKING:
     from fastmcp import FastMCP
 
@@ -912,7 +914,7 @@ async def debug_server(
     port: Annotated[
         int,
         Field(description="Port for debugpy to listen on (only used with action='start')", ge=1024, le=65535),
-    ] = 5678,
+    ] = DEFAULT_DEBUG_PORT,
     wait_for_client: Annotated[
         bool,
         Field(description="Block until a debugger client connects (only used with action='start')"),

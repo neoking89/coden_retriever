@@ -302,7 +302,7 @@ def detect_high_connectivity(
 
 def apply_token_budget_filter(
     items: list[dict[str, Any]],
-    token_limit: int,
+    token_limit: int | None,
     used_tokens: int,
     tokens_per_item: int,
     text_fields: list[str],
@@ -311,7 +311,7 @@ def apply_token_budget_filter(
 
     Args:
         items: List of dictionaries to filter.
-        token_limit: Maximum tokens allowed.
+        token_limit: Maximum tokens allowed (None = unlimited, for CLI mode).
         used_tokens: Tokens already used.
         tokens_per_item: Base token overhead per item.
         text_fields: List of field names to include in token estimation.
@@ -319,6 +319,9 @@ def apply_token_budget_filter(
     Returns:
         Tuple of (filtered_items, token_budget_exceeded).
     """
+    if token_limit is None:
+        return items, False
+
     filtered = []
     budget_exceeded = False
 

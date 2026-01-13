@@ -12,6 +12,12 @@ from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from ..config_loader import GenerationSettings, get_config, load_config
+from ..constants import (
+    OLLAMA_DEFAULT_URL,
+    LLAMACPP_DEFAULT_URL,
+    OLLAMA_DEFAULT_API_KEY,
+    LLAMACPP_DEFAULT_API_KEY,
+)
 
 
 @dataclass
@@ -24,12 +30,12 @@ class ProviderConfig:
 
 PROVIDER_CONFIGS: dict[str, ProviderConfig] = {
     "llamacpp": ProviderConfig(
-        default_url="http://localhost:8080/v1",
-        default_api_key="not-needed",
+        default_url=LLAMACPP_DEFAULT_URL,
+        default_api_key=LLAMACPP_DEFAULT_API_KEY,
     ),
     "ollama": ProviderConfig(
-        default_url="http://localhost:11434/v1",
-        default_api_key="ollama",
+        default_url=OLLAMA_DEFAULT_URL,
+        default_api_key=OLLAMA_DEFAULT_API_KEY,
     ),
     "openai": ProviderConfig(
         default_url="",

@@ -8,9 +8,19 @@ Configuration is stored at ~/.coden-retriever/settings.json
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Optional, Any, Literal
+from typing import Optional, Any, Callable, Literal
+
+from .constants import (
+    OLLAMA_DEFAULT_URL,
+    LLAMACPP_DEFAULT_URL,
+    DEFAULT_DAEMON_HOST,
+    DEFAULT_DAEMON_PORT,
+    DEFAULT_DAEMON_TIMEOUT,
+    DEFAULT_MAX_PROJECTS,
+    DEFAULT_MAX_RETRIES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +38,7 @@ class SettingMeta:
     short_desc: str   # Brief description for tab completion
     long_desc: str    # Detailed description for /config display
     value_type: Literal["str", "int", "bool", "float"]  # Type of the setting value
+    env_var: Optional[str] = None  # Environment variable name (None = no env override)
 
 
 # Single source of truth for all user-facing setting metadata
@@ -37,12 +48,14 @@ SETTING_METADATA: dict[str, SettingMeta] = {
         "LLM model identifier",
         "ollama:name, llamacpp:name, openai:name (official API), or name+base_url",
         "str",
+        "CODEN_RETRIEVER_MODEL",
     ),
     "base_url": SettingMeta(
         "base_url",
         "API endpoint URL",
         "OpenAI-compatible endpoint (auto-detected for ollama/llamacpp)",
         "str",
+        "CODEN_RETRIEVER_BASE_URL",
     ),
     "max_steps": SettingMeta(
         "max_steps",
@@ -53,7 +66,7 @@ SETTING_METADATA: dict[str, SettingMeta] = {
     "max_retries": SettingMeta(
         "max_retries",
         "Retry attempts for errors",
-        "Retry attempts for failed tool calls",
+        "Retry attempts for tool calls and output validation",
         "int",
     ),
     "debug": SettingMeta(
@@ -85,32 +98,256 @@ SETTING_METADATA: dict[str, SettingMeta] = {
         "Tool filter similarity threshold",
         "Threshold (0-1) for dynamic_tool_filtering. Lower=more tools, Higher=fewer tools",
         "float",
+        "CODEN_RETRIEVER_TOOL_FILTER_THRESHOLD",
     ),
     "temperature": SettingMeta(
         "temperature",
         "Model temperature (0-2)",
         "Controls randomness (0.0=deterministic, 1.0+=creative)",
         "float",
+        "CODEN_RETRIEVER_TEMPERATURE",
     ),
     "max_tokens": SettingMeta(
         "max_tokens",
         "Max response tokens",
         "Maximum tokens in response (empty=model default)",
         "int",
+        "CODEN_RETRIEVER_MAX_TOKENS",
     ),
     "timeout": SettingMeta(
         "timeout",
         "Request timeout (seconds)",
         "Timeout for model API requests (default: 120)",
         "float",
+        "CODEN_RETRIEVER_TIMEOUT",
     ),
     "api_key": SettingMeta(
         "api_key",
         "API key override",
         "Custom API key (overrides OPENAI_API_KEY env var for custom endpoints)",
         "str",
+        "CODEN_RETRIEVER_API_KEY",
+    ),
+    "host": SettingMeta(
+        "host",
+        "Daemon host address",
+        "Host address for the daemon server (default: 127.0.0.1)",
+        "str",
+        "CODEN_RETRIEVER_DAEMON_HOST",
+    ),
+    "port": SettingMeta(
+        "port",
+        "Daemon port number",
+        "Port for the daemon server (default: 19847)",
+        "int",
+        "CODEN_RETRIEVER_DAEMON_PORT",
+    ),
+    "daemon_timeout": SettingMeta(
+        "daemon_timeout",
+        "Socket timeout (seconds)",
+        "Timeout for daemon socket operations (default: 30)",
+        "float",
+    ),
+    "max_projects": SettingMeta(
+        "max_projects",
+        "Max cached projects",
+        "Maximum number of projects to keep in daemon cache",
+        "int",
+    ),
+    "default_tokens": SettingMeta(
+        "default_tokens",
+        "Default token budget",
+        "Default token budget for search results (default: 4000)",
+        "int",
+    ),
+    "default_limit": SettingMeta(
+        "default_limit",
+        "Default result limit",
+        "Default maximum number of search results (default: 20)",
+        "int",
+    ),
+    "semantic_model_path": SettingMeta(
+        "semantic_model_path",
+        "Semantic model path",
+        "Path to custom semantic search model (null for default)",
+        "str",
+        "CODEN_RETRIEVER_MODEL_PATH",
     ),
 }
+
+# Maps setting keys to their config section and attribute path
+# Format: key -> (section, attr_name, sub_attr_name or None)
+SETTING_LOCATIONS: dict[str, tuple[str, str, Optional[str]]] = {
+    "model": ("model", "default", None),
+    "base_url": ("model", "base_url", None),
+    "temperature": ("model", "generation", "temperature"),
+    "max_tokens": ("model", "generation", "max_tokens"),
+    "timeout": ("model", "generation", "timeout"),
+    "api_key": ("model", "generation", "api_key"),
+    "max_steps": ("agent", "max_steps", None),
+    "max_retries": ("agent", "max_retries", None),
+    "debug": ("agent", "debug", None),
+    "tool_instructions": ("agent", "tool_instructions", None),
+    "ask_tool_permission": ("agent", "ask_tool_permission", None),
+    "dynamic_tool_filtering": ("agent", "dynamic_tool_filtering", None),
+    "tool_filter_threshold": ("agent", "tool_filter_threshold", None),
+    "host": ("daemon", "host", None),
+    "port": ("daemon", "port", None),
+    "daemon_timeout": ("daemon", "daemon_timeout", None),
+    "max_projects": ("daemon", "max_projects", None),
+    "default_tokens": ("search", "default_tokens", None),
+    "default_limit": ("search", "default_limit", None),
+    "semantic_model_path": ("search", "semantic_model_path", None),
+}
+
+# Validation constraints for settings
+# Format: key -> (min_value, max_value, error_message) or None for no constraints
+SETTING_CONSTRAINTS: dict[str, tuple[float, float, str]] = {
+    "tool_filter_threshold": (0.0, 1.0, "must be between 0.0 and 1.0"),
+    "temperature": (0.0, 2.0, "must be between 0.0 and 2.0"),
+    "timeout": (0.001, float("inf"), "must be greater than 0"),
+    "daemon_timeout": (0.001, float("inf"), "must be greater than 0"),
+    "max_steps": (1, float("inf"), "must be at least 1"),
+    "max_retries": (0, float("inf"), "must be 0 or greater"),
+    "max_tokens": (1, float("inf"), "must be at least 1"),
+    "port": (1, 65535, "must be between 1 and 65535"),
+    "max_projects": (1, float("inf"), "must be at least 1"),
+    "default_tokens": (1, float("inf"), "must be at least 1"),
+    "default_limit": (1, float("inf"), "must be at least 1"),
+}
+
+# Type parsers dispatch table - maps value_type to parser function
+_TYPE_PARSERS: dict[str, Callable[[str], Any]] = {
+    "bool": lambda v: v.lower() in ("true", "1", "yes"),
+    "int": int,
+    "float": float,
+    "str": lambda v: v if v.lower() != "null" else None,
+}
+
+
+def parse_config_value(key: str, value: str) -> tuple[bool, Any, str]:
+    """Parse a string value to the appropriate type based on SETTING_METADATA.
+
+    Args:
+        key: The setting key.
+        value: The string value to parse.
+
+    Returns:
+        Tuple of (success, parsed_value, error_message).
+    """
+    if key not in SETTING_METADATA:
+        valid_keys = ", ".join(sorted(SETTING_METADATA.keys()))
+        return False, None, f"Unknown key: {key}. Valid keys: {valid_keys}"
+
+    meta = SETTING_METADATA[key]
+
+    try:
+        # Use dispatch table for type parsing
+        parser = _TYPE_PARSERS.get(meta.value_type, _TYPE_PARSERS["str"])
+        parsed = parser(value)
+        return True, parsed, ""
+    except ValueError as e:
+        return False, None, f"Invalid {meta.value_type} value '{value}': {e}"
+
+
+def validate_config_value(key: str, value: Any) -> tuple[bool, str]:
+    """Validate a parsed config value against constraints.
+
+    Args:
+        key: The setting key.
+        value: The parsed value to validate.
+
+    Returns:
+        Tuple of (is_valid, error_message). error_message is empty if valid.
+    """
+    if key not in SETTING_CONSTRAINTS:
+        return True, ""
+
+    if value is None:
+        return True, ""  # None values skip constraint validation
+
+    # Constraints require numeric comparison - reject non-numeric types
+    if not isinstance(value, (int, float)):
+        return False, f"{key} must be a number, got {type(value).__name__}"
+
+    min_val, max_val, error_msg = SETTING_CONSTRAINTS[key]
+    if not (min_val <= value <= max_val):
+        return False, f"{key} {error_msg}"
+
+    return True, ""
+
+
+def assign_config_value(config: "AppConfig", key: str, value: Any) -> None:
+    """Assign a value to the config at the appropriate location.
+
+    Args:
+        config: The AppConfig instance to modify.
+        key: The setting key.
+        value: The value to assign (already parsed and validated).
+    """
+    section_name, attr_name, sub_attr = SETTING_LOCATIONS[key]
+    section = getattr(config, section_name)
+
+    if sub_attr:
+        sub_obj = getattr(section, attr_name)
+        setattr(sub_obj, sub_attr, value)
+    else:
+        setattr(section, attr_name, value)
+
+
+def set_config_value(config: "AppConfig", key: str, value: str) -> tuple[bool, str]:
+    """Parse, validate, and set a config value.
+
+    Args:
+        config: The AppConfig instance to modify.
+        key: The setting key (e.g., "tool_filter_threshold").
+        value: The string value to set.
+
+    Returns:
+        Tuple of (success, error_message). error_message is empty on success.
+    """
+    if key not in SETTING_LOCATIONS:
+        if key in SETTING_METADATA:
+            return False, f"Key '{key}' is not configurable via CLI"
+        valid_keys = ", ".join(sorted(SETTING_METADATA.keys()))
+        return False, f"Unknown key: {key}. Valid keys: {valid_keys}"
+
+    # Parse
+    success, parsed_value, error = parse_config_value(key, value)
+    if not success:
+        return False, error
+
+    # Validate
+    is_valid, error = validate_config_value(key, parsed_value)
+    if not is_valid:
+        return False, error
+
+    # Assign
+    assign_config_value(config, key, parsed_value)
+    return True, ""
+
+
+def get_config_value(config: "AppConfig", key: str) -> tuple[bool, Any, str]:
+    """Get a config value by key.
+
+    Args:
+        config: The AppConfig instance.
+        key: The setting key.
+
+    Returns:
+        Tuple of (success, value, error_message).
+    """
+    if key not in SETTING_LOCATIONS:
+        return False, None, f"Unknown key: {key}"
+
+    section_name, attr_name, sub_attr = SETTING_LOCATIONS[key]
+    section = getattr(config, section_name)
+
+    if sub_attr:
+        sub_obj = getattr(section, attr_name)
+        return True, getattr(sub_obj, sub_attr), ""
+    else:
+        return True, getattr(section, attr_name), ""
 
 
 def get_config_dir() -> Path:
@@ -183,8 +420,8 @@ class ModelConfig:
     base_url: Optional[str] = None
     provider_urls: dict[str, str] = field(
         default_factory=lambda: {
-            "ollama": "http://localhost:11434/v1",
-            "llamacpp": "http://localhost:8080/v1",
+            "ollama": OLLAMA_DEFAULT_URL,
+            "llamacpp": LLAMACPP_DEFAULT_URL,
         }
     )
     generation: GenerationSettings = field(default_factory=GenerationSettings)
@@ -195,12 +432,12 @@ class AgentConfig:
     """Agent behavior configuration."""
 
     max_steps: int = 15
-    max_retries: int = 3
+    max_retries: int = DEFAULT_MAX_RETRIES
     debug: bool = False
     disabled_tools: list[str] = field(default_factory=lambda: DEFAULT_DISABLED_TOOLS.copy())
     mcp_server_timeout: float = 30.0
     tool_instructions: bool = False
-    ask_tool_permission: bool = True  
+    ask_tool_permission: bool = True
     dynamic_tool_filtering: bool = False
     tool_filter_threshold: float = 0.5
 
@@ -216,10 +453,10 @@ DEFAULT_DISABLED_TOOLS = [
 class DaemonConfig:
     """Daemon server configuration."""
 
-    host: str = "127.0.0.1"
-    port: int = 19847
-    socket_timeout: float = 30.0
-    max_projects: int = 5
+    host: str = DEFAULT_DAEMON_HOST
+    port: int = DEFAULT_DAEMON_PORT
+    daemon_timeout: float = DEFAULT_DAEMON_TIMEOUT
+    max_projects: int = DEFAULT_MAX_PROJECTS
 
 
 @dataclass
@@ -247,192 +484,121 @@ class AppConfig:
 
 
 def _config_to_dict(config: AppConfig) -> dict[str, Any]:
-    """Convert AppConfig to a JSON-serializable dictionary."""
-    return {
-        "_version": config._version,
-        "model": {
-            "default": config.model.default,
-            "base_url": config.model.base_url,
-            "provider_urls": config.model.provider_urls,
-            "temperature": config.model.generation.temperature,
-            "max_tokens": config.model.generation.max_tokens,
-            "timeout": config.model.generation.timeout,
-            "api_key": config.model.generation.api_key,
-        },
-        "agent": {
-            "max_steps": config.agent.max_steps,
-            "max_retries": config.agent.max_retries,
-            "debug": config.agent.debug,
-            "disabled_tools": config.agent.disabled_tools,
-            "mcp_server_timeout": config.agent.mcp_server_timeout,
-            "tool_instructions": config.agent.tool_instructions,
-            "ask_tool_permission": config.agent.ask_tool_permission,
-            "dynamic_tool_filtering": config.agent.dynamic_tool_filtering,
-            "tool_filter_threshold": config.agent.tool_filter_threshold,
-        },
-        "daemon": {
-            "host": config.daemon.host,
-            "port": config.daemon.port,
-            "socket_timeout": config.daemon.socket_timeout,
-            "max_projects": config.daemon.max_projects,
-        },
-        "search": {
-            "default_tokens": config.search.default_tokens,
-            "default_limit": config.search.default_limit,
-            "semantic_model_path": config.search.semantic_model_path,
-        },
-    }
+    """Convert AppConfig to a JSON-serializable dictionary.
+
+    Uses dataclasses.asdict for automatic serialization, then flattens
+    the 'generation' sub-struct into 'model' to match the existing JSON schema.
+    """
+    data = asdict(config)
+
+    # Flatten 'generation' sub-struct into 'model' to match existing JSON schema
+    # (generation params are stored at model.temperature, not model.generation.temperature)
+    if "model" in data and "generation" in data["model"]:
+        gen_data = data["model"].pop("generation")
+        data["model"].update(gen_data)
+
+    return data
+
+
+def _get_nested_value(data: dict, section: str, attr: str, sub_attr: Optional[str]) -> Any:
+    """Safely get a nested value from config dict, handling the generation flattening.
+
+    The JSON schema flattens generation params into model (e.g., model.temperature
+    instead of model.generation.temperature), so we need to handle that mapping.
+
+    Args:
+        data: The config dictionary.
+        section: Top-level section name (model, agent, daemon, search).
+        attr: Attribute name within the section.
+        sub_attr: Sub-attribute for nested dataclasses (e.g., generation.temperature).
+
+    Returns:
+        The value if found, None otherwise.
+    """
+    section_data = data.get(section, {})
+    if not isinstance(section_data, dict):
+        return None
+
+    # Handle flattened generation params (stored at model level, not model.generation)
+    if section == "model" and sub_attr:
+        return section_data.get(sub_attr)
+
+    return section_data.get(attr)
 
 
 def _dict_to_config(data: dict[str, Any]) -> AppConfig:
-    """Convert a dictionary to AppConfig."""
+    """Convert a dictionary to AppConfig using metadata-driven mapping.
+
+    Uses SETTING_LOCATIONS as the source of truth for user-configurable settings,
+    with special handling for internal settings not exposed via /config.
+    """
     config = AppConfig()
 
-    # Parse model section
+    # Load user-configurable settings via SETTING_LOCATIONS (metadata-driven)
+    for key, (section, attr, sub_attr) in SETTING_LOCATIONS.items():
+        raw_val = _get_nested_value(data, section, attr, sub_attr)
+
+        if raw_val is not None:
+            is_valid, error = validate_config_value(key, raw_val)
+            if is_valid:
+                assign_config_value(config, key, raw_val)
+            else:
+                logger.warning(f"Config load error for '{key}': {error}")
+
+    # Load internal settings with special handling (not in SETTING_METADATA)
     if "model" in data and isinstance(data["model"], dict):
         model_data = data["model"]
-        config.model.default = model_data.get("default", config.model.default)
-        config.model.base_url = model_data.get("base_url", config.model.base_url)
         if "provider_urls" in model_data and isinstance(model_data["provider_urls"], dict):
             config.model.provider_urls.update(model_data["provider_urls"])
-        # Parse generation parameters with validation
-        gen = config.model.generation
-        raw_temp = model_data.get("temperature", gen.temperature)
-        if isinstance(raw_temp, (int, float)) and 0.0 <= raw_temp <= 2.0:
-            gen.temperature = float(raw_temp)
-        else:
-            logger.warning(f"Invalid temperature '{raw_temp}', using default {gen.temperature}")
-        raw_max_tokens = model_data.get("max_tokens", gen.max_tokens)
-        if raw_max_tokens is None or (isinstance(raw_max_tokens, int) and raw_max_tokens > 0):
-            gen.max_tokens = raw_max_tokens
-        else:
-            logger.warning(f"Invalid max_tokens '{raw_max_tokens}', using default")
-        raw_timeout = model_data.get("timeout", gen.timeout)
-        if isinstance(raw_timeout, (int, float)) and raw_timeout > 0:
-            gen.timeout = float(raw_timeout)
-        else:
-            logger.warning(f"Invalid timeout '{raw_timeout}', using default {gen.timeout}")
-        gen.api_key = model_data.get("api_key", gen.api_key)
 
-    # Parse agent section
     if "agent" in data and isinstance(data["agent"], dict):
         agent_data = data["agent"]
-        config.agent.max_steps = agent_data.get("max_steps", config.agent.max_steps)
-        config.agent.max_retries = agent_data.get("max_retries", config.agent.max_retries)
-        config.agent.debug = agent_data.get("debug", config.agent.debug)
-        # Only use defaults if disabled_tools key doesn't exist (old config format)
-        # An empty list means user explicitly enabled all tools - respect that
+        # disabled_tools: None means use defaults, empty list means user enabled all
         saved_disabled = agent_data.get("disabled_tools")
         if saved_disabled is None:
             config.agent.disabled_tools = DEFAULT_DISABLED_TOOLS.copy()
         else:
             config.agent.disabled_tools = saved_disabled
-        config.agent.mcp_server_timeout = agent_data.get("mcp_server_timeout", config.agent.mcp_server_timeout)
-        config.agent.tool_instructions = agent_data.get("tool_instructions", config.agent.tool_instructions)
-        config.agent.ask_tool_permission = agent_data.get("ask_tool_permission", config.agent.ask_tool_permission)
-        config.agent.dynamic_tool_filtering = agent_data.get("dynamic_tool_filtering", config.agent.dynamic_tool_filtering)
-        # Validate and load tool_filter_threshold with bounds checking
-        raw_threshold = agent_data.get("tool_filter_threshold", config.agent.tool_filter_threshold)
-        if isinstance(raw_threshold, (int, float)) and 0.0 <= raw_threshold <= 1.0:
-            config.agent.tool_filter_threshold = float(raw_threshold)
-        else:
-            logger.warning(f"Invalid tool_filter_threshold '{raw_threshold}', using default {config.agent.tool_filter_threshold}")
 
-    # Parse daemon section
-    if "daemon" in data and isinstance(data["daemon"], dict):
-        daemon_data = data["daemon"]
-        config.daemon.host = daemon_data.get("host", config.daemon.host)
-        config.daemon.port = daemon_data.get("port", config.daemon.port)
-        config.daemon.socket_timeout = daemon_data.get("socket_timeout", config.daemon.socket_timeout)
-        config.daemon.max_projects = daemon_data.get("max_projects", config.daemon.max_projects)
-
-    # Parse search section
-    if "search" in data and isinstance(data["search"], dict):
-        search_data = data["search"]
-        config.search.default_tokens = search_data.get("default_tokens", config.search.default_tokens)
-        config.search.default_limit = search_data.get("default_limit", config.search.default_limit)
-        config.search.semantic_model_path = search_data.get(
-            "semantic_model_path", config.search.semantic_model_path
-        )
+        if "mcp_server_timeout" in agent_data:
+            config.agent.mcp_server_timeout = agent_data["mcp_server_timeout"]
 
     return config
 
 
 def _apply_env_overrides(config: AppConfig) -> None:
-    """Apply environment variable overrides to config (in-place)."""
-    # Model overrides
-    if env_model := os.environ.get("CODEN_RETRIEVER_MODEL"):
-        config.model.default = env_model
+    """Apply environment variable overrides using SETTING_METADATA as a map.
 
-    if env_base_url := os.environ.get("CODEN_RETRIEVER_BASE_URL"):
-        config.model.base_url = env_base_url
+    Uses the env_var field in SETTING_METADATA to determine which environment
+    variables to check, with special handling for internal settings.
+    """
+    # Apply metadata-driven env overrides
+    for key, meta in SETTING_METADATA.items():
+        if not meta.env_var:
+            continue
 
-    # Daemon overrides
-    if env_port := os.environ.get("CODEN_RETRIEVER_DAEMON_PORT"):
-        try:
-            config.daemon.port = int(env_port)
-        except ValueError:
-            logger.warning(f"Invalid CODEN_RETRIEVER_DAEMON_PORT: {env_port}")
+        env_val = os.environ.get(meta.env_var)
+        if env_val is None:
+            continue
 
-    if env_host := os.environ.get("CODEN_RETRIEVER_DAEMON_HOST"):
-        config.daemon.host = env_host
+        success, parsed_val, error = parse_config_value(key, env_val)
+        if not success:
+            logger.warning(f"Env override parse failed for {meta.env_var}: {error}")
+            continue
 
-    # Agent overrides
+        is_valid, v_error = validate_config_value(key, parsed_val)
+        if not is_valid:
+            logger.warning(f"Env override validation failed for {meta.env_var}: {v_error}")
+            continue
+
+        assign_config_value(config, key, parsed_val)
+
+    # Handle internal env overrides not in SETTING_METADATA
     if env_mcp_timeout := os.environ.get("CODEN_RETRIEVER_MCP_TIMEOUT"):
         try:
             config.agent.mcp_server_timeout = float(env_mcp_timeout)
         except ValueError:
             logger.warning(f"Invalid CODEN_RETRIEVER_MCP_TIMEOUT: {env_mcp_timeout}")
-
-    # Search overrides
-    if env_model_path := os.environ.get("CODEN_RETRIEVER_MODEL_PATH"):
-        config.search.semantic_model_path = env_model_path
-
-    # Tool filter threshold override
-    if env_threshold := os.environ.get("CODEN_RETRIEVER_TOOL_FILTER_THRESHOLD"):
-        try:
-            threshold = float(env_threshold)
-            if 0.0 <= threshold <= 1.0:
-                config.agent.tool_filter_threshold = threshold
-            else:
-                logger.warning(f"Invalid CODEN_RETRIEVER_TOOL_FILTER_THRESHOLD: {env_threshold} (must be 0.0-1.0)")
-        except ValueError:
-            logger.warning(f"Invalid CODEN_RETRIEVER_TOOL_FILTER_THRESHOLD: {env_threshold}")
-
-    # Model generation parameter overrides
-    gen = config.model.generation
-    if env_temperature := os.environ.get("CODEN_RETRIEVER_TEMPERATURE"):
-        try:
-            temp = float(env_temperature)
-            if 0.0 <= temp <= 2.0:
-                gen.temperature = temp
-            else:
-                logger.warning(f"Invalid CODEN_RETRIEVER_TEMPERATURE: {env_temperature} (must be 0.0-2.0)")
-        except ValueError:
-            logger.warning(f"Invalid CODEN_RETRIEVER_TEMPERATURE: {env_temperature}")
-
-    if env_max_tokens := os.environ.get("CODEN_RETRIEVER_MAX_TOKENS"):
-        try:
-            max_tokens = int(env_max_tokens)
-            if max_tokens > 0:
-                gen.max_tokens = max_tokens
-            else:
-                logger.warning(f"Invalid CODEN_RETRIEVER_MAX_TOKENS: {env_max_tokens} (must be > 0)")
-        except ValueError:
-            logger.warning(f"Invalid CODEN_RETRIEVER_MAX_TOKENS: {env_max_tokens}")
-
-    if env_timeout := os.environ.get("CODEN_RETRIEVER_TIMEOUT"):
-        try:
-            timeout = float(env_timeout)
-            if timeout > 0:
-                gen.timeout = timeout
-            else:
-                logger.warning(f"Invalid CODEN_RETRIEVER_TIMEOUT: {env_timeout} (must be > 0)")
-        except ValueError:
-            logger.warning(f"Invalid CODEN_RETRIEVER_TIMEOUT: {env_timeout}")
-
-    if env_api_key := os.environ.get("CODEN_RETRIEVER_API_KEY"):
-        gen.api_key = env_api_key
 
 
 def load_config() -> AppConfig:
@@ -531,3 +697,23 @@ def reload_config() -> AppConfig:
     global _cached_config
     _cached_config = load_config()
     return _cached_config
+
+
+def get_semantic_model_path() -> str:
+    """Get the semantic model path from config or use the default.
+
+    This is a shared utility for clone detection and other semantic features.
+    Returns the configured model path or falls back to the bundled default.
+
+    Returns:
+        Path to the semantic model directory.
+    """
+    default_model_path = str(
+        Path(__file__).parent / "models" / "embeddings" / "model2vec_embed_distill"
+    )
+    try:
+        config = load_config()
+        return config.search.semantic_model_path or default_model_path
+    except Exception as e:
+        logger.debug(f"Config load failed, using default model path: {e}")
+        return default_model_path

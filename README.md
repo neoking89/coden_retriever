@@ -6,7 +6,7 @@
 pip install coden-retriever
 ```
 
-Requires Python 3.10-3.12.
+**Requires Python 3.10-3.12.** Python 3.13+ is not supported because `tree-sitter-languages` (required for multi-language parsing) only provides wheels up to Python 3.12.
 
 ```bash
 # Get a ranked map of a repo
@@ -23,6 +23,19 @@ coden /path/to/repo --find "UserAuth"
 
 # Find refactoring hotspots (high coupling + complexity)
 coden /path/to/repo --hotspots -n 20 --stats -r
+
+# Detect code clones (find duplicate/similar functions)
+coden /path/to/repo --clones --clone-threshold 0.90
+
+# Clone detection modes: semantic-only or syntactic-only
+coden /path/to/repo --clones --clone-semantic     # Similar behavior (embeddings)
+coden /path/to/repo --clones --clone-syntactic    # Copy-paste detection (Jaccard)
+
+# Analyze architecture health (propagation cost)
+coden /path/to/repo --propagation --breakdown
+
+# Find echo comments (comments that just restate the code)
+coden /path/to/repo flag -E --dry-run
 ```
 
 <img src="images/readme/coden_stats_reverzed.png" alt="Coden stats output showing directory tree and ranking metrics" width="700">
@@ -39,7 +52,7 @@ We initially parse code with tree-sitter, build a call graph (functions, classes
 
 **PageRank** finds the load-bearing code. If a function is called by many other important functions, it scores high. High PageRank means "if this breaks, a lot of things break."
 
-**Betweenness Centrality** finds the bridges—code that sits between different parts of your system. These are the integration points, the places where module A talks to module B. High betweenness means "this is where different parts of the system meet."
+**Betweenness Centrality** finds the bridges--code that sits between different parts of your system. These are the integration points, the places where module A talks to module B. High betweenness means "this is where different parts of the system meet."
 
 We use these instead of simple text matching because structural dependencies matter. A file that is imported everywhere is more important than a file that happens to contain your search term five times.
 
@@ -77,10 +90,27 @@ coden /path/to/repo --query "auth" --semantic # Semantic search
 coden /path/to/repo --find "UserAuth"        # Find symbol
 coden /path/to/repo --hotspots -n 20         # Top 20 refactoring hotspots
 coden /path/to/repo -H --stats -r            # Hotspots with stats, reversed
+coden /path/to/repo -C --clone-threshold 0.90      # Find code clones (90% similarity)
+coden /path/to/repo -C --clone-semantic            # Semantic-only clone detection
+coden /path/to/repo -C --clone-syntactic           # Syntactic-only clone detection
+coden /path/to/repo -C --semantic-weight 0.65      # Adjust combined score weights
+coden /path/to/repo -P --breakdown           # Architecture health analysis
+coden /path/to/repo -P --critical-paths      # Show high-impact code paths
 coden /path/to/repo --map --show-deps        # Show callers/callees
 coden /path/to/repo --format json            # Output as json/markdown/xml
 coden serve                                  # Start MCP server
 coden serve --transport http --port 8000     # MCP over HTTP
+coden -E --remove-comments --dry-run         # Preview echo comment removal
+coden -E --remove-comments --backup          # Remove echoes entirely (with backup)
+coden flag -C --dry-run                      # Preview clone flags
+coden flag -E --dry-run                      # Preview echo comment flagging
+coden flag -E --echo-threshold 0.85          # Flag echo comments (default threshold)
+coden flag -E --echo-threshold 0.95          # Stricter: only near-identical echoes
+coden flag -E --remove-comments --backup     # Alternative: remove via flag subcommand
+coden flag -E --include-tests                # Include test files in analysis
+coden flag -HPCE --backup                    # Flag all issues (hotspots, propagation, clones, echoes)
+coden flag clear                             # Remove all [CODEN] comments
+coden reset                                  # Reset everything (destructive!)
 ```
 
 ## Daemon Mode
@@ -95,6 +125,177 @@ coden daemon stop                 # Stop it
 coden daemon restart              # Restart
 coden daemon clear-cache          # Clear daemon cache
 ```
+
+## Code Flagging
+
+Add `[CODEN]` comments to mark problematic code or remove echo comments directly:
+
+```bash
+coden -E --remove-comments --dry-run # Preview echo comment removal (direct)
+coden -E --remove-comments --backup  # Remove echo comments directly
+coden flag -C --dry-run              # Preview clone flags
+coden flag -E --dry-run              # Preview echo comment flags
+coden flag -HPCE --backup            # Flag hotspots, propagation, clones, echoes
+coden flag clear                     # Remove all [CODEN] comments
+```
+
+### Common Options
+
+- **`--dry-run`**: Preview changes without modifying files. Always use this first to see what will be flagged.
+- **`--backup`**: Create `.coden-backup` copies of files before modification (e.g., `file.py.coden-backup`).
+- **`--include-tests`**: Include test files in analysis (excluded by default).
+- **`--stats`**: Display summary statistics after flagging.
+
+### Analysis Types & Thresholds
+
+| Analysis Type | Flag | Threshold Option | Default | Description |
+|---|---|---|---|---|
+| **Hotspots** | `-H` | `--risk-threshold` | 50 | Min risk score (raw score, typically 50-200+) |
+| **Propagation Cost** | `-P` | `--propagation-threshold` | 0.25 | Min internal coupling for modules (0-1) |
+| **Code Clones** | `-C` | `--clone-threshold` | 0.95 | Min semantic similarity for clones (0-1) |
+| **Echo Comments** | `-E` | `--echo-threshold` | 0.85 | Min similarity for echo detection (0-1) |
+
+**Usage notes:**
+- All threshold options work in both direct mode (`coden -H`) and flag mode (`coden flag -H`)
+- `-H`: Filters hotspots with `risk_score >= threshold` (raw score = coupling × log(complexity))
+- `-P`: Filters modules in breakdown with `internal_coupling >= threshold` (0-1 scale)
+- `-C`: Filters clones with `similarity >= threshold` (0-1 scale)
+- `-E`: Filters echo comments with `similarity >= threshold` (0-1 scale)
+
+**Threshold ranges:** `-P`, `-C`, `-E` use 0-1 scale. Lower values are more permissive, higher values are stricter. `-H` uses raw risk scores (typically 50-200+).
+
+### Code Clone Detection
+
+Clone detection finds duplicate or near-duplicate functions that are candidates for refactoring. Three detection modes are available:
+
+| Mode | Flag | Description | Best For |
+|------|------|-------------|----------|
+| **Combined** | (default) | Both semantic + syntactic | General use, balanced detection |
+| **Semantic** | `--clone-semantic` | Model2Vec embeddings | Behaviorally similar functions |
+| **Syntactic** | `--clone-syntactic` | Line-by-line Jaccard | Exact copy-paste detection |
+
+#### Detection Modes Explained
+
+**Combined mode** (default) uses a weighted harmonic mean of semantic and syntactic scores:
+- Semantic weight: 0.65 (adjustable via `--semantic-weight`)
+- Syntactic weight: 0.35 (adjustable via `--syntactic-weight`)
+
+**Semantic mode** detects functions with similar behavior, even if structurally different. Uses Model2Vec embeddings to find:
+- Async/sync variants of the same function
+- Functions that do the same thing with different implementations
+- Renamed copies with modified variable names
+
+**Syntactic mode** detects copy-paste clones using line-by-line Jaccard similarity:
+- `--line-threshold`: Min similarity per line (default: 0.70)
+- `--func-threshold`: Min percentage of lines that must match (default: 0.50)
+
+#### Usage Examples
+
+```bash
+# Default combined mode (recommended)
+coden /path/to/repo -C --clone-threshold 0.90
+
+# Semantic-only: find behaviorally similar functions
+coden /path/to/repo -C --clone-semantic
+
+# Syntactic-only: find copy-paste duplicates
+coden /path/to/repo -C --clone-syntactic
+
+# Adjust combined weights (more emphasis on semantic similarity)
+coden /path/to/repo -C --semantic-weight 0.80 --syntactic-weight 0.20
+
+# Syntactic with custom thresholds
+coden /path/to/repo -C --clone-syntactic --line-threshold 0.80 --func-threshold 0.60
+
+# Flag clones in code with [CODEN] comments
+coden flag -C --backup
+```
+
+### Echo Comment Detection
+
+Echo comments are comments that provide no additional value because they simply repeat what the code identifier already conveys. For example:
+
+**Echo comments (redundant)**:
+```python
+# Calculate the total
+def calculate_total(items):
+    return sum(item.price for item in items)
+
+# Process the payment
+def process_payment(amount):
+    ...
+```
+
+**Good comments (provide context)**:
+```python
+# Apply progressive discount based on customer lifetime value
+# Tier 1: 0-10 purchases = 0%, Tier 2: 11-50 = 5%, Tier 3: 51+ = 10%
+def calculate_discount_tier(purchases: int) -> float:
+    ...
+```
+
+Echo detection uses:
+- **Tree-sitter AST parsing** to extract ALL comments from your codebase
+- **Semantic similarity analysis** (Model2Vec embeddings + cosine similarity) to compare comment text with code identifiers
+- **Configurable threshold** to control strictness (0.95 = near-identical only, 0.75 = looser)
+
+#### Usage Examples
+
+```bash
+# Preview echo comments (dry run)
+coden flag -E --dry-run
+
+# Flag echo comments with [CODEN] markers
+coden flag -E --backup
+
+# Remove echo comments entirely (no markers)
+coden flag -E --remove-comments --backup
+
+# Adjust threshold (stricter - only exact echoes)
+coden flag -E --echo-threshold 0.95 --dry-run
+
+# Adjust threshold (looser - catch more potential echoes)
+coden flag -E --echo-threshold 0.75 --dry-run
+
+# Include test files in analysis
+coden flag -E --include-tests --dry-run
+
+# Combine with other analysis types
+coden flag -HPCE --backup  # All analyses at once
+
+# Preview only top 10 issues (limit only works in dry-run mode)
+coden flag -H --dry-run -n 10
+```
+
+#### Options Explained
+
+**`--dry-run`**: Preview mode - shows what would be changed without modifying any files. Use this first to review results before making changes.
+
+**`-n/--limit`**: Limit the number of results (default: 20). Use `-n -1` to show all results (may be slow for large repos). In flag mode, the limit only applies in dry-run preview - when actually flagging code (without `--dry-run`), all matching items will be flagged to ensure comprehensive coverage.
+
+**`--backup`**: Creates a safety copy of each modified file with a `.coden-backup` extension before making changes. Recommended when removing comments or making bulk modifications. Example: modifying `src/utils.py` creates `src/utils.py.coden-backup`.
+
+**`--remove-comments`**: Deletes detected echo comments entirely from the source files instead of flagging them with `[CODEN]` markers. Works with both `coden -E --remove-comments` and `coden flag -E --remove-comments`. Use with `--backup` for safety. Without this flag, echo comments are only flagged/displayed, not removed.
+
+**`--include-tests`**: Include test files in the analysis (files matching `*test*.py`, `*spec.ts`, etc.). By default, test files are excluded since echo comments are more acceptable in tests where clarity is prioritized over conciseness.
+
+**`--echo-threshold`**: Controls detection strictness (0.0-1.0 range):
+- `0.95` = Very strict, only near-identical echoes (e.g., `# get user` -> `get_user()`)
+- `0.85` = Default, balanced detection
+- `0.75` = Looser, catches more potential echoes
+
+#### Output Format
+
+Flag mode displays a parameter header showing:
+- **Active analysis types** and their thresholds (e.g., "Hotspots (risk >= 50.0)")
+- **Preview limit** status (shows if `-n` is limiting results)
+- **Warning message** if `-n` is used without `--dry-run`
+
+Detected echo comments show:
+- **File path and line number**
+- **Similarity score** (0-100%)
+- **Severity**: CRITICAL (>95%), HIGH (>90%), ELEVATED (>85%), MODERATE (<85%)
+- **Comment text** and **associated code identifier**
 
 ## Caching
 
@@ -136,7 +337,7 @@ coden config set <key> <value>  # Set a value
   },
   "agent": {
     "max_steps": 15,
-    "max_retries": 3,
+    "max_retries": 5,
     "debug": false,
     "disabled_tools": ["debug_server"],
     "mcp_server_timeout": 30.0,
@@ -276,8 +477,10 @@ Reload VS Code (Ctrl+Shift+P -> "Developer: Reload Window").
 **Code Discovery**
 - **code_map** - Architectural overview with dependencies. Start here.
 - **code_search** - Keyword or semantic search.
-- **coupling_hotspots** - Find refactoring targets (high coupling + complexity). CLI: `--hotspots` / `-H`
+- **coupling_hotspots** - Find refactoring targets (high coupling + complexity). CLI: `-H`
 - **find_hotspots** - Git churn analysis (frequently changed files).
+- **clone_detection** - Find duplicate functions (combined/semantic/syntactic modes). CLI: `-C`
+- **propagation_cost** - Measure architecture health based on coupling. CLI: `-P`
 
 **Graph Analysis**
 - **change_impact_radius** - Blast radius analysis ("if I change this, what breaks?").
@@ -405,3 +608,18 @@ If you encounter problems, clearing the cache and stopping the daemon might help
 coden cache clear --all
 coden daemon stop
 ```
+
+### Full Reset
+
+To reset everything at once, use the reset command:
+
+```bash
+coden reset
+```
+
+This performs all of the following in one step:
+- Clears all project caches
+- Stops the daemon
+- Resets configuration to defaults
+
+> **Warning:** This is a destructive operation. Your custom configuration settings will be lost and all cached indices will be deleted.

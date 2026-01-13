@@ -101,7 +101,7 @@ def get_cached_model(model_path: str) -> "StaticModel":
     The mmap approach works across separate CLI calls because:
     - np.load(..., mmap_mode='r') maps the file into virtual memory
     - First access loads pages from disk into OS filesystem cache (RAM)
-    - Subsequent processes mmap the same file → hits filesystem cache
+    - Subsequent processes mmap the same file -> hits filesystem cache
     - No disk I/O on subsequent loads (until OS evicts under memory pressure)
 
     Args:

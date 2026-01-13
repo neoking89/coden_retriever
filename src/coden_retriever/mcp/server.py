@@ -6,12 +6,16 @@ This is the default server that includes both code search and dynamic tools.
 """
 import os
 
+from .clone_detection import register_clone_detection_tools
 from .code_search import register_code_search_tools
 from .constants import FULL_SERVER_INSTRUCTIONS, SERVER_NAME_FULL, _is_dynamic_tools_enabled
 from .debug_trace import register_debug_tools
 from .dynamic_tools import register_dynamic_tools
+from .echo_comments import register_echo_comment_tools
 from .file_edit import register_file_edit_tools
+from .flag_insertion import register_flag_tools
 from .graph_analysis import register_graph_analysis_tools
+from .propagation_cost import register_propagation_cost_tools
 from .server_factory import create_mcp_server_with_config
 
 
@@ -38,10 +42,14 @@ def create_mcp_server() -> "FastMCP":
     disabled_tools = get_disabled_tools()
 
     register_functions = [
+        lambda mcp: register_clone_detection_tools(mcp, disabled_tools),
         lambda mcp: register_code_search_tools(mcp, disabled_tools),
         lambda mcp: register_debug_tools(mcp, disabled_tools),
+        lambda mcp: register_echo_comment_tools(mcp, disabled_tools),
         lambda mcp: register_file_edit_tools(mcp, disabled_tools),
+        lambda mcp: register_flag_tools(mcp, disabled_tools),
         lambda mcp: register_graph_analysis_tools(mcp, disabled_tools),
+        lambda mcp: register_propagation_cost_tools(mcp, disabled_tools),
     ]
 
     # Only register dynamic tools if explicitly enabled in pyproject.toml

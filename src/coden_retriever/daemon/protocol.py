@@ -5,23 +5,16 @@ Provides request/response models, serialization for IPC, and centralized constan
 """
 import json
 from dataclasses import dataclass, field, asdict
-from typing import Any
+from typing import Any, Literal
+
+from ..constants import (
+    DEFAULT_DAEMON_HOST,
+    DEFAULT_DAEMON_PORT,
+    DEFAULT_MAX_PROJECTS,
+    DEFAULT_DAEMON_TIMEOUT,
+)
 
 PROTOCOL_VERSION = "1.0"
-
-# Fallback defaults (used when config loading fails)
-_DEFAULT_PORT = 19847
-_DEFAULT_HOST = "127.0.0.1"
-_SOCKET_TIMEOUT = 30.0
-_CLIENT_TIMEOUT = 5.0
-_MAX_PROJECTS_DEFAULT = 5
-
-# Keep old names for backward compatibility
-DEFAULT_PORT = _DEFAULT_PORT
-DEFAULT_HOST = _DEFAULT_HOST
-SOCKET_TIMEOUT = _SOCKET_TIMEOUT
-CLIENT_TIMEOUT = _CLIENT_TIMEOUT
-MAX_PROJECTS_DEFAULT = _MAX_PROJECTS_DEFAULT
 
 IDLE_CHECK_INTERVAL = 10  # Check idle status every N seconds
 
@@ -38,10 +31,10 @@ WINDOWS_CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 
 def get_daemon_defaults() -> tuple[str, int, float, int]:
-    """Get daemon defaults from config or fallback to hardcoded values.
+    """Get daemon defaults from config or fallback to centralized constants.
 
     Returns:
-        Tuple of (host, port, socket_timeout, max_projects)
+        Tuple of (host, port, daemon_timeout, max_projects)
     """
     try:
         from ..config_loader import load_config
@@ -49,11 +42,11 @@ def get_daemon_defaults() -> tuple[str, int, float, int]:
         return (
             config.daemon.host,
             config.daemon.port,
-            config.daemon.socket_timeout,
+            config.daemon.daemon_timeout,
             config.daemon.max_projects,
         )
     except ImportError:
-        return _DEFAULT_HOST, _DEFAULT_PORT, _SOCKET_TIMEOUT, _MAX_PROJECTS_DEFAULT
+        return DEFAULT_DAEMON_HOST, DEFAULT_DAEMON_PORT, DEFAULT_DAEMON_TIMEOUT, DEFAULT_MAX_PROJECTS
 
 
 @dataclass
@@ -143,6 +136,129 @@ class StacktraceParams:
 
     @classmethod
     def from_dict(cls, data: dict) -> "StacktraceParams":
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class CloneDetectionParams:
+    """Parameters for clone detection requests.
+
+    Used to find semantically similar (cloned) functions across the codebase.
+    Supports three modes: combined (default), semantic, and syntactic.
+
+    Note: token_limit=None means no limit (CLI mode).
+    MCP tools should pass an explicit limit (e.g., 4000) for LLM context.
+    """
+
+    source_dir: str
+
+    mode: Literal["combined", "semantic", "syntactic"] = "combined"
+
+    # Semantic parameters
+    similarity_threshold: float = 0.95
+
+    # Syntactic parameters
+    line_threshold: float = 0.70  # Jaccard threshold for line match
+    func_threshold: float = 0.50  # Percentage of lines that must match
+    min_shared_lines: int = 2  # Minimum shared unique lines for candidates
+
+    # Shared parameters
+    limit: int = 50
+    exclude_tests: bool = True
+    min_lines: int = 3
+    token_limit: int | None = None  # None = no limit (CLI), int = limit (MCP)
+
+    # Score fusion weights (for combined mode harmonic mean)
+    semantic_weight: float = 0.6
+    syntactic_weight: float = 0.4
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CloneDetectionParams":
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class PropagationCostParams:
+    """Parameters for propagation cost requests.
+
+    Used to measure how changes ripple through the codebase (architectural coupling).
+    Based on MacCormack et al. (2006) research on software architecture.
+
+    Note: token_limit=None means no limit (CLI mode).
+    MCP tools should pass an explicit limit (e.g., 4000) for LLM context.
+    """
+
+    source_dir: str
+    include_breakdown: bool = True
+    show_critical_paths: bool = True
+    exclude_tests: bool = True
+    token_limit: int | None = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "PropagationCostParams":
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class FlagParams:
+    """Parameters for code flagging requests.
+
+    Used to insert [CODEN] comments above code objects based on analysis results.
+    Supports flagging from hotspots, propagation cost, clone detection, and echo comments.
+    """
+
+    source_dir: str
+    hotspots: bool = False
+    propagation: bool = False
+    clones: bool = False
+    echo_comments: bool = False
+    risk_threshold: float = 0.5
+    propagation_threshold: float = 0.25
+    clone_threshold: float = 0.95
+    echo_threshold: float = 0.85
+    dry_run: bool = False
+    limit: int | None = None
+    backup: bool = False
+    verbose: bool = False
+    exclude_tests: bool = True
+    remove_comments: bool = False
+    output_format: str = "tree"
+
+    clone_mode: Literal["combined", "semantic", "syntactic"] = "combined"
+    # Syntactic clone parameters
+    line_threshold: float = 0.70
+    func_threshold: float = 0.50
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "FlagParams":
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class FlagClearParams:
+    """Parameters for clearing [CODEN] flags from code.
+
+    Removes all [CODEN] comments inserted by the flag command.
+    """
+
+    source_dir: str
+    dry_run: bool = False
+    verbose: bool = False
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "FlagClearParams":
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 

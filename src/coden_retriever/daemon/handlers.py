@@ -20,7 +20,6 @@ from ..graph_utils import (
     _TOKEN_PER_BOTTLENECK,
     _TOKEN_PER_CALLER,
     AUTO_MIN_IMPORTANCE,
-    HIGH_FANIN_THRESHOLD,
     apply_token_budget_filter,
     build_bottleneck_info,
     build_caller_info,
@@ -29,17 +28,19 @@ from ..graph_utils import (
     extract_module_from_path,
     find_symbol_nodes,
     get_connected_modules,
-    get_entity_display_name,
 )
 from ..search import SearchEngine
 from ..token_estimator import count_tokens
 from .protocol import (
+    CloneDetectionParams,
+    FlagClearParams,
+    FlagParams,
+    PropagationCostParams,
     GraphAnalysisParams,
     SearchParams,
     StacktraceParams,
     TraceDependencyParams,
 )
-
 if TYPE_CHECKING:
     from .server import DaemonServer
 
@@ -155,7 +156,6 @@ class SearchHandlerBase(BaseHandler):
             search_params.show_deps,
         )
 
-        # Calculate actual tokens used
         used_tokens = 100  # Base overhead
         for result in included_results:
             code = result.entity.get_context_snippet()
@@ -637,6 +637,149 @@ class DebugStacktraceHandler(BaseHandler):
         }
 
 
+class CloneDetectionHandler(BaseHandler):
+    """Handler for clone detection requests.
+
+    Supports three modes:
+    - combined (default): Both semantic + syntactic analysis
+    - semantic: Model2Vec embedding similarity only
+    - syntactic: Line-by-line Jaccard similarity only
+    """
+
+    def handle(self, params: dict) -> dict:
+        from ..clone import (
+            detect_clones_combined,
+            detect_clones_semantic,
+            detect_clones_syntactic,
+        )
+        from ..config_loader import get_semantic_model_path
+
+        clone_params = CloneDetectionParams.from_dict(params)
+        mode = clone_params.mode
+
+        # Load project with semantic support if needed
+        enable_semantic = mode in ("combined", "semantic")
+        indices, _ = self._server._get_or_load_project(
+            clone_params.source_dir,
+            enable_semantic=enable_semantic,
+        )
+
+        model_path = get_semantic_model_path()
+
+        if mode == "syntactic":
+            result = detect_clones_syntactic(
+                entities=indices.entities,
+                line_threshold=clone_params.line_threshold,
+                func_threshold=clone_params.func_threshold,
+                min_shared_lines=clone_params.min_shared_lines,
+                limit=clone_params.limit,
+                exclude_tests=clone_params.exclude_tests,
+                min_lines=clone_params.min_lines,
+                token_limit=clone_params.token_limit,
+            )
+        elif mode == "semantic":
+            result = detect_clones_semantic(
+                entities=indices.entities,
+                model_path=model_path,
+                threshold=clone_params.similarity_threshold,
+                limit=clone_params.limit,
+                exclude_tests=clone_params.exclude_tests,
+                min_lines=clone_params.min_lines,
+                token_limit=clone_params.token_limit,
+            )
+        else:  # combined (default)
+            result = detect_clones_combined(
+                entities=indices.entities,
+                model_path=model_path,
+                semantic_threshold=clone_params.similarity_threshold,
+                line_threshold=clone_params.line_threshold,
+                func_threshold=clone_params.func_threshold,
+                min_shared_lines=clone_params.min_shared_lines,
+                limit=clone_params.limit,
+                exclude_tests=clone_params.exclude_tests,
+                min_lines=clone_params.min_lines,
+                token_limit=clone_params.token_limit,
+                semantic_weight=clone_params.semantic_weight,
+                syntactic_weight=clone_params.syntactic_weight,
+            )
+
+        result["source"] = "daemon"
+        return result
+
+
+class PropagationCostHandler(BaseHandler):
+    """Handler for propagation cost requests."""
+
+    def handle(self, params: dict) -> dict:
+        from ..mcp.propagation_cost import compute_propagation_cost
+
+        pc_params = PropagationCostParams.from_dict(params)
+        indices, _ = self._server._get_or_load_project(pc_params.source_dir)
+
+        result = compute_propagation_cost(
+            graph=indices.graph,
+            entities=indices.entities,
+            include_breakdown=pc_params.include_breakdown,
+            show_critical_paths=pc_params.show_critical_paths,
+            exclude_tests=pc_params.exclude_tests,
+            token_limit=pc_params.token_limit,
+        )
+        result["source"] = "daemon"
+        return result
+
+
+class FlagHandler(BaseHandler):
+    """Handler for code flagging requests."""
+
+    def handle(self, params: dict) -> dict:
+        from ..mcp.flag_insertion import flag_code
+
+        flag_params = FlagParams.from_dict(params)
+        indices, _ = self._server._get_or_load_project(flag_params.source_dir)
+
+        result = flag_code(
+            entities=indices.entities,
+            graph=indices.graph,
+            pagerank=indices.pagerank,
+            source_dir=flag_params.source_dir,
+            hotspots=flag_params.hotspots,
+            propagation=flag_params.propagation,
+            clones=flag_params.clones,
+            echo_comments=flag_params.echo_comments,
+            risk_threshold=flag_params.risk_threshold,
+            propagation_threshold=flag_params.propagation_threshold,
+            clone_threshold=flag_params.clone_threshold,
+            echo_threshold=flag_params.echo_threshold,
+            clone_mode=flag_params.clone_mode,
+            line_threshold=flag_params.line_threshold,
+            func_threshold=flag_params.func_threshold,
+            dry_run=flag_params.dry_run,
+            backup=flag_params.backup,
+            verbose=flag_params.verbose,
+            exclude_tests=flag_params.exclude_tests,
+            remove_comments=flag_params.remove_comments,
+        )
+        result["source"] = "daemon"
+        return result
+
+
+class FlagClearHandler(BaseHandler):
+    """Handler for clearing [CODEN] flags from code."""
+
+    def handle(self, params: dict) -> dict:
+        from ..mcp.flag_insertion import flag_clear
+
+        clear_params = FlagClearParams.from_dict(params)
+
+        result = flag_clear(
+            source_dir=clear_params.source_dir,
+            dry_run=clear_params.dry_run,
+            verbose=clear_params.verbose,
+        )
+        result["source"] = "daemon"
+        return result
+
+
 def create_handler_registry(server: "DaemonServer") -> dict[str, BaseHandler]:
     """Create the handler registry mapping method names to handler instances.
 
@@ -658,4 +801,8 @@ def create_handler_registry(server: "DaemonServer") -> dict[str, BaseHandler]:
         "change_impact_radius": ChangeImpactRadiusHandler(server),
         "trace_dependency": TraceDependencyHandler(server),
         "debug_stacktrace": DebugStacktraceHandler(server),
+        "detect_clones": CloneDetectionHandler(server),
+        "propagation_cost": PropagationCostHandler(server),
+        "flag_code": FlagHandler(server),
+        "flag_clear": FlagClearHandler(server),
     }

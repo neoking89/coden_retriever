@@ -2,16 +2,22 @@
 Terminal styling utilities using Rich library for cross-platform support.
 
 Provides:
-- Clickable hyperlinks (file:// URLs)
+- Clickable hyperlinks (configurable for different IDEs)
 - Score-based color mapping with Rich markup
 - Works in all terminals that support Rich
 
 Uses lazy imports to avoid loading Rich until actually needed.
 Thread-safe initialization via double-checked locking.
+
+Environment Variables:
+    CODEN_EDITOR: Configure which editor URLs to generate.
+                  Options: vscode (default), pycharm, idea, sublime, file
 """
+import os
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
+from urllib.parse import quote
 
 if TYPE_CHECKING:
     from rich.console import Console
@@ -77,6 +83,76 @@ def _get_score_styles() -> dict[str, "Style"]:
     return _SCORE_STYLES
 
 
+# Supported editors and their URL schemes
+SUPPORTED_EDITORS = ("vscode", "pycharm", "idea", "sublime", "file")
+
+
+def get_configured_editor() -> str:
+    """Get the configured editor from CODEN_EDITOR env var (default: vscode)."""
+    editor = os.environ.get("CODEN_EDITOR", "vscode").lower()
+    if editor not in SUPPORTED_EDITORS:
+        return "vscode"
+    return editor
+
+
+def _make_vscode_url(path: str, line: int | None) -> str:
+    """Generate vscode:// URL."""
+    if line is not None:
+        return f"vscode://file/{path}:{line}:1"
+    return f"vscode://file/{path}"
+
+
+def _make_jetbrains_url(ide: str, path: str, line: int | None) -> str:
+    """Generate jetbrains:// URL for PyCharm or IntelliJ IDEA."""
+    encoded_path = quote(path, safe="")
+    if line is not None:
+        return f"jetbrains://{ide}/navigate/reference?path={encoded_path}&line={line}"
+    return f"jetbrains://{ide}/navigate/reference?path={encoded_path}"
+
+
+def _make_sublime_url(path: str, line: int | None) -> str:
+    """Generate subl:// URL for Sublime Text."""
+    file_url = f"file:///{path}"
+    if line is not None:
+        return f"subl://open?url={quote(file_url, safe='')}&line={line}"
+    return f"subl://open?url={quote(file_url, safe='')}"
+
+
+def _make_file_url(path: str, line: int | None) -> str:
+    """Generate basic file:// URL (no line number support)."""
+    return f"file:///{path}"
+
+
+# Editor URL handler dispatch table - defined after helper functions
+# Maps editor name -> handler function (path, line) -> url
+_EDITOR_URL_HANDLERS: dict[str, Callable[[str, int | None], str]] = {
+    "vscode": _make_vscode_url,
+    "pycharm": lambda p, l: _make_jetbrains_url("pycharm", p, l),
+    "idea": lambda p, l: _make_jetbrains_url("idea", p, l),
+    "sublime": _make_sublime_url,
+    "file": _make_file_url,
+}
+
+
+def make_editor_url(file_path: str | Path, line: int | None = None) -> str:
+    """Create an editor URL for the given path based on CODEN_EDITOR setting.
+
+    Supported editors (set via CODEN_EDITOR env var):
+        - vscode (default): vscode://file/path:line:col
+        - pycharm: jetbrains://pycharm/navigate/reference?path=...&line=...
+        - idea: jetbrains://idea/navigate/reference?path=...&line=...
+        - sublime: subl://open?url=file://...&line=...
+        - file: file:///path (no line number support)
+    """
+    path = Path(file_path).resolve()
+    path_str = str(path).replace("\\", "/")
+    editor = get_configured_editor()
+
+    # Use dispatch table instead of if/elif chain
+    handler = _EDITOR_URL_HANDLERS.get(editor, _EDITOR_URL_HANDLERS["file"])
+    return handler(path_str, line)
+
+
 class TerminalStyle:
     """
     Terminal styling using Rich for cross-platform color and hyperlink support.
@@ -86,7 +162,12 @@ class TerminalStyle:
         """Initialize with a Rich console."""
         _ensure_rich_loaded()
         # Use force_terminal=True and color_system="truecolor" for full 24-bit color gradient
-        self._console: "Console" = _rich_console(force_terminal=True, highlight=False, color_system="truecolor")
+        self._console: "Console" = _rich_console(
+            force_terminal=True,
+            highlight=False,
+            color_system="truecolor",
+            legacy_windows=False,
+        )
 
     def get_score_tier(self, score: float, max_score: float) -> str:
         """Determine the tier (1-10) for a given score relative to max."""
@@ -104,12 +185,8 @@ class TerminalStyle:
         return styles.get(tier, styles["tier_1"])
 
     def make_file_url(self, file_path: str | Path, line: int | None = None) -> str:
-        """Create a file:// URL for the given path."""
-        path = Path(file_path).resolve()
-        uri = path.as_uri()
-        if line is not None:
-            uri = f"{uri}:{line}"
-        return uri
+        """Create an editor URL based on CODEN_EDITOR setting."""
+        return make_editor_url(file_path, line)
 
     def colorize(self, text: str, tier: str) -> "Text":
         """Create colored Rich Text."""

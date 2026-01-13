@@ -18,23 +18,11 @@ from typing import Annotated, Any
 from pydantic import Field
 
 from ..cache import CacheManager
-from ..daemon.client import DaemonClient, DaemonConnectionError, DaemonRequestError
+from ..daemon.client import try_daemon_stacktrace as _daemon_stacktrace
 from ..daemon.protocol import StacktraceParams
 from ..search import SearchEngine
 
 logger = logging.getLogger(__name__)
-
-
-def _try_daemon_stacktrace(params: StacktraceParams) -> dict | None:
-    """Try to debug stacktrace via daemon, return None if unavailable."""
-    try:
-        client = DaemonClient(timeout=5.0)
-        return client.debug_stacktrace(params)
-    except (DaemonConnectionError, DaemonRequestError):
-        return None
-    except Exception as e:
-        logger.debug(f"Daemon error for debug_stacktrace: {e}")
-        return None
 
 
 @dataclass
@@ -277,7 +265,7 @@ async def debug_stacktrace(
         context_lines=max_context_lines,
         show_dependencies=include_dependencies,
     )
-    daemon_result = _try_daemon_stacktrace(daemon_params)
+    daemon_result = _daemon_stacktrace(daemon_params, auto_start=False)
     if daemon_result is not None:
         return daemon_result
 

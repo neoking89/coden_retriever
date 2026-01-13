@@ -12,6 +12,15 @@ from ..models import CodeEntity
 
 logger = logging.getLogger(__name__)
 
+# Stub statement types (language-agnostic AST patterns)
+# These node types represent explicit stub/placeholder constructs
+STUB_STATEMENT_TYPES: frozenset[str] = frozenset({
+    "pass_statement",      # Python: pass
+    "raise_statement",     # Python: raise
+    "throw_statement",     # JS/Java/C++: throw
+    "macro_invocation",    # Rust: todo!(), unimplemented!(), panic!()
+})
+
 # AST node types that increase cyclomatic complexity by language
 COMPLEXITY_NODES: dict[str, set[str]] = {
     "python": {
@@ -333,6 +342,86 @@ class RepoParser:
             logger.debug(f"Error extracting method call parts: {e}")
             return None, None
 
+    def _is_stub_node(self, node: Any) -> bool:
+        """Detect stub/interface methods using Tree-sitter AST.
+
+        Language-agnostic: analyzes the 'body' node structure.
+        A method is a stub if:
+        - No body (abstract/interface)
+        - Empty body (0 statements)
+        - Single statement that is a stub pattern (pass, raise, throw, empty return)
+
+        NOT a stub if:
+        - Has multiple statements
+        - Has a return with a value (return 42, return True, etc.)
+        """
+        try:
+            # Traverse up to find the node with a 'body' field
+            # This handles languages like C++ where the captured node is nested
+            # (e.g., identifier inside function_declarator inside function_definition)
+            body = None
+            current = node
+            max_depth = 5  # Prevent infinite loops
+            for _ in range(max_depth):
+                body = current.child_by_field_name('body')
+                if body is not None:
+                    break
+                if current.parent is None:
+                    break
+                current = current.parent
+
+            if not body:
+                return True  # No body = abstract/interface
+
+            # Count named children that are not extras (comments/whitespace)
+            statements = [c for c in body.children if c.is_named and not c.is_extra]
+
+            # Skip leading string literal (docstring pattern across languages)
+            if statements and statements[0].type in ("expression_statement", "string"):
+                first = statements[0]
+                if first.type == "string" or (
+                    first.children and
+                    all(c.type == "string" or not c.is_named for c in first.children)
+                ):
+                    statements = statements[1:]
+
+            # Empty body = stub
+            if len(statements) == 0:
+                return True
+
+            # Multiple statements = not a stub
+            if len(statements) > 1:
+                return False
+
+            # Single statement - check if it's a stub pattern
+            stmt = statements[0]
+            stmt_type = stmt.type
+
+            # Use module-level constant for stub statement types
+            if stmt_type in STUB_STATEMENT_TYPES:
+                return True
+
+            # Check for ellipsis (Python: ...)
+            if stmt_type == "expression_statement":
+                for child in stmt.children:
+                    if child.type == "ellipsis":
+                        return True
+                    # Rust macro_invocation inside expression_statement
+                    if child.type == "macro_invocation":
+                        return True
+
+            # Return statement: stub only if no value
+            if stmt_type == "return_statement":
+                # Check if there's a value (any named child that's not the return keyword)
+                value_children = [c for c in stmt.children if c.is_named]
+                return len(value_children) == 0
+
+            # Other single statements with actual logic = not a stub
+            return False
+
+        except Exception:
+            return False
+
     def _extract_entity(
         self,
         node: Any,
@@ -384,8 +473,10 @@ class RepoParser:
 
         # Calculate cyclomatic complexity for functions/methods only
         complexity = None
+        is_stub = False
         if entity_type in ("function", "method"):
             complexity = self._calculate_cyclomatic_complexity(def_node, lang_name, source_bytes)
+            is_stub = self._is_stub_node(def_node)
 
         return CodeEntity(
             name=name,
@@ -400,6 +491,7 @@ class RepoParser:
             docstring=docstring,
             parent_class=parent_class,
             cyclomatic_complexity=complexity,
+            is_stub=is_stub,
         )
 
     def _extract_docstring(

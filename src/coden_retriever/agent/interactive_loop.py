@@ -11,7 +11,7 @@ Follows Single Responsibility Principle - only handles REPL control flow.
 """
 
 from dataclasses import dataclass, field, asdict
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
 from .commands import execute_command
 
@@ -24,6 +24,7 @@ from .input_prompt import create_prompt_session, get_user_input_async
 from .rich_console import console
 from .tool_picker import run_tool_picker_async
 from .tool_wizard import inject_manual_tool_result, run_tool_wizard
+from ..constants import DEFAULT_MAX_RETRIES
 
 
 @dataclass
@@ -33,7 +34,7 @@ class CommandContext:
     model: str
     base_url: Optional[str]
     max_steps: int
-    max_retries: int = 3
+    max_retries: int = DEFAULT_MAX_RETRIES
     debug: bool = False
     debug_logger: Any = None
     available_tools: list = field(default_factory=list)
@@ -130,52 +131,77 @@ class InteractiveLoop:
             result.should_exit = True
             return result
 
-        if action == "run_wizard":
-            wizard_result = await self._run_wizard()
-            if wizard_result and wizard_result.success:
-                result.wizard_result = wizard_result
-                self.history = inject_manual_tool_result(self.history, wizard_result)
-
-        elif action == "history_cleared":
-            result.history_cleared = True
-            self.clear_history()
-
-        elif action == "open_browser":
-            await self._handle_directory_browser()
-            result.directory_changed = True
-
-        elif action == "cd_success":
-            # Directory already updated by command
-            result.directory_changed = True
-
-        elif action == "model_switch_requested":
-            # Model already updated by command on self.context
-            result.model_switched = True
-            result.new_model = self.context.model
-            if self.on_model_switch:
-                self.on_model_switch(self.context.model)
-            console.print("[green]Model switched successfully![/green]")
-            console.print()
-
-        elif action == "open_tool_picker":
-            await self._handle_tool_picker()
-
-        elif action == "study_mode_enabled":
-            # study_topic already set by command
-            self.context.study_mode = True
-            result.study_mode_changed = True
-            self.clear_history()  # Fresh start for study session
-
-        elif action == "study_mode_disabled":
-            self.context.study_mode = False
-            self.context.study_topic = None
-            result.study_mode_changed = True
-            self.clear_history()  # Fresh start after study
-
-        elif action == "config_changed":
-            result.config_changed = True
+        # Use dispatch table for action handling
+        handler = self._ACTION_HANDLERS.get(action)
+        if handler:
+            await handler(self, result)
 
         return result
+
+    # Action handler methods for dispatch table
+    async def _action_run_wizard(self, result: CommandResult) -> None:
+        """Handle run_wizard action."""
+        wizard_result = await self._run_wizard()
+        if wizard_result and wizard_result.success:
+            result.wizard_result = wizard_result
+            self.history = inject_manual_tool_result(self.history, wizard_result)
+
+    async def _action_history_cleared(self, result: CommandResult) -> None:
+        """Handle history_cleared action."""
+        result.history_cleared = True
+        self.clear_history()
+
+    async def _action_open_browser(self, result: CommandResult) -> None:
+        """Handle open_browser action."""
+        await self._handle_directory_browser()
+        result.directory_changed = True
+
+    async def _action_cd_success(self, result: CommandResult) -> None:
+        """Handle cd_success action."""
+        result.directory_changed = True
+
+    async def _action_model_switch(self, result: CommandResult) -> None:
+        """Handle model_switch_requested action."""
+        result.model_switched = True
+        result.new_model = self.context.model
+        if self.on_model_switch:
+            self.on_model_switch(self.context.model)
+        console.print("[green]Model switched successfully![/green]")
+        console.print()
+
+    async def _action_open_tool_picker(self, result: CommandResult) -> None:
+        """Handle open_tool_picker action."""
+        await self._handle_tool_picker()
+
+    async def _action_study_mode_enabled(self, result: CommandResult) -> None:
+        """Handle study_mode_enabled action."""
+        self.context.study_mode = True
+        result.study_mode_changed = True
+        self.clear_history()  # Fresh start for study session
+
+    async def _action_study_mode_disabled(self, result: CommandResult) -> None:
+        """Handle study_mode_disabled action."""
+        self.context.study_mode = False
+        self.context.study_topic = None
+        result.study_mode_changed = True
+        self.clear_history()  # Fresh start after study
+
+    async def _action_config_changed(self, result: CommandResult) -> None:
+        """Handle config_changed action."""
+        result.config_changed = True
+
+    # Action dispatch table - maps action strings to handler methods
+    _ACTION_HANDLERS: dict[str, Callable[["InteractiveLoop", CommandResult], Awaitable[None]]] = {
+        "run_wizard": _action_run_wizard,
+        "history_cleared": _action_history_cleared,
+        "open_browser": _action_open_browser,
+        "cd_success": _action_cd_success,
+        "model_switch_requested": _action_model_switch,
+        "open_tool_picker": _action_open_tool_picker,
+        "study_mode_enabled": _action_study_mode_enabled,
+        "study_mode_disabled": _action_study_mode_disabled,
+        "config_changed": _action_config_changed,
+    }
 
     async def _run_wizard(self) -> Any:
         """Run the tool wizard."""

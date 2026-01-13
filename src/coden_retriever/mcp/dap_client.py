@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..constants import DEFAULT_DEBUG_PORT
+
 logger = logging.getLogger(__name__)
 
 
@@ -74,7 +76,7 @@ class DAPClient:
     then connects via socket for DAP communication.
     """
 
-    DEFAULT_PORT = 5678
+    DEFAULT_PORT = DEFAULT_DEBUG_PORT
 
     def __init__(self):
         self._socket: socket.socket | None = None

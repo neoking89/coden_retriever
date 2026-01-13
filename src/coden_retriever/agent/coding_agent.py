@@ -1,7 +1,7 @@
 """Pydantic-AI coding agent with MCP tools and ReAct reasoning.
 
 Uses coden-retriever MCP server for code search and analysis capabilities.
-Displays reasoning steps (Thought → Action → Observation) for transparency.
+Displays reasoning steps (Thought -> Action -> Observation) for transparency.
 
 Supported model formats:
 - "ollama:model_name" - Ollama server (e.g. ollama:qwen2.5-coder:14b)
@@ -29,7 +29,7 @@ from .mcp_server import create_mcp_server
 from .model_factory import ModelFactory
 from .models import AgentMode, AgentResponse
 from .permission_toolset import wrap_toolset_with_permission
-from .prompt_builder import PromptBuilder, SYSTEM_PROMPT_TEMPLATE
+from .prompt_builder import PromptBuilder
 from .query_executor import ErrorHandler, QueryExecutor
 from .react_loop import parse_messages_to_steps, run_with_react_display
 from .rich_console import (
@@ -39,13 +39,7 @@ from .rich_console import (
     print_welcome,
 )
 from .text_tool_fallback import handle_fallback_iteration
-
-
-# Re-export for backwards compatibility
-SYSTEM_PROMPT = SYSTEM_PROMPT_TEMPLATE.format(
-    root_directory="(Will be set at runtime)",
-    directory_tree="(Directory structure will be loaded dynamically)",
-)
+from ..constants import DEFAULT_MAX_RETRIES
 
 
 # AgentMode is imported from models.py for proper dependency injection support
@@ -133,16 +127,6 @@ class CodingAgent:
             use_config_for_tool_instructions=True,
         )
 
-    @property
-    def _cached_tree(self) -> str | None:
-        """Backwards-compatible access to cached tree."""
-        return self._prompt_builder._cached_tree
-
-    @property
-    def _cached_tree_path(self) -> str | None:
-        """Backwards-compatible access to cached tree path."""
-        return self._prompt_builder._cached_tree_path
-
     def _build_model_settings(self) -> ModelSettings:
         """Build ModelSettings dict from current config.
 
@@ -193,7 +177,7 @@ class CodingAgent:
         study_topic: str | None = None,
         disabled_tools: list[str] | None = None,
         timeout: float | None = None,
-        max_retries: int = 3,
+        max_retries: int = DEFAULT_MAX_RETRIES,
     ) -> tuple:
         """Create MCP server and agent with shared setup logic.
 
@@ -544,7 +528,7 @@ class CodingAgent:
                 self._get_model(),
                 system_prompt=system_prompt,
                 toolsets=[toolset],
-                retries=max_retries,
+                retries=context.max_retries,
                 model_settings=self._build_model_settings(),
             )
 
@@ -589,7 +573,7 @@ class CodingAgent:
                             self._get_model(),
                             system_prompt=system_prompt,
                             toolsets=[toolset],
-                            retries=max_retries,
+                            retries=context.max_retries,
                             model_settings=self._build_model_settings(),
                         )
                         # Auto-start study session when entering study mode
