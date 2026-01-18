@@ -1,3 +1,24 @@
+# Release Notes - Version 1.2.0
+
+**Release Date:** January 18, 2026
+
+## New Features
+
+- **Dead Code Detection (`-D`)**: Find potentially unused functions and methods in your codebase
+  - Use `--dead-code-threshold` to adjust confidence level (default: 0.5)
+  - In flag mode: use `--remove-dead-code` to delete dead code instead of flagging
+
+## Installation Changes
+
+- **Modular Installation**: Base install is now significantly lighter. Heavy dependencies are now optional:
+  - `pip install coden-retriever` — Base install (search, hotspots, propagation analysis)
+  - `pip install 'coden-retriever[semantic]'` — Adds semantic search, clone detection, echo comments
+  - `pip install 'coden-retriever[mcp]'` — Adds MCP server (`coden serve`)
+  - `pip install 'coden-retriever[agent]'` — Adds interactive agent (`coden agent`)
+  - `pip install 'coden-retriever[all]'` — All features
+
+---
+
 # Release Notes - Version 1.1.0
 
 **Release Date:** January 13, 2026
