@@ -22,6 +22,7 @@ import networkx as nx
 from pydantic import Field
 
 from ..cache import CacheManager
+from ..constants import PC_THRESHOLD_CRITICAL, PC_THRESHOLD_GOOD, PC_THRESHOLD_WARNING
 from ..daemon.client import try_daemon_propagation_cost as _daemon_propagation_cost
 from ..daemon.protocol import PropagationCostParams
 from ..token_estimator import count_tokens
@@ -30,16 +31,6 @@ if TYPE_CHECKING:
     from ..cache.models import CachedIndices
 
 logger = logging.getLogger(__name__)
-
-# Research-backed thresholds (MacCormack et al., 2006)
-# From "Exploring the Structure of Complex Software Designs"
-# The study analyzed Linux kernel vs Mozilla codebase:
-# - Linux (well-architected): PC ~10% - modular design with clear boundaries
-# - Mozilla (pre-refactor): PC ~43% - high coupling, difficult to maintain
-# The 25% threshold is the midpoint indicating moderate coupling concerns.
-PC_THRESHOLD_GOOD = 0.10      # 10%: Excellent - matches well-designed systems like Linux
-PC_THRESHOLD_WARNING = 0.25   # 25%: Moderate - coupling warrants monitoring
-PC_THRESHOLD_CRITICAL = 0.43  # 43%: Critical - matches pre-refactor Mozilla, needs action
 
 # Token budget constants
 _TOKEN_OVERHEAD_PROPAGATION = 200
@@ -62,48 +53,44 @@ async def _load_cached_indices(root_directory: str) -> "CachedIndices":
     return await asyncio.to_thread(_load_sync)
 
 
-def _compute_module_breakdown(
+def _extract_module_at_depth(parts: tuple[str, ...], src_idx: int, depth: int) -> str:
+    """Extract module name at specified depth after src/ directory."""
+    if src_idx >= 0 and src_idx + depth < len(parts):
+        return "/".join(parts[src_idx + 1:src_idx + 1 + depth])
+    elif len(parts) > depth:
+        return "/".join(parts[-1 - depth:-1])
+    return "root"
+
+
+def _group_nodes_by_module(
     graph: nx.DiGraph,
     entities: dict[str, Any],
-    closure: nx.DiGraph,
-    token_limit: int | None = None,
-) -> list[dict]:
-    """Compute per-module coupling contribution.
-
-    Language-agnostic: Extracts module from file path, works for any language.
-    """
-    # Group nodes by module (first directory component)
+    depth: int,
+) -> dict[str, set[str]]:
+    """Group graph nodes by module at specified depth after src/ directory."""
     module_nodes: dict[str, set[str]] = defaultdict(set)
     for node_id in graph.nodes():
         entity = entities.get(node_id)
         if entity and hasattr(entity, 'file_path') and entity.file_path:
-            # Extract module from file path (language-agnostic)
-            path = Path(entity.file_path)
-            parts = path.parts
-            # Use first directory after src/ or root
+            parts = Path(entity.file_path).parts
             src_idx = next((i for i, p in enumerate(parts) if p == "src"), -1)
-            if src_idx >= 0 and src_idx + 1 < len(parts):
-                module = parts[src_idx + 1]
-            elif len(parts) > 1:
-                module = parts[-2]  # Parent directory
-            else:
-                module = "root"
+            module = _extract_module_at_depth(parts, src_idx, depth)
             module_nodes[module].add(node_id)
+    return module_nodes
 
-    # Calculate coupling for each module
-    breakdown = []
+
+def _compute_module_coupling(
+    module_nodes: dict[str, set[str]],
+    closure: nx.DiGraph,
+    token_limit: int | None,
+) -> list[dict[str, Any]]:
+    """Calculate coupling metrics for each module."""
+    breakdown: list[dict[str, Any]] = []
     used_tokens = 0
 
     for module, nodes in sorted(module_nodes.items(), key=lambda x: -len(x[1])):
-        internal_edges = sum(
-            1 for u, v in closure.edges()
-            if u in nodes and v in nodes
-        )
-        external_edges = sum(
-            1 for u, v in closure.edges()
-            if (u in nodes) != (v in nodes)
-        )
-
+        internal_edges = sum(1 for u, v in closure.edges() if u in nodes and v in nodes)
+        external_edges = sum(1 for u, v in closure.edges() if (u in nodes) != (v in nodes))
         internal_possible = len(nodes) * (len(nodes) - 1) if len(nodes) > 1 else 1
         internal_pc = internal_edges / internal_possible if internal_possible > 0 else 0
 
@@ -114,7 +101,6 @@ def _compute_module_breakdown(
             "external_edges": external_edges,
         }
 
-        # Apply token budget if set
         if token_limit is not None:
             entry_tokens = count_tokens(str(entry), is_code=False) + _TOKEN_PER_MODULE
             if used_tokens + entry_tokens > token_limit:
@@ -123,10 +109,34 @@ def _compute_module_breakdown(
 
         breakdown.append(entry)
 
-    # Sort by total contribution descending
     breakdown.sort(key=lambda x: x["internal_coupling"] + x["external_edges"], reverse=True)
+    return breakdown
 
-    return breakdown[:10]  # Top 10 modules
+
+# Maximum modules to return in breakdown
+_MAX_MODULE_BREAKDOWN = 10
+
+
+def _compute_module_breakdown(
+    graph: nx.DiGraph,
+    entities: dict[str, Any],
+    closure: nx.DiGraph,
+    token_limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Compute per-module coupling contribution.
+
+    Language-agnostic: Extracts module from file path, works for any language.
+    Automatically uses subdirectories if only one top-level module exists.
+    """
+    # First pass: group by first level after src/
+    module_nodes = _group_nodes_by_module(graph, entities, depth=1)
+
+    # If only 1 module, try deeper grouping for more useful breakdown
+    if len(module_nodes) == 1:
+        module_nodes = _group_nodes_by_module(graph, entities, depth=2)
+
+    breakdown = _compute_module_coupling(module_nodes, closure, token_limit)
+    return breakdown[:_MAX_MODULE_BREAKDOWN]
 
 
 def _find_critical_paths(

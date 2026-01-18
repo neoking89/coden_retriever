@@ -8,11 +8,15 @@ import math
 import re
 from collections import Counter, defaultdict
 from functools import lru_cache
-
-import numpy as np
+from typing import TYPE_CHECKING
 
 from ..config import Config
+from ..utils.optional_deps import get_numpy
 from .base import SearchIndex
+
+if TYPE_CHECKING:
+    import numpy as np
+
 
 # Pre-compiled regex patterns for tokenization (module-level for performance)
 _CAMEL_CASE_PATTERN = re.compile(r"([a-z])([A-Z])")
@@ -58,9 +62,10 @@ class BM25Index(SearchIndex):
         self._doc_ids: list[str] = []
         self._idf: dict[str, float] = {}
         # Inverted index: term -> (doc_indices array, term_frequencies array)
-        self._inverted_index: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self._inverted_index: dict[str, tuple["np.ndarray", "np.ndarray"]] = {}
         # Pre-computed: k1 * (1 - b + b * (doc_len / avg_len)) per document
-        self._doc_denom_part: np.ndarray = np.array([], dtype=np.float32)
+        np = get_numpy()
+        self._doc_denom_part: "np.ndarray" = np.array([], dtype=np.float32)
 
     @staticmethod
     def tokenize(text: str) -> tuple[str, ...]:
@@ -76,6 +81,7 @@ class BM25Index(SearchIndex):
         if self._corpus_size == 0:
             return
 
+        np = get_numpy()
         self._doc_ids = list(documents.keys())
         doc_id_to_idx = {doc_id: i for i, doc_id in enumerate(self._doc_ids)}
 
@@ -124,6 +130,7 @@ class BM25Index(SearchIndex):
         except ValueError:
             return 0.0
 
+        np = get_numpy()
         score = 0.0
         for term in self.tokenize(query):
             if term not in self._inverted_index:
@@ -153,6 +160,7 @@ class BM25Index(SearchIndex):
         if not query_terms or self._corpus_size == 0:
             return {}
 
+        np = get_numpy()
         # Initialize scores for all documents
         scores = np.zeros(self._corpus_size, dtype=np.float32)
 

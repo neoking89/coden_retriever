@@ -27,7 +27,7 @@ from .filtering_toolset import create_filtered_toolset
 from .interactive_loop import CommandContext, InteractiveLoop
 from .mcp_server import create_mcp_server
 from .model_factory import ModelFactory
-from .models import AgentMode, AgentResponse
+from .models import AgentMode, AgentResponse, ReActStep
 from .permission_toolset import wrap_toolset_with_permission
 from .prompt_builder import PromptBuilder
 from .query_executor import ErrorHandler, QueryExecutor
@@ -257,7 +257,7 @@ class CodingAgent:
         async with server:
             full_prompt = f"Working directory: {root_directory}\n\n{prompt}"
             current_history = message_history
-            fallback_steps = []
+            fallback_steps: list[ReActStep] = []
             fallback_tool_calls = 0
             all_messages = []
             steps = []
@@ -539,12 +539,13 @@ class CodingAgent:
         while True:
             try:
                 if pending_input is not None:
-                    user_input = pending_input
+                    user_input: str = pending_input
                     pending_input = None
                 else:
-                    user_input = await loop.get_input()
-                    if user_input is None:
+                    maybe_input = await loop.get_input()
+                    if maybe_input is None:
                         continue
+                    user_input = maybe_input
 
                 cmd_result = await loop.process_command(user_input)
                 if cmd_result.should_exit:

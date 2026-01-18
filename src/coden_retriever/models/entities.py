@@ -101,9 +101,9 @@ class PathTraceResult:
                 unique_nodes.append(node)
         return unique_nodes
 
-    def _count_node_frequency(self, unique_paths: list[list[tuple[str, str, str]]]) -> dict:
+    def _count_node_frequency(self, unique_paths: list[list[tuple[str, str, str]]]) -> dict[tuple[str, str], int]:
         """Count how many times each node appears in paths."""
-        frequency = {}
+        frequency: dict[tuple[str, str], int] = {}
         for path in unique_paths:
             for _, name, etype in path:
                 key = (name, etype)
@@ -147,7 +147,7 @@ class PathTraceResult:
         dependency_paths = "\n".join(paths_lines) if paths_lines else "No paths found."
 
         # Group nodes by depth with frequency
-        depth_groups = {}
+        depth_groups: dict[int, list[tuple[str, str, str, int]]] = {}
         for node_id, name, etype in unique_nodes:
             key = (name, etype)
             node_depth = depth_map.get(key, 0)
@@ -196,7 +196,7 @@ class PathTraceResult:
         critical_names = [name for name, _ in critical_nodes]
 
         # Identify branching points (nodes with multiple children in paths)
-        branching_nodes = []
+        branching_nodes: list[tuple[str, str]] = []
         for path in unique_paths:
             for i, (_, name, etype) in enumerate(path[:-1]):  # Exclude leaf nodes
                 # Count how many different successors this node has across all paths
@@ -323,6 +323,7 @@ class CodeEntity:
     parent_class: str | None = None
     cyclomatic_complexity: int | None = None
     is_stub: bool = False
+    is_decorated: bool = False  # True if function/method has decorators/annotations (AST-detected)
 
     @property
     def node_id(self) -> str:
@@ -372,7 +373,10 @@ class CodeEntity:
             return True
 
         # Check for test directories in path (use path separators to be precise)
+        # Exclude "fixtures/" subdirectories which contain sample code, not tests
         path_lower = self.file_path.lower().replace("\\", "/")
+        if "/fixtures/" in path_lower:
+            return False
         if ("/tests/" in path_lower or
             "/test/" in path_lower or
             "/spec/" in path_lower or

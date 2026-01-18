@@ -33,6 +33,7 @@ from ..search import SearchEngine
 from ..token_estimator import count_tokens
 from .protocol import (
     CloneDetectionParams,
+    DeadCodeParams,
     FlagClearParams,
     FlagParams,
     PropagationCostParams,
@@ -300,9 +301,12 @@ class FindHandler(SearchHandlerBase):
         if not search_params.find_identifier:
             raise ValueError("find_identifier is required")
 
+        # Mypy: find_identifier is guaranteed non-None after the check above
+        identifier = search_params.find_identifier
+
         def do_find(search_params: SearchParams, engine: SearchEngine) -> list:
             return engine.find_identifiers(
-                search_params.find_identifier,
+                identifier,
                 limit=search_params.limit,
                 include_deps=search_params.show_deps,
             )
@@ -728,6 +732,28 @@ class PropagationCostHandler(BaseHandler):
         return result
 
 
+class DeadCodeHandler(BaseHandler):
+    """Handler for dead code detection requests."""
+
+    def handle(self, params: dict) -> dict:
+        from ..dead_code.detector import detect_unused_functions
+
+        dc_params = DeadCodeParams.from_dict(params)
+        indices, _ = self._server._get_or_load_project(dc_params.source_dir)
+
+        result = detect_unused_functions(
+            entities=indices.entities,
+            graph=indices.graph,
+            confidence_threshold=dc_params.confidence_threshold,
+            exclude_tests=dc_params.exclude_tests,
+            include_private=dc_params.include_private,
+            min_lines=dc_params.min_lines,
+            limit=dc_params.limit,
+        )
+        result["source"] = "daemon"
+        return result
+
+
 class FlagHandler(BaseHandler):
     """Handler for code flagging requests."""
 
@@ -746,10 +772,12 @@ class FlagHandler(BaseHandler):
             propagation=flag_params.propagation,
             clones=flag_params.clones,
             echo_comments=flag_params.echo_comments,
+            dead_code=flag_params.dead_code,
             risk_threshold=flag_params.risk_threshold,
             propagation_threshold=flag_params.propagation_threshold,
             clone_threshold=flag_params.clone_threshold,
             echo_threshold=flag_params.echo_threshold,
+            dead_code_threshold=flag_params.dead_code_threshold,
             clone_mode=flag_params.clone_mode,
             line_threshold=flag_params.line_threshold,
             func_threshold=flag_params.func_threshold,
@@ -758,6 +786,7 @@ class FlagHandler(BaseHandler):
             verbose=flag_params.verbose,
             exclude_tests=flag_params.exclude_tests,
             remove_comments=flag_params.remove_comments,
+            remove_dead_code=flag_params.remove_dead_code,
         )
         result["source"] = "daemon"
         return result
@@ -803,6 +832,7 @@ def create_handler_registry(server: "DaemonServer") -> dict[str, BaseHandler]:
         "debug_stacktrace": DebugStacktraceHandler(server),
         "detect_clones": CloneDetectionHandler(server),
         "propagation_cost": PropagationCostHandler(server),
+        "detect_dead_code": DeadCodeHandler(server),
         "flag_code": FlagHandler(server),
         "flag_clear": FlagClearHandler(server),
     }

@@ -10,17 +10,24 @@ and tool descriptions - no keyword-based rules.
 Users can adjust the threshold via:
 - Environment variable: CODEN_RETRIEVER_TOOL_FILTER_THRESHOLD
 - Config setting: /config set tool_filter_threshold <value>
+
+Requires the 'semantic' extra:
+    pip install 'coden-retriever[semantic]'
 """
 import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Any
+from typing import Callable, Any, TYPE_CHECKING, cast
 
-import numpy as np
 from rich.console import Console
 
 from ..search.semantic import get_cached_model
+from ..utils.optional_deps import get_numpy
+
+if TYPE_CHECKING:
+    import numpy as np
+    from model2vec import StaticModel
 
 logger = logging.getLogger(__name__)
 
@@ -213,7 +220,7 @@ class ToolFilter:
             else:
                 self.domain_tools[name] = tool
 
-        self._model = None
+        self._model: StaticModel | None = None
         self._embeddings: np.ndarray | None = None
         self._domain_tool_names: list[str] = []
 
@@ -239,10 +246,12 @@ class ToolFilter:
 
         logger.info(f"Computing embeddings for {len(texts)} domain tools (skipping {len(self.core_tools)} core tools)...")
 
-        # Generate embeddings
-        self._embeddings = self._model.encode(texts)
+        # Generate embeddings (model is set on line 233 via get_cached_model)
+        model = cast("StaticModel", self._model)
+        self._embeddings = model.encode(texts)
 
         # Normalize for cosine similarity (dot product of normalized vectors)
+        np = get_numpy()
         norms = np.linalg.norm(self._embeddings, axis=1, keepdims=True)
         norms = np.where(norms == 0, 1, norms)  # Avoid division by zero
         self._embeddings = self._embeddings / norms
@@ -299,6 +308,7 @@ class ToolFilter:
             return FilterResult(core_tools=core_results, domain_tools=[])
 
         # Encode and normalize query
+        np = get_numpy()
         query_vec = self._model.encode([query])[0]
         query_norm = np.linalg.norm(query_vec)
         if query_norm == 0:
@@ -369,6 +379,7 @@ class ToolFilter:
             return {name: 0.0 for name in self._domain_tool_names}
 
         # Encode and normalize query
+        np = get_numpy()
         query_vec = self._model.encode([query])[0]
         query_norm = np.linalg.norm(query_vec)
         if query_norm == 0:

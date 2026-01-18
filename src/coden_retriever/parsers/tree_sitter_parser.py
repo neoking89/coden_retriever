@@ -21,6 +21,18 @@ STUB_STATEMENT_TYPES: frozenset[str] = frozenset({
     "macro_invocation",    # Rust: todo!(), unimplemented!(), panic!()
 })
 
+# AST node types that indicate decorators/annotations (language-agnostic)
+# These are standard node type names used by tree-sitter grammars
+DECORATOR_NODE_TYPES: frozenset[str] = frozenset({
+    "decorator",            # Python, JavaScript, TypeScript
+    "decorated_definition", # Python (parent node containing decorators)
+    "annotation",           # Java, Kotlin, Scala
+    "marker_annotation",    # Java (annotation without arguments)
+    "attribute",            # C#, Rust (#[...])
+    "attribute_item",       # Rust
+    "attribute_list",       # C#
+})
+
 # AST node types that increase cyclomatic complexity by language
 COMPLEXITY_NODES: dict[str, set[str]] = {
     "python": {
@@ -64,6 +76,129 @@ COMPLEXITY_NODES: dict[str, set[str]] = {
 }
 
 
+def _extract_python_method_call(node) -> tuple[str | None, str | None]:
+    """Extract receiver and method from Python attribute node."""
+    obj_node = None
+    attr_node = None
+    for child in node.children:
+        if hasattr(child, 'type'):
+            if child.type == "identifier":
+                if obj_node is None:
+                    obj_node = child
+                attr_node = child
+            elif child.type == "attribute":
+                obj_node = child
+            elif child.type in ("call", "subscript"):
+                obj_node = child
+
+    method = None
+    receiver = None
+    if attr_node and attr_node.text:
+        method = attr_node.text.decode("utf-8", errors="replace")
+    if obj_node and obj_node.text and obj_node != attr_node:
+        receiver_text = obj_node.text.decode("utf-8", errors="replace")
+        receiver = receiver_text.split('.')[-1] if '.' in receiver_text else receiver_text
+
+    return receiver, method
+
+
+def _extract_js_ts_method_call(node) -> tuple[str | None, str | None]:
+    """Extract receiver and method from JS/TS member_expression."""
+    method = None
+    receiver = None
+    for child in node.children:
+        if hasattr(child, 'type'):
+            if child.type == "property_identifier" and child.text:
+                method = child.text.decode("utf-8", errors="replace")
+            elif child.type == "identifier" and child.text:
+                receiver = child.text.decode("utf-8", errors="replace")
+            elif child.type == "member_expression":
+                for subchild in child.children:
+                    if hasattr(subchild, 'type') and subchild.type == "property_identifier":
+                        if subchild.text:
+                            receiver = subchild.text.decode("utf-8", errors="replace")
+                        break
+    return receiver, method
+
+
+def _extract_go_method_call(node) -> tuple[str | None, str | None]:
+    """Extract receiver and method from Go selector_expression."""
+    method = None
+    receiver = None
+    for child in node.children:
+        if hasattr(child, 'type'):
+            if child.type == "field_identifier" and child.text:
+                method = child.text.decode("utf-8", errors="replace")
+            elif child.type == "identifier" and child.text:
+                receiver = child.text.decode("utf-8", errors="replace")
+    return receiver, method
+
+
+def _extract_rust_cpp_method_call(node) -> tuple[str | None, str | None]:
+    """Extract receiver and method from Rust/C++ field_expression."""
+    method = None
+    receiver = None
+    for child in node.children:
+        if hasattr(child, 'type'):
+            if child.type == "field_identifier" and child.text:
+                method = child.text.decode("utf-8", errors="replace")
+            elif child.type == "identifier" and child.text:
+                receiver = child.text.decode("utf-8", errors="replace")
+    return receiver, method
+
+
+def _extract_fallback_method_call(node) -> tuple[str | None, str | None]:
+    """Fallback: parse receiver and method from node text."""
+    if not node.text:
+        return None, None
+    text = node.text.decode("utf-8", errors="replace")
+    if '.' not in text:
+        return None, None
+    parts = text.split('.')
+    method = parts[-1]
+    receiver = parts[-2] if len(parts) >= 2 else None
+    return receiver, method
+
+
+# Node types that represent identifier definitions (not usages)
+# When an identifier appears as a child of these nodes, it's being DEFINED
+DEFINITION_PARENT_TYPES: frozenset[str] = frozenset({
+    # Function/method definitions
+    "function_definition", "function_declaration", "method_definition",
+    "method_declaration", "function_item", "arrow_function",
+    # Class definitions
+    "class_definition", "class_declaration", "struct_item", "enum_item",
+    "trait_item", "interface_declaration", "type_alias_declaration",
+    # Parameters
+    "parameter", "parameters", "typed_parameter", "typed_default_parameter",
+    "default_parameter", "formal_parameters", "required_parameter",
+    # Variable definitions (LHS of assignment)
+    "assignment", "augmented_assignment", "variable_declarator",
+    "short_var_declaration", "let_declaration", "const_declaration",
+    # Import definitions
+    "import_statement", "import_from_statement", "import_declaration",
+    "use_declaration", "aliased_import",
+    # For loop variable
+    "for_statement", "for_in_statement", "for_in_clause",
+    # Exception handling
+    "except_clause", "catch_clause",
+    # Comprehension variables
+    "list_comprehension", "dictionary_comprehension", "set_comprehension",
+    "generator_expression",
+})
+
+# Node types that ARE identifiers (language-specific names)
+IDENTIFIER_NODE_TYPES: frozenset[str] = frozenset({
+    "identifier",           # Python, JS, TS, Go, Rust, Java, etc.
+    "property_identifier",  # JS/TS for object properties
+    "field_identifier",     # Go, Rust for struct fields
+    "type_identifier",      # Many languages for type names
+    "simple_identifier",    # Kotlin, Swift
+    "name",                 # PHP
+    "shorthand_property_identifier",  # JS destructuring
+})
+
+
 class RepoParser:
     """Parses source files using Tree-sitter."""
 
@@ -97,7 +232,7 @@ class RepoParser:
                 parser = Parser(language)
             except TypeError:
                 parser = Parser()
-                parser.set_language(language)
+                parser.set_language(language)  # type: ignore[attr-defined]
 
             # Use language.query() method (preferred in newer tree-sitter)
             try:
@@ -239,6 +374,116 @@ class RepoParser:
 
         return entities, references
 
+    def extract_identifier_usages(
+        self,
+        file_path: str,
+        source_code: str
+    ) -> set[str]:
+        """Extract all identifier names that are USED (referenced) in a file.
+
+        This implements Vulture-style name tracking: any identifier that appears
+        in a non-definition context is considered "used". This catches patterns
+        that call-graph analysis misses:
+        - Dictionary values: {"key": func}
+        - Callbacks: sort(key=func)
+        - Assignments: handler = func
+        - List literals: [func1, func2]
+
+        Returns:
+            Set of identifier names that are referenced (not just defined).
+        """
+        ext = Path(file_path).suffix.lower()
+        lang_name = LANGUAGE_MAP.get(ext)
+
+        if not lang_name:
+            return set()
+
+        parser = self._get_parser(lang_name)
+        if not parser:
+            return set()
+
+        try:
+            source_bytes = source_code.encode("utf-8")
+            tree = parser.parse(source_bytes)
+        except Exception as e:
+            logger.debug(f"Parse error in {file_path}: {e}")
+            return set()
+
+        used_names: set[str] = set()
+
+        def is_definition_context(node: Any) -> bool:
+            """Check if this identifier is being defined (not used)."""
+            parent = node.parent
+            if not parent:
+                return False
+
+            # Direct child of a definition node
+            if parent.type in DEFINITION_PARENT_TYPES:
+                # For assignments, only LHS is definition
+                if parent.type in ("assignment", "augmented_assignment"):
+                    # Check if this is the left side
+                    left = parent.child_by_field_name("left")
+                    if left and node.start_byte >= left.start_byte and node.end_byte <= left.end_byte:
+                        return True
+                    return False
+                return True
+
+            # Function/method name (the identifier being defined)
+            if parent.type in ("function_definition", "function_declaration",
+                              "method_definition", "method_declaration",
+                              "function_item", "class_definition",
+                              "class_declaration", "struct_item", "enum_item",
+                              "trait_item", "interface_declaration"):
+                # Check if this is the 'name' field
+                name_node = parent.child_by_field_name("name")
+                if name_node and node.id == name_node.id:
+                    return True
+
+            # Parameter name
+            if parent.type in ("parameter", "typed_parameter",
+                              "typed_default_parameter", "default_parameter",
+                              "required_parameter"):
+                return True
+
+            # Variable declarator (JS/TS: const x = ...)
+            if parent.type == "variable_declarator":
+                name_node = parent.child_by_field_name("name")
+                if name_node and node.id == name_node.id:
+                    return True
+
+            # For-in loop variable
+            if parent.type in ("for_in_clause", "for_in_statement"):
+                # The loop variable is typically the first identifier
+                left = parent.child_by_field_name("left")
+                if left and node.start_byte >= left.start_byte and node.end_byte <= left.end_byte:
+                    return True
+
+            return False
+
+        def walk(node: Any) -> None:
+            """Walk AST and collect identifier usages."""
+            # Check if this is an identifier node
+            if node.type in IDENTIFIER_NODE_TYPES:
+                if node.text:
+                    name = node.text.decode("utf-8", errors="replace")
+                    # Skip if in definition context
+                    if not is_definition_context(node):
+                        # Skip common keywords/builtins that aren't user-defined
+                        if name not in ("self", "this", "super", "cls", "None",
+                                       "True", "False", "null", "undefined",
+                                       "true", "false", "nil"):
+                            used_names.add(name)
+
+            # Recurse into children
+            for child in node.children:
+                walk(child)
+
+        try:
+            walk(tree.root_node)
+        except Exception as e:
+            logger.debug(f"Error walking AST in {file_path}: {e}")
+
+        return used_names
 
     def _extract_method_call_parts(
         self,
@@ -255,82 +500,16 @@ class RepoParser:
             Tuple of (receiver, method_name). Either may be None if extraction fails.
         """
         try:
-            receiver = None
-            method = None
-
             if lang_name == "python":
-                # Python attribute node structure
-                obj_node = None
-                attr_node = None
-                for child in node.children:
-                    if hasattr(child, 'type'):
-                        if child.type == "identifier":
-                            if obj_node is None:
-                                obj_node = child
-                            attr_node = child
-                        elif child.type == "attribute":
-                            # Chained: a.b.c - the nested attribute becomes our object
-                            obj_node = child
-                        elif child.type in ("call", "subscript"):
-                            obj_node = child
-
-                if attr_node and attr_node.text:
-                    method = attr_node.text.decode("utf-8", errors="replace")
-                if obj_node and obj_node.text and obj_node != attr_node:
-                    receiver_text = obj_node.text.decode("utf-8", errors="replace")
-                    if '.' in receiver_text:
-                        receiver = receiver_text.split('.')[-1]
-                    else:
-                        receiver = receiver_text
-
+                receiver, method = _extract_python_method_call(node)
             elif lang_name in ("javascript", "typescript"):
-                # JS/TS member_expression
-                for child in node.children:
-                    if hasattr(child, 'type'):
-                        if child.type == "property_identifier":
-                            if child.text:
-                                method = child.text.decode("utf-8", errors="replace")
-                        elif child.type == "identifier":
-                            if child.text:
-                                receiver = child.text.decode("utf-8", errors="replace")
-                        elif child.type == "member_expression":
-                            for subchild in child.children:
-                                if hasattr(subchild, 'type') and subchild.type == "property_identifier":
-                                    if subchild.text:
-                                        receiver = subchild.text.decode("utf-8", errors="replace")
-                                    break
-
+                receiver, method = _extract_js_ts_method_call(node)
             elif lang_name == "go":
-                # Go selector_expression
-                for child in node.children:
-                    if hasattr(child, 'type'):
-                        if child.type == "field_identifier":
-                            if child.text:
-                                method = child.text.decode("utf-8", errors="replace")
-                        elif child.type == "identifier":
-                            if child.text:
-                                receiver = child.text.decode("utf-8", errors="replace")
-
+                receiver, method = _extract_go_method_call(node)
             elif lang_name in ("rust", "cpp"):
-                # Rust/C++ field_expression
-                for child in node.children:
-                    if hasattr(child, 'type'):
-                        if child.type == "field_identifier":
-                            if child.text:
-                                method = child.text.decode("utf-8", errors="replace")
-                        elif child.type == "identifier":
-                            if child.text:
-                                receiver = child.text.decode("utf-8", errors="replace")
-
+                receiver, method = _extract_rust_cpp_method_call(node)
             else:
-                # Fallback: parse from text
-                if node.text:
-                    text = node.text.decode("utf-8", errors="replace")
-                    if '.' in text:
-                        parts = text.split('.')
-                        method = parts[-1]
-                        if len(parts) >= 2:
-                            receiver = parts[-2]
+                receiver, method = _extract_fallback_method_call(node)
 
             # Skip self/this/super - can't resolve without type analysis
             if receiver in ('self', 'this', 'super', 'cls'):
@@ -341,6 +520,47 @@ class RepoParser:
         except Exception as e:
             logger.debug(f"Error extracting method call parts: {e}")
             return None, None
+
+    def _has_decorator_or_annotation(self, def_node: Any) -> bool:
+        """Detect if a function/method definition has decorators/annotations.
+
+        Language-agnostic: checks for standard tree-sitter node type names
+        that represent decorators/annotations across different languages.
+
+        Important: Only checks IMMEDIATE parent or preceding sibling to avoid
+        false positives from other decorated definitions elsewhere in the file.
+        """
+        try:
+            parent = def_node.parent
+            if parent is None:
+                return False
+
+            # Check immediate parent for decorated_definition wrapper
+            # This is the standard pattern in Python for decorated functions
+            if parent.type in DECORATOR_NODE_TYPES:
+                return True
+
+            # Find the immediate preceding sibling (not all preceding siblings)
+            # This handles Java/C#/Rust where annotations are siblings
+            prev_sibling = None
+            for child in parent.children:
+                if child.start_byte >= def_node.start_byte:
+                    break
+                prev_sibling = child
+
+            if prev_sibling is not None:
+                if prev_sibling.type in DECORATOR_NODE_TYPES:
+                    return True
+                # Java/Kotlin: annotations in modifiers block
+                if prev_sibling.type == "modifiers":
+                    for mod_child in prev_sibling.children:
+                        if mod_child.type in DECORATOR_NODE_TYPES:
+                            return True
+
+        except (AttributeError, TypeError):
+            # AST node access can fail with various attribute/type errors
+            pass
+        return False
 
     def _is_stub_node(self, node: Any) -> bool:
         """Detect stub/interface methods using Tree-sitter AST.
@@ -422,6 +642,38 @@ class RepoParser:
         except Exception:
             return False
 
+    def _extract_arrow_function_name(self, arrow_node: Any, line: int) -> str:
+        """Extract name for arrow function from parent variable assignment.
+
+        Arrow functions get names from variable declarations:
+        - const myFunc = () => {...}  -> "myFunc"
+        - let handler = x => x        -> "handler"
+        - obj.method = () => {}       -> "<arrow@line>"  (no good name)
+        - (() => {})()                -> "<arrow@line>"  (IIFE)
+
+        Returns:
+            Function name if found, otherwise "<arrow@line:col>" format.
+        """
+        try:
+            parent = arrow_node.parent
+            if parent and parent.type == "variable_declarator":
+                # const myFunc = () => {...}
+                name_node = parent.child_by_field_name("name")
+                if name_node and name_node.text:
+                    return name_node.text.decode("utf-8", errors="replace")
+
+            # Also check for assignment_expression (e.g., myFunc = () => {...})
+            if parent and parent.type == "assignment_expression":
+                left = parent.child_by_field_name("left")
+                if left and left.type == "identifier" and left.text:
+                    return left.text.decode("utf-8", errors="replace")
+
+        except (AttributeError, TypeError):
+            pass
+
+        # Fallback: use <arrow@line> format for anonymous arrow functions
+        return f"<arrow@{line}>"
+
     def _extract_entity(
         self,
         node: Any,
@@ -440,6 +692,15 @@ class RepoParser:
 
         start_line = def_node.start_point.row + 1
         end_line = def_node.end_point.row + 1
+
+        # Handle arrow functions: extract name from parent variable_declarator
+        # Arrow functions don't have inline names, they get names via assignment
+        # e.g., `const myFunc = () => {...}` -> name is "myFunc"
+        # Note: For arrow functions, the query captures the arrow_function node itself
+        # (not a child identifier), so we check node.type, not def_node.type
+        if node.type == "arrow_function":
+            arrow_line = node.start_point.row + 1
+            name = self._extract_arrow_function_name(node, arrow_line)
 
         key = (file_path, start_line)
         if key in seen:
@@ -474,9 +735,11 @@ class RepoParser:
         # Calculate cyclomatic complexity for functions/methods only
         complexity = None
         is_stub = False
+        is_decorated = False
         if entity_type in ("function", "method"):
             complexity = self._calculate_cyclomatic_complexity(def_node, lang_name, source_bytes)
             is_stub = self._is_stub_node(def_node)
+            is_decorated = self._has_decorator_or_annotation(def_node)
 
         return CodeEntity(
             name=name,
@@ -492,6 +755,7 @@ class RepoParser:
             parent_class=parent_class,
             cyclomatic_complexity=complexity,
             is_stub=is_stub,
+            is_decorated=is_decorated,
         )
 
     def _extract_docstring(

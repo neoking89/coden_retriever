@@ -44,15 +44,13 @@ def create_mcp_server(
 
     # Use -OO for optimized mode (faster startup, no docstrings/asserts)
     # Use -I for isolated mode (prevents debug output from site-packages)
-    kwargs = {
-        "args": ["-I", "-OO", "-m", "coden_retriever", "serve"],
-        "env": env,
-        "max_retries": max_retries,
-    }
-    if timeout is not None:
-        kwargs["timeout"] = timeout
+    args = ["-I", "-OO", "-m", "coden_retriever", "serve"]
 
-    return MCPServerStdio(sys.executable, **kwargs)
+    if timeout is not None:
+        return MCPServerStdio(
+            sys.executable, args=args, env=env, max_retries=max_retries, timeout=timeout
+        )
+    return MCPServerStdio(sys.executable, args=args, env=env, max_retries=max_retries)
 
 
 @asynccontextmanager

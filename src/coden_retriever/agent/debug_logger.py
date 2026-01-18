@@ -347,20 +347,20 @@ class DebugLogger:
                         self._write(f"[{type(part).__name__}]\n{part}")
 
             elif isinstance(msg, ModelResponse):
-                for part in msg.parts:
-                    if isinstance(part, TextPart):
-                        self._write(f"[TextPart]\n{part.content}")
-                    elif isinstance(part, ThinkingPart):
+                for resp_part in msg.parts:
+                    if isinstance(resp_part, TextPart):
+                        self._write(f"[TextPart]\n{resp_part.content}")
+                    elif isinstance(resp_part, ThinkingPart):
                         # Explicitly handle ThinkingPart for model reasoning traces
-                        thinking_content = getattr(part, 'content', str(part))
+                        thinking_content = getattr(resp_part, 'content', str(resp_part))
                         self._write(f"[ThinkingPart]\n{thinking_content}")
-                    elif isinstance(part, ToolCallPart):
-                        args_str = json.dumps(part.args, indent=2, default=str) if isinstance(part.args, dict) else str(part.args)
-                        self._write(f"[ToolCall] {part.tool_name} (id={part.tool_call_id})")
+                    elif isinstance(resp_part, ToolCallPart):
+                        args_str = json.dumps(resp_part.args, indent=2, default=str) if isinstance(resp_part.args, dict) else str(resp_part.args)
+                        self._write(f"[ToolCall] {resp_part.tool_name} (id={resp_part.tool_call_id})")
                         self._write(f"Args: {args_str}")
                     else:
                         # Capture any other parts
-                        self._write(f"[{type(part).__name__}]\n{part}")
+                        self._write(f"[{type(resp_part).__name__}]\n{resp_part}")
             else:
                 self._write(str(msg))
 

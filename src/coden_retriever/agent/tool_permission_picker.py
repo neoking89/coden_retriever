@@ -254,7 +254,7 @@ def run_tool_permission_picker(request: ToolPermissionRequest) -> Optional[Permi
     })
 
     # Create and run application
-    app = Application(
+    app: Application[None] = Application(
         layout=Layout(root_container),
         key_bindings=kb,
         style=style,

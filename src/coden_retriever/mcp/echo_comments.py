@@ -3,6 +3,9 @@
 This module provides MCP tools for detecting "echo comments" - redundant comments
 that merely restate what the identifier already conveys without adding value.
 Uses Model2Vec embeddings for language-agnostic semantic similarity analysis.
+
+Requires the 'semantic' extra:
+    pip install 'coden-retriever[semantic]'
 """
 
 from __future__ import annotations
@@ -13,8 +16,6 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
-import numpy as np
-from numpy.linalg import norm
 from pydantic import Field
 
 from ..cache import CacheManager
@@ -22,9 +23,11 @@ from ..config_loader import get_semantic_model_path
 from ..language import LanguageLoader
 from ..search.semantic import get_cached_model
 from ..token_estimator import count_tokens
+from ..utils.optional_deps import get_numpy
 from .flag_insertion import CODEN_MARKER
 
 if TYPE_CHECKING:
+    import numpy as np
     from ..models import CodeEntity
 
 logger = logging.getLogger(__name__)
@@ -249,7 +252,7 @@ def _extract_all_comments_from_file(file_path: str, language: str) -> list[tuple
             parser = Parser(ts_language)
         except TypeError:
             parser = Parser()
-            parser.set_language(ts_language)
+            parser.set_language(ts_language)  # type: ignore[attr-defined]
 
         tree = parser.parse(source_bytes)
     except Exception as e:
@@ -372,6 +375,10 @@ def compute_echo_comments(
         n_comments = len(comments)
         comment_embeddings = all_embeddings[:n_comments]
         identifier_embeddings = all_embeddings[n_comments:]
+
+        # Lazy load numpy for norm computation
+        np = get_numpy()
+        norm = np.linalg.norm
 
         # Compute norms for all embeddings
         comment_norms = norm(comment_embeddings, axis=1)

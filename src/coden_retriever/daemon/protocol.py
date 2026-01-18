@@ -210,7 +210,7 @@ class FlagParams:
     """Parameters for code flagging requests.
 
     Used to insert [CODEN] comments above code objects based on analysis results.
-    Supports flagging from hotspots, propagation cost, clone detection, and echo comments.
+    Supports flagging from hotspots, propagation cost, clone detection, echo comments, and dead code.
     """
 
     source_dir: str
@@ -218,16 +218,19 @@ class FlagParams:
     propagation: bool = False
     clones: bool = False
     echo_comments: bool = False
+    dead_code: bool = False
     risk_threshold: float = 0.5
     propagation_threshold: float = 0.25
     clone_threshold: float = 0.95
     echo_threshold: float = 0.85
+    dead_code_threshold: float = 0.5
     dry_run: bool = False
     limit: int | None = None
     backup: bool = False
     verbose: bool = False
     exclude_tests: bool = True
     remove_comments: bool = False
+    remove_dead_code: bool = False
     output_format: str = "tree"
 
     clone_mode: Literal["combined", "semantic", "syntactic"] = "combined"
@@ -259,6 +262,30 @@ class FlagClearParams:
 
     @classmethod
     def from_dict(cls, data: dict) -> "FlagClearParams":
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class DeadCodeParams:
+    """Parameters for dead code detection requests.
+
+    Used to find functions with no incoming calls in the call graph.
+    Confidence scoring reduces false positives for entry points.
+    """
+
+    source_dir: str
+    confidence_threshold: float = 0.5
+    limit: int | None = 50
+    exclude_tests: bool = True
+    include_private: bool = False
+    min_lines: int = 3
+    token_limit: int | None = None  # None = no limit (CLI), int = limit (MCP)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "DeadCodeParams":
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 

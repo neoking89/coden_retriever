@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "coden-retriever"
-version = "1.1.0"
+version = "1.0.0"
 description = "Retriever for finding most relevant code"
 readme = "README.md"
 requires-python = ">=3.10, <3.13"
@@ -13,33 +13,55 @@ dependencies = [
     "networkx>=3.0",
     "tree-sitter>=0.23.0,<0.24",
     "tree-sitter-languages>=1.10.0",
-    "model2vec>=0.1.0",
     "pydantic>=2.0.0",
-    "watchdog>=4.0.0",
-    "fastmcp>=0.1.0",
-    "tiktoken>=0.5.0",
-    "tokenizers>=0.15.0",
-    "numpy",
-    "scipy>=1.10.0",
-    "pydantic-ai-slim[mcp,openai]>=0.1.0",
     "rich>=13.0.0",
     "prompt_toolkit>=3.0.0",
-    "debugpy>=1.8.0",
+    "tiktoken>=0.5.0",
+    "tokenizers>=0.15.0",
+    "watchdog>=4.0.0",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# Model files are distributed separately via the 'semantic' extra
+# Users install: pip install 'coden-retriever[semantic]' to get embedding support
 [tool.setuptools.package-data]
-coden_retriever = ["models/embeddings/model2vec_embed_distill/*"]
+coden_retriever = []
 
 [project.optional-dependencies]
+# Semantic search with Model2Vec embeddings
+semantic = [
+    "model2vec>=0.1.0",
+    "numpy",
+    "scipy>=1.10.0",
+]
+
+# MCP server mode
+mcp = [
+    "fastmcp>=0.1.0",
+]
+
+# Interactive agent with pydantic-ai
+agent = [
+    "pydantic-ai-slim[mcp,openai]>=0.1.0",
+    "fastmcp>=0.1.0",
+]
+
+# Install all optional features
+all = [
+    "coden-retriever[semantic,mcp,agent]",
+]
+
+# Development dependencies
 dev = [
     "pytest>=9.0.0",
     "pytest-asyncio>=1.3.0",
     "ruff>=0.1.0",
-    "httpx>=0.27.0"
+    "httpx>=0.27.0",
+    "debugpy>=1.8.0",
 ]
+
 # Dynamic tools: pip install coden-retriever[dynamic-tools]
 # Then set CODEN_RETRIEVER_ENABLE_DYNAMIC_TOOLS=1
 dynamic-tools = []

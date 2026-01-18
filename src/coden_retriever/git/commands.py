@@ -36,22 +36,23 @@ async def run_git_command(
         env = os.environ.copy()
         env["GIT_TERMINAL_PROMPT"] = "0"  # Disable credential prompts
 
-        # Windows-specific: create new process group to avoid console issues
-        kwargs: dict[str, object] = {
-            "stdin": asyncio.subprocess.DEVNULL,
-            "stdout": asyncio.subprocess.PIPE,
-            "stderr": asyncio.subprocess.PIPE,
-            "cwd": cwd,
-            "env": env,
-        }
+        # Windows-specific: CREATE_NO_WINDOW prevents console popup
+        creationflags = 0
         if sys.platform == "win32":
-            # CREATE_NO_WINDOW prevents console window popup
-            # CREATE_NEW_PROCESS_GROUP helps with subprocess management
-            kwargs["creationflags"] = (
+            creationflags = (
                 subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
             )
 
-        proc = await asyncio.create_subprocess_exec("git", *args, **kwargs)
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            *args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
+            env=env,
+            creationflags=creationflags,
+        )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         return (
             proc.returncode or 0,

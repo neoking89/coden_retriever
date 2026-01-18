@@ -5,17 +5,12 @@ Provides the Model Context Protocol server for CodenRetriever with all tools.
 This is the default server that includes both code search and dynamic tools.
 """
 import os
+from typing import TYPE_CHECKING
 
-from .clone_detection import register_clone_detection_tools
-from .code_search import register_code_search_tools
+if TYPE_CHECKING:
+    from fastmcp import FastMCP
+
 from .constants import FULL_SERVER_INSTRUCTIONS, SERVER_NAME_FULL, _is_dynamic_tools_enabled
-from .debug_trace import register_debug_tools
-from .dynamic_tools import register_dynamic_tools
-from .echo_comments import register_echo_comment_tools
-from .file_edit import register_file_edit_tools
-from .flag_insertion import register_flag_tools
-from .graph_analysis import register_graph_analysis_tools
-from .propagation_cost import register_propagation_cost_tools
 from .server_factory import create_mcp_server_with_config
 
 
@@ -30,7 +25,7 @@ def get_disabled_tools() -> set[str]:
     return set(name.strip() for name in disabled_str.split(",") if name.strip())
 
 
-def create_mcp_server() -> "FastMCP":
+def create_mcp_server() -> "FastMCP | None":
     """Create an MCP server with all tools (code search + dynamic tools).
 
     This is the default server that includes both code search and dynamic tools functionality.
@@ -39,11 +34,24 @@ def create_mcp_server() -> "FastMCP":
     Dynamic tools require enable_dynamic_tools = true in pyproject.toml [tool.coden-retriever].
     Respects CODEN_RETRIEVER_DISABLED_TOOLS env var to filter out specific tools.
     """
+    # Lazy imports to avoid heavy dependencies at module load time
+    from .clone_detection import register_clone_detection_tools
+    from .code_search import register_code_search_tools
+    from .dead_code import register_dead_code_tools
+    from .debug_trace import register_debug_tools
+    from .dynamic_tools import register_dynamic_tools
+    from .echo_comments import register_echo_comment_tools
+    from .file_edit import register_file_edit_tools
+    from .flag_insertion import register_flag_tools
+    from .graph_analysis import register_graph_analysis_tools
+    from .propagation_cost import register_propagation_cost_tools
+
     disabled_tools = get_disabled_tools()
 
     register_functions = [
         lambda mcp: register_clone_detection_tools(mcp, disabled_tools),
         lambda mcp: register_code_search_tools(mcp, disabled_tools),
+        lambda mcp: register_dead_code_tools(mcp, disabled_tools),
         lambda mcp: register_debug_tools(mcp, disabled_tools),
         lambda mcp: register_echo_comment_tools(mcp, disabled_tools),
         lambda mcp: register_file_edit_tools(mcp, disabled_tools),

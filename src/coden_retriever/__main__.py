@@ -10,8 +10,16 @@ import time
 import traceback
 from pathlib import Path
 import io
-import asyncio
 from dataclasses import dataclass
+from typing import Literal
+
+from .utils.optional_deps import MissingDependencyError, require_feature
+
+
+def _get_asyncio():
+    """Lazy import asyncio to avoid 18ms startup cost."""
+    import asyncio
+    return asyncio
 
 
 @dataclass(frozen=True)
@@ -65,6 +73,15 @@ THRESHOLD_CONFIGS = {
         short_help="Echo comment similarity threshold (0.0-1.0)",
         detailed_help="Echo Comments (-E): semantic similarity threshold. Range: 0-1. Default: 0.85. Stricter (0.95) = near-identical only, Looser (0.75) = more detections",
         example_value=0.85,
+    ),
+    "dead_code": ThresholdConfig(
+        name="dead-code-threshold",
+        default=0.5,
+        analysis_flag="-D",
+        analysis_name="Dead Code",
+        short_help="Dead code confidence threshold (0.0-1.0)",
+        detailed_help="Dead Code (-D): min confidence score for flagging. Range: 0-1. Default: 0.5 (medium confidence)",
+        example_value=0.7,
     ),
 }
 
@@ -126,6 +143,7 @@ from .cli_metrics_contract import apply_defensive_limit, print_metric_output
 from .config import get_central_cache_root, get_project_cache_dir
 from .config import OutputFormat
 from .config_loader import (
+    AppConfig,
     get_config,
     load_config,
     save_config,
@@ -142,6 +160,7 @@ from .daemon.client import (
     try_daemon_search,
     try_daemon_hotspots,
     try_daemon_clones,
+    try_daemon_dead_code,
     try_daemon_propagation_cost,
     try_daemon_flag,
     try_daemon_flag_clear,
@@ -150,6 +169,7 @@ from .daemon.protocol import (
     WINDOWS_CREATE_NEW_PROCESS_GROUP,
     WINDOWS_DETACHED_PROCESS,
     CloneDetectionParams,
+    DeadCodeParams,
     FlagClearParams,
     FlagParams,
     GraphAnalysisParams,
@@ -157,8 +177,9 @@ from .daemon.protocol import (
     SearchParams,
 )
 from .daemon.server import get_log_file, is_daemon_running, run_daemon
-from .formatters import CloneFormatter, PropagationFormatter
+from .formatters import CloneFormatter, DeadCodeFormatter, PropagationFormatter
 from .formatters.cli_metrics import FALSE_POSITIVE_WARNING
+from .formatters.dead_code_formatter import format_dead_code_parameters_header
 from .formatters.flag_formatter import FlagFormatter
 from .formatters.terminal_style import get_terminal_style
 from .pipeline import SearchConfig, SearchPipeline
@@ -414,7 +435,7 @@ def print_hotspots_output(
         print(formatted_output)
 
 
-def _get_clone_mode(args: argparse.Namespace) -> str:
+def _get_clone_mode(args: argparse.Namespace) -> Literal["combined", "semantic", "syntactic"]:
     """Determine clone detection mode from CLI flags."""
     clone_semantic = getattr(args, "clone_semantic", False)
     clone_syntactic = getattr(args, "clone_syntactic", False)
@@ -436,6 +457,14 @@ def handle_clones_command(args: argparse.Namespace, root_path: Path, config) -> 
 
     # Determine clone mode
     mode = _get_clone_mode(args)
+
+    # Clone detection requires semantic feature unless syntactic-only mode
+    if mode in ("semantic", "combined"):
+        try:
+            require_feature("semantic")
+        except MissingDependencyError as e:
+            print(str(e), file=sys.stderr)
+            return 1
     line_threshold = getattr(args, "line_threshold", 0.70)
     func_threshold = getattr(args, "func_threshold", 0.50)
     semantic_weight = getattr(args, "semantic_weight", 0.65)
@@ -499,7 +528,7 @@ def handle_clones_command(args: argparse.Namespace, root_path: Path, config) -> 
     try:
         from .mcp.clone_detection import detect_clones as mcp_detect_clones
 
-        result = asyncio.run(mcp_detect_clones(
+        result = _get_asyncio().run(mcp_detect_clones(
             root_directory=str(root_path),
             mode=mode,
             similarity_threshold=args.clone_threshold,
@@ -540,6 +569,13 @@ def handle_clones_command(args: argparse.Namespace, root_path: Path, config) -> 
 
 def handle_echo_comments_command(args: argparse.Namespace, root_path: Path, config) -> int:
     """Handle echo comment detection command (read-only analysis or file modification with --remove-comments)."""
+    # Echo comment detection requires semantic feature (Model2Vec)
+    try:
+        require_feature("semantic")
+    except MissingDependencyError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
     args.limit = normalize_limit(args.limit)
     start_time = time.time()
 
@@ -690,23 +726,25 @@ def handle_echo_comments_command(args: argparse.Namespace, root_path: Path, conf
 
 
 def _filter_propagation_by_threshold(result: dict, threshold: float) -> dict:
-    """Filter propagation result to only show modules above threshold.
+    """Mark modules above threshold in propagation result.
 
     Args:
         result: Propagation cost result dict
-        threshold: Minimum internal_coupling (0-1) to include
+        threshold: Minimum internal_coupling (0-1) to flag as high-coupling
 
     Returns:
-        Filtered result with module_breakdown filtered by threshold
+        Result with module_breakdown annotated (not filtered)
     """
     if "module_breakdown" not in result:
         return result
 
+    # Don't filter - annotate modules above threshold instead
     filtered = result.copy()
     filtered["module_breakdown"] = [
-        m for m in result["module_breakdown"]
-        if m.get("internal_coupling", 0) >= threshold
+        {**m, "above_threshold": m.get("internal_coupling", 0) >= threshold}
+        for m in result["module_breakdown"]
     ]
+    filtered["coupling_threshold"] = threshold
     return filtered
 
 
@@ -757,7 +795,7 @@ def handle_propagation_command(args: argparse.Namespace, root_path: Path, config
     try:
         from .mcp.propagation_cost import propagation_cost as mcp_propagation_cost
 
-        result = asyncio.run(mcp_propagation_cost(
+        result = _get_asyncio().run(mcp_propagation_cost(
             root_directory=str(root_path),
             include_breakdown=args.breakdown,
             show_critical_paths=args.critical_paths,
@@ -825,9 +863,19 @@ def handle_flag_command(args: argparse.Namespace, root_path: Path, config) -> in
         return 1
 
     # Check if at least one analysis type is selected
-    if not (args.hotspots or args.propagation or args.clones or args.echo_comments):
-        print("Error: At least one analysis flag (-H, -P, -C, or -E) is required.", file=sys.stderr)
+    if not (args.hotspots or args.propagation or args.clones or args.echo_comments or args.dead_code):
+        print("Error: At least one analysis flag (-H, -P, -C, -E, or -D) is required.", file=sys.stderr)
         return 1
+
+    # Echo comments and clone detection (except syntactic-only) require semantic feature
+    clone_mode = _get_clone_mode(args)
+    needs_semantic = args.echo_comments or (args.clones and clone_mode in ("semantic", "combined"))
+    if needs_semantic:
+        try:
+            require_feature("semantic")
+        except MissingDependencyError as e:
+            print(str(e), file=sys.stderr)
+            return 1
 
     # Determine active flags for parameter header
     active_flags = []
@@ -839,6 +887,8 @@ def handle_flag_command(args: argparse.Namespace, root_path: Path, config) -> in
         active_flags.append("-C")
     if args.echo_comments:
         active_flags.append("-E")
+    if args.dead_code:
+        active_flags.append("-D")
 
     # Print parameter header
     from .formatters.flag_formatter import format_parameters_header
@@ -851,6 +901,7 @@ def handle_flag_command(args: argparse.Namespace, root_path: Path, config) -> in
         echo_threshold=args.echo_threshold,
         limit=args.limit,
         dry_run=args.dry_run,
+        dead_code_threshold=args.dead_code_threshold,
     )
     print(header)
     print()  # Blank line
@@ -861,15 +912,18 @@ def handle_flag_command(args: argparse.Namespace, root_path: Path, config) -> in
         propagation=args.propagation,
         clones=args.clones,
         echo_comments=args.echo_comments,
+        dead_code=args.dead_code,
         risk_threshold=args.risk_threshold,
         propagation_threshold=args.propagation_threshold,
         clone_threshold=args.clone_threshold,
         echo_threshold=args.echo_threshold,
+        dead_code_threshold=args.dead_code_threshold,
         dry_run=args.dry_run,
         backup=args.backup,
         verbose=args.verbose,
         exclude_tests=not args.include_tests,
         remove_comments=args.remove_comments,
+        remove_dead_code=args.remove_dead_code,
         output_format=args.format,
         limit=args.limit,
     )
@@ -916,10 +970,12 @@ def handle_flag_command(args: argparse.Namespace, root_path: Path, config) -> in
             propagation=args.propagation,
             clones=args.clones,
             echo_comments=args.echo_comments,
+            dead_code=args.dead_code,
             risk_threshold=args.risk_threshold,
             propagation_threshold=args.propagation_threshold,
             clone_threshold=args.clone_threshold,
             echo_threshold=args.echo_threshold,
+            dead_code_threshold=args.dead_code_threshold,
             clone_mode=clone_mode,
             line_threshold=getattr(args, "line_threshold", 0.70),
             func_threshold=getattr(args, "func_threshold", 0.50),
@@ -928,6 +984,7 @@ def handle_flag_command(args: argparse.Namespace, root_path: Path, config) -> in
             verbose=args.verbose,
             exclude_tests=not args.include_tests,
             remove_comments=args.remove_comments,
+            remove_dead_code=args.remove_dead_code,
         )
 
         if "error" in result:
@@ -1280,16 +1337,16 @@ def handle_cache_command(args: list[str]) -> int:
         print(f"Cache directory: {get_central_cache_root()}\n")
 
         total_size = 0
-        for cache in caches:
-            total_size += cache["size_mb"]
-            source = cache["source_dir"]
+        for cache_info in caches:
+            total_size += cache_info["size_mb"]
+            source = cache_info["source_dir"]
             # Truncate long paths
             if len(source) > 60:
                 source = "..." + source[-57:]
             print(f"  {source}")
-            print(f"    Entities: {cache['entity_count']:,} | Files: {cache['file_count']:,} | Size: {cache['size_mb']:.1f} MB")
-            if cache.get("updated_at"):
-                print(f"    Updated: {cache['updated_at']}")
+            print(f"    Entities: {cache_info['entity_count']:,} | Files: {cache_info['file_count']:,} | Size: {cache_info['size_mb']:.1f} MB")
+            if cache_info.get("updated_at"):
+                print(f"    Updated: {cache_info['updated_at']}")
             print()
 
         print(f"Total cache size: {total_size:.1f} MB")
@@ -1581,7 +1638,7 @@ def _add_flag_arguments(parser: argparse.ArgumentParser, config) -> None:
     analysis_group.add_argument("-P", "--propagation", action="store_true",
                                 help="Flag high propagation cost functions")
     analysis_group.add_argument("-C", "--clones", action="store_true",
-                                help="Flag code clones")
+                                help="Flag code clones. Requires [semantic] extra for semantic/combined modes")
     analysis_group.add_argument("--clone-semantic", action="store_true",
                                 help="Clone detection: semantic only (Model2Vec embeddings)")
     analysis_group.add_argument("--clone-syntactic", action="store_true",
@@ -1595,7 +1652,9 @@ def _add_flag_arguments(parser: argparse.ArgumentParser, config) -> None:
     analysis_group.add_argument("--syntactic-weight", type=float, default=0.35,
                                 help="Weight for syntactic similarity in combined score")
     analysis_group.add_argument("-E", "--echo-comments", action="store_true",
-                                help="Detect and flag echo comments - comments that merely restate what the code already says (e.g., '# Calculate total' above calculate_total())")
+                                help="Detect and flag echo comments. Requires [semantic] extra")
+    analysis_group.add_argument("-D", "--dead-code", action="store_true",
+                                help="Flag dead code - functions/methods with no callers in the codebase")
 
     # Threshold options (uses centralized THRESHOLD_CONFIGS for maintainability)
     threshold_group = parser.add_argument_group("Threshold Options")
@@ -1609,6 +1668,8 @@ def _add_flag_arguments(parser: argparse.ArgumentParser, config) -> None:
                         help="Create .coden-backup files before modifying")
     parser.add_argument("--remove-comments", action="store_true",
                         help="Delete detected echo comments entirely instead of flagging with [CODEN] markers (use with -E)")
+    parser.add_argument("--remove-dead-code", action="store_true",
+                        help="Delete dead code functions entirely instead of flagging with [CODEN] markers (DESTRUCTIVE - use with --backup)")
     parser.add_argument("--include-tests", action="store_true",
                         help="Include test files in analysis. By default, test files are excluded to focus on production code")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -1689,7 +1750,7 @@ def create_serve_parser(config) -> argparse.ArgumentParser:
     """Create parser for 'serve' subcommand."""
     parser = argparse.ArgumentParser(
         prog="coden serve",
-        description="Run as MCP server",
+        description="Run as MCP server. Requires [mcp] extra: pip install 'coden-retriever[mcp]'",
         formatter_class=DefaultValueHelpFormatter,
     )
     parser.add_argument("--transport", choices=["stdio", "http", "sse", "streamable-http"],
@@ -1706,7 +1767,7 @@ def create_agent_parser(config) -> argparse.ArgumentParser:
     """Create parser for 'agent' subcommand."""
     parser = argparse.ArgumentParser(
         prog="coden agent",
-        description="Interactive coding agent with ReAct reasoning",
+        description="Interactive coding agent with ReAct reasoning. Requires [agent] extra: pip install 'coden-retriever[agent]'",
         formatter_class=DefaultValueHelpFormatter,
     )
     parser.add_argument("root", nargs="?", default=".",
@@ -1731,8 +1792,8 @@ def create_search_parser(config) -> argparse.ArgumentParser:
         formatter_class=DefaultValueHelpFormatter,
         epilog="""
 Subcommands:
-  serve                 Run as MCP server
-  agent (-a)            Interactive coding agent
+  serve                 Run as MCP server (requires [mcp] extra)
+  agent (-a)            Interactive coding agent (requires [agent] extra)
   daemon                Manage daemon (start, stop, status)
   cache                 Manage caches (list, clear, status)
   config                Manage configuration (show, set, reset)
@@ -1774,7 +1835,7 @@ Examples:
     parser.add_argument("-H", "--hotspots", action="store_true",
                         help="Find refactoring hotspots (high coupling + complexity)")
     parser.add_argument("-C", "--clones", action="store_true",
-                        help="Detect code clones - find semantically similar functions for refactoring")
+                        help="Detect code clones - find semantically similar functions for refactoring. Requires [semantic] extra for semantic/combined modes")
     parser.add_argument("--clone-semantic", action="store_true",
                         help="Clone detection: semantic only (Model2Vec embeddings)")
     parser.add_argument("--clone-syntactic", action="store_true",
@@ -1790,7 +1851,9 @@ Examples:
     parser.add_argument("-P", "--propagation", action="store_true",
                         help="Analyze propagation cost (architecture coupling)")
     parser.add_argument("-E", "--echo-comments", action="store_true",
-                        help="Detect echo comments - comments that merely restate what the code already says")
+                        help="Detect echo comments - comments that merely restate what the code already says. Requires [semantic] extra")
+    parser.add_argument("-D", "--dead-code", action="store_true",
+                        help="Detect dead code - functions/methods with no callers")
     parser.add_argument("--breakdown", action="store_true",
                         help="Include per-module breakdown (with -P)")
     parser.add_argument("--critical-paths", action="store_true",
@@ -1801,6 +1864,7 @@ Examples:
     add_threshold_argument(parser, THRESHOLD_CONFIGS["propagation"], use_detailed_help=False)
     add_threshold_argument(parser, THRESHOLD_CONFIGS["clone"], use_detailed_help=False)
     add_threshold_argument(parser, THRESHOLD_CONFIGS["echo"], use_detailed_help=False)
+    add_threshold_argument(parser, THRESHOLD_CONFIGS["dead_code"], use_detailed_help=False)
     def _validate_min_lines(value):
         ival = int(value)
         if ival < 1:
@@ -1824,7 +1888,7 @@ Examples:
     parser.add_argument("-r", "--reverse", action="store_true",
                         help="Reverse result order (highest score last)")
     parser.add_argument("-s", "--semantic", dest="enable_semantic", action="store_true",
-                        help="Enable semantic search (Model2Vec)")
+                        help="Enable semantic search (Model2Vec). Requires [semantic] extra")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Verbose logging")
 
@@ -1842,6 +1906,12 @@ Examples:
 
 def handle_serve_command(args: argparse.Namespace) -> int:
     """Handle 'serve' subcommand."""
+    try:
+        require_feature("mcp")
+    except MissingDependencyError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
@@ -1863,14 +1933,16 @@ def handle_serve_command(args: argparse.Namespace) -> int:
 
 def handle_agent_command(args: argparse.Namespace, config) -> int:
     """Handle 'agent' subcommand."""
+    try:
+        require_feature("agent")
+    except MissingDependencyError as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    try:
-        from .agent import run_interactive
-    except ImportError:
-        logger.error("pydantic-ai not installed. Run: pip install coden-retriever[agent]")
-        return 1
+    from .agent import run_interactive
 
     root_path = Path(args.root).resolve()
     if not root_path.exists() or not root_path.is_dir():
@@ -1892,7 +1964,7 @@ def handle_agent_command(args: argparse.Namespace, config) -> int:
         save_config(config)
 
     try:
-        asyncio.run(run_interactive(
+        _get_asyncio().run(run_interactive(
             str(root_path),
             args.model,
             args.base_url,
@@ -1977,7 +2049,7 @@ def handle_hotspots_command(args: argparse.Namespace, root_path: Path, config) -
     try:
         from .mcp.graph_analysis import coupling_hotspots
 
-        result = asyncio.run(coupling_hotspots(
+        result = _get_asyncio().run(coupling_hotspots(
             root_directory=str(root_path),
             limit=args.limit,
             min_coupling_score=10,
@@ -2019,6 +2091,107 @@ def handle_hotspots_command(args: argparse.Namespace, root_path: Path, config) -
         return 1
 
 
+def _filter_dead_code_results(
+    results: list[dict],
+    threshold: float,
+    limit: int | None,
+) -> list[dict]:
+    """Filter dead code results by confidence threshold and apply limit."""
+    threshold_filtered = [
+        d for d in results
+        if d.get("confidence", 0) >= threshold
+    ]
+    return apply_defensive_limit(threshold_filtered, limit)
+
+
+def _process_dead_code_result(
+    result: dict,
+    formatter: DeadCodeFormatter,
+    args: argparse.Namespace,
+    start_time: float,
+    mode: str,
+) -> int:
+    """Process dead code detection result and output."""
+    if "error" in result:
+        logger.error(f"Dead code detection error: {result['error']}")
+        return 1
+
+    all_dead_code = result.get("dead_code", [])
+    summary = result.get("summary", {})
+
+    dead_code = _filter_dead_code_results(all_dead_code, args.dead_code_threshold, args.limit)
+
+    formatted_output = formatter.format_items(dead_code, args.format, args.reverse)
+    stats_output = formatter.format_stats(summary) if args.stats else None
+    print_metric_output(formatted_output, stats_output, args.reverse)
+
+    elapsed_ms = (time.time() - start_time) * 1000
+    if args.verbose:
+        print(f"\n[{mode} mode] Dead code detection: {elapsed_ms:.1f}ms, Found: {len(dead_code)}", file=sys.stderr)
+    return 0
+
+
+def _run_direct_dead_code(
+    root_path: Path,
+    formatter: DeadCodeFormatter,
+    args: argparse.Namespace,
+    start_time: float,
+) -> int:
+    """Run dead code detection directly (non-daemon)."""
+    from .mcp.dead_code import detect_dead_code as mcp_detect_dead_code
+    try:
+        result = _get_asyncio().run(mcp_detect_dead_code(
+            root_directory=str(root_path),
+            confidence_threshold=args.dead_code_threshold,
+            limit=args.limit,
+            exclude_tests=True,
+            include_private=False,
+            min_lines=args.min_lines,
+        ))
+        return _process_dead_code_result(result, formatter, args, start_time, "Direct")
+    except Exception as e:
+        logger.error(f"Dead code detection failed: {e}")
+        if args.verbose:
+            traceback.print_exc()
+        return 1
+
+
+def handle_dead_code_command(
+    args: argparse.Namespace,
+    root_path: Path,
+    config: AppConfig,
+) -> int:
+    """Handle dead code detection (-D/--dead-code flag)."""
+    args.limit = normalize_limit(args.limit)
+    start_time = time.time()
+    formatter = DeadCodeFormatter()
+
+    header = format_dead_code_parameters_header(
+        confidence_threshold=args.dead_code_threshold,
+        exclude_tests=True,
+        limit=args.limit,
+    )
+    print(header)
+    print()
+
+    params = DeadCodeParams(
+        source_dir=str(root_path),
+        confidence_threshold=args.dead_code_threshold,
+        limit=args.limit,
+        exclude_tests=True,
+        include_private=False,
+        min_lines=args.min_lines,
+        token_limit=args.tokens,
+    )
+
+    daemon_result = try_daemon_dead_code(params, host=config.daemon.host, port=config.daemon.port)
+    if daemon_result is not None:
+        return _process_dead_code_result(daemon_result, formatter, args, start_time, "Daemon")
+
+    logger.warning("Daemon not available, falling back to direct analysis...")
+    return _run_direct_dead_code(root_path, formatter, args, start_time)
+
+
 def handle_search_command(args: argparse.Namespace, config) -> int:
     """Handle search (default) mode."""
     args.limit = normalize_limit(args.limit)
@@ -2029,6 +2202,14 @@ def handle_search_command(args: argparse.Namespace, config) -> int:
     if not root_path.exists() or not root_path.is_dir():
         logger.error(f"Invalid root path: {args.root}")
         return 1
+
+    # Check semantic feature for --semantic flag
+    if args.enable_semantic:
+        try:
+            require_feature("semantic")
+        except MissingDependencyError as e:
+            print(str(e), file=sys.stderr)
+            return 1
 
     # Handle propagation mode separately
     if args.propagation:
@@ -2045,6 +2226,10 @@ def handle_search_command(args: argparse.Namespace, config) -> int:
     # Handle echo comments mode separately
     if args.echo_comments:
         return handle_echo_comments_command(args, root_path, config)
+
+    # Handle dead code mode separately
+    if args.dead_code:
+        return handle_dead_code_command(args, root_path, config)
 
     # Create cache manager (use config for model_path)
     cache = CacheManager(

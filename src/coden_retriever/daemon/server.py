@@ -53,6 +53,7 @@ class DaemonTCPServer(socketserver.ThreadingTCPServer):
     """
     allow_reuse_address = True
     daemon_threads = True  # Handler threads are daemon threads (exit when main exits)
+    daemon_instance: "DaemonServer | None" = None  # Set by DaemonServer.start()
 
 
 class DaemonRequestHandler(socketserver.StreamRequestHandler):

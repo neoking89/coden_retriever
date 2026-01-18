@@ -3,22 +3,26 @@
 Detects code clones by computing cosine similarity between
 function embeddings. Finds functions that "do similar things"
 even with different implementations.
+
+Requires the 'semantic' extra:
+    pip install 'coden-retriever[semantic]'
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
-
 from ..search.semantic import get_cached_model
 from ..token_estimator import count_tokens
+from ..utils.optional_deps import get_numpy
 
 if TYPE_CHECKING:
+    import numpy as np
     from ..models import CodeEntity
 
-_TOKEN_OVERHEAD_CLONES = 200
-_TOKEN_PER_CLONE_PAIR = 80
+# Token budget constants for output size estimation
+_TOKEN_OVERHEAD_CLONES = 200  # Base overhead for clone detection output structure
+_TOKEN_PER_CLONE_PAIR = 80  # Estimated tokens per clone pair in output
 
 
 def _is_stub_body(entity: "CodeEntity") -> bool:
@@ -144,6 +148,7 @@ def detect_clones_semantic(
             }
         }
 
+    np = get_numpy()
     model = get_cached_model(model_path)
     node_ids = list(func_entities.keys())
     texts = [func_entities[nid].source_code for nid in node_ids]

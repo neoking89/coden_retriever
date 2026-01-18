@@ -204,11 +204,11 @@ def _find_symbol_in_file(
 
     # Build list of available symbols for error messages
     available: list[str] = []
-    for e in entities:
-        if e.parent_class:
-            available.append(f"{e.parent_class}.{e.name}")
+    for ent in entities:
+        if ent.parent_class:
+            available.append(f"{ent.parent_class}.{ent.name}")
         else:
-            available.append(e.name)
+            available.append(ent.name)
 
     # Parse symbol_name for class.method pattern
     if "." in symbol_name:

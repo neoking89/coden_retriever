@@ -427,6 +427,13 @@ class ModelConfig:
     generation: GenerationSettings = field(default_factory=GenerationSettings)
 
 
+# Tools disabled by default.
+# Users can enable via /tools in --agent mode.
+DEFAULT_DISABLED_TOOLS: list[str] = [
+    "debug_server",  # IDE integration tool, less relevant for agents
+]
+
+
 @dataclass
 class AgentConfig:
     """Agent behavior configuration."""
@@ -440,13 +447,6 @@ class AgentConfig:
     ask_tool_permission: bool = True
     dynamic_tool_filtering: bool = False
     tool_filter_threshold: float = 0.5
-
-
-# Tools disabled by default.
-# Users can enable via /tools in --agent mode.
-DEFAULT_DISABLED_TOOLS = [
-    "debug_server",  # IDE integration tool, less relevant for agents
-]
 
 
 @dataclass

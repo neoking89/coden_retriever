@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from tree_sitter import Parser
+    from ..language import LanguageLoader
 
 # Minimum line length to consider (skip trivial lines)
 MIN_LINE_LENGTH = 5
@@ -52,7 +53,7 @@ class LineTokenizer:
         except TypeError:
             # Older tree-sitter API
             parser = Parser()
-            parser.set_language(language)
+            parser.set_language(language)  # type: ignore[attr-defined]
 
         self._parsers[lang] = parser
         return parser

@@ -8,6 +8,42 @@ pip install coden-retriever
 
 **Requires Python 3.10-3.12.** Python 3.13+ is not supported because `tree-sitter-languages` (required for multi-language parsing) only provides wheels up to Python 3.12.
 
+### Optional Extras
+
+The core package provides BM25 keyword search, code mapping, hotspot detection, and propagation analysis. Advanced features require optional extras:
+
+```bash
+# Core only (BM25 search, code map, hotspots, propagation)
+pip install coden-retriever
+
+# Semantic search, clone detection, echo comment detection
+pip install 'coden-retriever[semantic]'
+
+# MCP server mode
+pip install 'coden-retriever[mcp]'
+
+# Interactive agent mode
+pip install 'coden-retriever[agent]'
+
+# All features
+pip install 'coden-retriever[all]'
+
+# Development (tests, linting)
+pip install 'coden-retriever[dev]'
+```
+
+| Feature | Required Extra | Command Example |
+|---------|----------------|-----------------|
+| BM25 keyword search | Core | `coden /path -q "auth"` |
+| Code map & hotspots | Core | `coden /path --map`, `coden /path -H` |
+| Propagation analysis | Core | `coden /path -P` |
+| Dead code detection | Core | `coden /path -D` |
+| Semantic search | `[semantic]` | `coden /path -q "auth" --semantic` |
+| Clone detection (semantic/combined) | `[semantic]` | `coden /path -C` |
+| Echo comment detection | `[semantic]` | `coden /path -E` |
+| MCP server | `[mcp]` | `coden serve` |
+| Interactive agent | `[agent]` | `coden --agent` |
+
 ```bash
 # Get a ranked map of a repo
 coden /path/to/repo
@@ -36,6 +72,9 @@ coden /path/to/repo --propagation --breakdown
 
 # Find echo comments (comments that just restate the code)
 coden /path/to/repo flag -E --dry-run
+
+# Detect dead code (unused functions with no callers)
+coden /path/to/repo -D --dead-code-threshold 0.5
 ```
 
 <img src="images/readme/coden_stats_reverzed.png" alt="Coden stats output showing directory tree and ranking metrics" width="700">
@@ -77,6 +116,8 @@ Results are ranked using Reciprocal Rank Fusion across:
 
 Semantic search uses a Model2Vec model distilled from [Qodo-Embed-1-1.5B](https://huggingface.co/Qodo/Qodo-Embed-1-1.5B) that ships with the package.
 
+> **Note:** Semantic search requires the `[semantic]` extra: `pip install 'coden-retriever[semantic]'`
+
 ## Supported Languages
 
 **Support:** Python, Go, Rust, Java, C, C++, C#, Kotlin, Swift, Javascript/Typescript, PHP, Scala
@@ -96,6 +137,8 @@ coden /path/to/repo -C --clone-syntactic           # Syntactic-only clone detect
 coden /path/to/repo -C --semantic-weight 0.65      # Adjust combined score weights
 coden /path/to/repo -P --breakdown           # Architecture health analysis
 coden /path/to/repo -P --critical-paths      # Show high-impact code paths
+coden /path/to/repo -D                       # Detect dead code (no callers)
+coden /path/to/repo -D --dead-code-threshold 0.7  # Stricter detection
 coden /path/to/repo --map --show-deps        # Show callers/callees
 coden /path/to/repo --format json            # Output as json/markdown/xml
 coden serve                                  # Start MCP server
@@ -108,7 +151,9 @@ coden flag -E --echo-threshold 0.85          # Flag echo comments (default thres
 coden flag -E --echo-threshold 0.95          # Stricter: only near-identical echoes
 coden flag -E --remove-comments --backup     # Alternative: remove via flag subcommand
 coden flag -E --include-tests                # Include test files in analysis
-coden flag -HPCE --backup                    # Flag all issues (hotspots, propagation, clones, echoes)
+coden flag -D --dry-run                      # Preview dead code flagging
+coden flag -D --remove-dead-code --backup    # Remove dead code functions (DESTRUCTIVE)
+coden flag -HPCED --backup                   # Flag all issues (hotspots, propagation, clones, echoes, dead code)
 coden flag clear                             # Remove all [CODEN] comments
 coden reset                                  # Reset everything (destructive!)
 ```
@@ -128,14 +173,16 @@ coden daemon clear-cache          # Clear daemon cache
 
 ## Code Flagging
 
-Add `[CODEN]` comments to mark problematic code or remove echo comments directly:
+Add `[CODEN]` comments to mark problematic code or remove echo comments/dead code directly:
 
 ```bash
 coden -E --remove-comments --dry-run # Preview echo comment removal (direct)
 coden -E --remove-comments --backup  # Remove echo comments directly
 coden flag -C --dry-run              # Preview clone flags
 coden flag -E --dry-run              # Preview echo comment flags
-coden flag -HPCE --backup            # Flag hotspots, propagation, clones, echoes
+coden flag -D --dry-run              # Preview dead code flags
+coden flag -D --remove-dead-code --backup  # Remove dead code entirely (DESTRUCTIVE)
+coden flag -HPCED --backup           # Flag hotspots, propagation, clones, echoes, dead code
 coden flag clear                     # Remove all [CODEN] comments
 ```
 
@@ -154,17 +201,21 @@ coden flag clear                     # Remove all [CODEN] comments
 | **Propagation Cost** | `-P` | `--propagation-threshold` | 0.25 | Min internal coupling for modules (0-1) |
 | **Code Clones** | `-C` | `--clone-threshold` | 0.95 | Min semantic similarity for clones (0-1) |
 | **Echo Comments** | `-E` | `--echo-threshold` | 0.85 | Min similarity for echo detection (0-1) |
+| **Dead Code** | `-D` | `--dead-code-threshold` | 0.50 | Min confidence for dead code detection (0-1) |
 
 **Usage notes:**
 - All threshold options work in both direct mode (`coden -H`) and flag mode (`coden flag -H`)
-- `-H`: Filters hotspots with `risk_score >= threshold` (raw score = coupling × log(complexity))
+- `-H`: Filters hotspots with `risk_score >= threshold` (raw score = coupling x log(complexity))
 - `-P`: Filters modules in breakdown with `internal_coupling >= threshold` (0-1 scale)
 - `-C`: Filters clones with `similarity >= threshold` (0-1 scale)
 - `-E`: Filters echo comments with `similarity >= threshold` (0-1 scale)
+- `-D`: Filters dead code with `confidence >= threshold` (0-1 scale)
 
-**Threshold ranges:** `-P`, `-C`, `-E` use 0-1 scale. Lower values are more permissive, higher values are stricter. `-H` uses raw risk scores (typically 50-200+).
+**Threshold ranges:** `-P`, `-C`, `-E`, `-D` use 0-1 scale. Lower values are more permissive, higher values are stricter. `-H` uses raw risk scores (typically 50-200+).
 
 ### Code Clone Detection
+
+> **Note:** Combined and semantic clone detection require the `[semantic]` extra: `pip install 'coden-retriever[semantic]'`. Syntactic-only mode (`--clone-syntactic`) works with the core package.
 
 Clone detection finds duplicate or near-duplicate functions that are candidates for refactoring. Three detection modes are available:
 
@@ -212,6 +263,8 @@ coden flag -C --backup
 ```
 
 ### Echo Comment Detection
+
+> **Note:** Echo comment detection requires the `[semantic]` extra: `pip install 'coden-retriever[semantic]'`
 
 Echo comments are comments that provide no additional value because they simply repeat what the code identifier already conveys. For example:
 
@@ -261,7 +314,7 @@ coden flag -E --echo-threshold 0.75 --dry-run
 coden flag -E --include-tests --dry-run
 
 # Combine with other analysis types
-coden flag -HPCE --backup  # All analyses at once
+coden flag -HPCED --backup  # All analyses at once
 
 # Preview only top 10 issues (limit only works in dry-run mode)
 coden flag -H --dry-run -n 10
@@ -296,6 +349,38 @@ Detected echo comments show:
 - **Similarity score** (0-100%)
 - **Severity**: CRITICAL (>95%), HIGH (>90%), ELEVATED (>85%), MODERATE (<85%)
 - **Comment text** and **associated code identifier**
+
+### Dead Code Detection
+
+Dead code detection finds functions with no callers in the codebase. Results are scored by confidence (0-1) based on whether the function is private, decorated, or follows entry-point patterns.
+
+#### Usage Examples
+
+```bash
+# Basic detection (default 50% confidence threshold)
+coden /path/to/repo -D
+
+# Stricter (only high-confidence items)
+coden /path/to/repo -D --dead-code-threshold 0.8
+
+# Preview what would be flagged
+coden flag -D --dry-run
+
+# Flag with [CODEN] comments
+coden flag -D --backup
+
+# Remove dead code entirely (DESTRUCTIVE)
+coden flag -D --remove-dead-code --backup
+```
+
+#### Options
+
+- **`--dead-code-threshold`**: Minimum confidence (0.0-1.0, default: 0.50)
+- **`--include-private`**: Include private functions (default: excluded)
+- **`--include-tests`**: Include test functions (default: excluded)
+- **`--remove-dead-code`**: Delete functions instead of flagging (use with `--backup`)
+
+Automatically skipped: dunder methods (`__init__`), runtime-called functions (`init()`, `constructor`), test functions, and trivial functions (<3 lines).
 
 ## Caching
 
@@ -400,6 +485,8 @@ These override the config file:
 
 ## Interactive Agent
 
+> **Note:** Interactive agent requires the `[agent]` extra: `pip install 'coden-retriever[agent]'`
+
 <img src="images/readme/coden_agentic_mode.png" alt="Coden agent mode welcome screen" width="700">
 
 Activate coden in agent mode and use an LLM to chat about your codebase.
@@ -455,6 +542,8 @@ In-agent config:
 
 ## MCP Server
 
+> **Note:** MCP server mode requires the `[mcp]` extra: `pip install 'coden-retriever[mcp]'`
+
 Transport options: `stdio` (default), `http`, `sse`, `streamable-http`
 
 For VS Code, configure `.vscode/mcp.json`:
@@ -481,6 +570,7 @@ Reload VS Code (Ctrl+Shift+P -> "Developer: Reload Window").
 - **find_hotspots** - Git churn analysis (frequently changed files).
 - **clone_detection** - Find duplicate functions (combined/semantic/syntactic modes). CLI: `-C`
 - **propagation_cost** - Measure architecture health based on coupling. CLI: `-P`
+- **detect_dead_code** - Find unused functions with no callers. CLI: `-D`
 
 **Graph Analysis**
 - **change_impact_radius** - Blast radius analysis ("if I change this, what breaks?").

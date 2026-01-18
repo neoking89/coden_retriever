@@ -3,6 +3,7 @@ File watcher using watchdog library.
 
 Monitors source files for changes and triggers cache updates.
 """
+from __future__ import annotations
 
 import logging
 import threading
@@ -10,11 +11,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from watchdog.events import (
-    FileSystemEventHandler,
     FileCreatedEvent,
     FileDeletedEvent,
     FileModifiedEvent,
     FileMovedEvent,
+    FileSystemEventHandler,
 )
 from watchdog.observers import Observer
 from watchdog.observers.polling import PollingObserver
@@ -24,6 +25,12 @@ from ..language import LANGUAGE_MAP
 from .debouncer import BatchedChanges, ChangeDebouncer, ChangeType, FileChange
 
 if TYPE_CHECKING:
+    from watchdog.events import (
+        DirCreatedEvent,
+        DirDeletedEvent,
+        DirModifiedEvent,
+        DirMovedEvent,
+    )
     from watchdog.observers.api import BaseObserver as ObserverType
 
 logger = logging.getLogger(__name__)
@@ -111,19 +118,19 @@ class CodeFileHandler(FileSystemEventHandler):
         change = FileChange(path=file_path, change_type=change_type)
         self.debouncer.add_change(change)
 
-    def on_created(self, event: FileCreatedEvent) -> None:
+    def on_created(self, event: DirCreatedEvent | FileCreatedEvent) -> None:
         """Handle file creation."""
         self._handle_event(event, ChangeType.CREATED)
 
-    def on_modified(self, event: FileModifiedEvent) -> None:
+    def on_modified(self, event: DirModifiedEvent | FileModifiedEvent) -> None:
         """Handle file modification."""
         self._handle_event(event, ChangeType.MODIFIED)
 
-    def on_deleted(self, event: FileDeletedEvent) -> None:
+    def on_deleted(self, event: DirDeletedEvent | FileDeletedEvent) -> None:
         """Handle file deletion."""
         self._handle_event(event, ChangeType.DELETED)
 
-    def on_moved(self, event: FileMovedEvent) -> None:
+    def on_moved(self, event: DirMovedEvent | FileMovedEvent) -> None:
         """
         Handle file move/rename.
 
@@ -133,15 +140,17 @@ class CodeFileHandler(FileSystemEventHandler):
             return
 
         # Handle source (deleted)
-        if self._should_process(event.src_path):
-            src_path = Path(event.src_path)
+        src_path_str = event.src_path if isinstance(event.src_path, str) else event.src_path.decode()
+        if self._should_process(src_path_str):
+            src_path = Path(src_path_str)
             self.debouncer.add_change(
                 FileChange(path=src_path, change_type=ChangeType.DELETED)
             )
 
         # Handle destination (created)
-        if self._should_process(event.dest_path):
-            dest_path = Path(event.dest_path)
+        dest_path_str = event.dest_path if isinstance(event.dest_path, str) else event.dest_path.decode()
+        if self._should_process(dest_path_str):
+            dest_path = Path(dest_path_str)
             self.debouncer.add_change(
                 FileChange(path=dest_path, change_type=ChangeType.CREATED)
             )

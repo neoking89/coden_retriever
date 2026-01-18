@@ -140,7 +140,7 @@ def format_step_rich(step: ReActStep) -> Group:
     Returns:
         A Rich Group containing the formatted step elements.
     """
-    elements = []
+    elements: list[Any] = []
 
     # Step header with number
     step_header = Text()

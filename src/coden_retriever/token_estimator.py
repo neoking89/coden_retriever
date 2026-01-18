@@ -5,6 +5,7 @@ Provides generic token estimation with multiple backends.
 """
 import logging
 from functools import lru_cache
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,8 @@ class TokenEstimator:
             backend: One of "auto", "heuristic", "tiktoken", "tokenizers"
         """
         self._backend = backend
-        self._encoder = None
+        # Any: encoder can be tiktoken.Encoding or tokenizers.Tokenizer
+        self._encoder: Any = None
         self._initialize_backend()
 
     def _initialize_backend(self) -> None:

@@ -216,3 +216,4 @@ class Config:
         if package_model_path.exists():
             return str(package_model_path)
 
+        return None

@@ -300,7 +300,7 @@ def run_directory_browser(start_path: Optional[str] = None) -> Optional[str]:
     })
 
     # Create and run application
-    app = Application(
+    app: Application[None] = Application(
         layout=Layout(root_container),
         key_bindings=kb,
         style=style,

@@ -14,16 +14,27 @@ import math
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
-import networkx as nx
-
 from ..config import Config
 from ..constants import AMBIGUOUS_METHOD_NAMES
 from ..models import PathTraceResult
 
 if TYPE_CHECKING:
+    import networkx as nx
     from ..models.entities import CodeEntity
 
 logger = logging.getLogger(__name__)
+
+# Module-level reference for tests to mock (populated on first use)
+_nx_module = None
+
+
+def _get_nx():
+    """Lazy import networkx to avoid 140ms startup cost."""
+    global _nx_module
+    import networkx as nx
+    _nx_module = nx
+    return nx
+
 
 
 class GraphAnalyzer:
@@ -61,12 +72,13 @@ class GraphAnalyzer:
         self._file_scopes = file_scopes
         self._verbose = verbose
 
-        self._graph: nx.DiGraph = nx.DiGraph()
+        nx = _get_nx()
+        self._graph: "nx.DiGraph" = nx.DiGraph()
         self._pagerank_cache: dict[str, float] = {}
         self._betweenness_cache: dict[str, float] = {}
 
     @property
-    def graph(self) -> nx.DiGraph:
+    def graph(self) -> "nx.DiGraph":
         """Get the underlying graph."""
         return self._graph
 
@@ -168,6 +180,7 @@ class GraphAnalyzer:
             return
 
         # PageRank Computation
+        nx = _get_nx()
         try:
             pagerank_scores = nx.pagerank(self._graph, weight="weight")
             if self._scores_are_uniform(pagerank_scores):
@@ -221,10 +234,10 @@ class GraphAnalyzer:
         if not self._graph.nodes():
             return {}
 
-        personalization = {}
+        personalization: dict[str, float] = {}
 
         if scores_bm25:
-            top_seeds = sorted(scores_bm25.keys(), key=scores_bm25.get, reverse=True)[:30]
+            top_seeds = sorted(scores_bm25.keys(), key=lambda k: scores_bm25[k], reverse=True)[:30]
             for node_id in top_seeds:
                 if node_id in self._graph:
                     personalization[node_id] = personalization.get(node_id, 0) + scores_bm25[node_id]
@@ -237,6 +250,7 @@ class GraphAnalyzer:
                 personalization = {}
 
             if personalization:
+                nx = _get_nx()
                 try:
                     scores = nx.pagerank(self._graph, personalization=personalization, weight="weight")
                     if not self._scores_are_uniform(scores):
@@ -347,9 +361,11 @@ class GraphAnalyzer:
                     direction=direction
                 )
 
-        paths = []
+        paths: list[list[tuple[str, str, str]]] = []
         reachable = set()
         max_depth_reached = 0
+
+        nx = _get_nx()
 
         # Filter graph by edge weight
         filtered_graph = self._graph.copy()
@@ -467,7 +483,7 @@ class GraphAnalyzer:
         Returns:
             List of (neighbor_id, weight, types) tuples
         """
-        result = []
+        result: list[tuple[str, float, set[str]]] = []
 
         if node_id not in self._graph:
             return result

@@ -22,6 +22,7 @@ from ..constants import (
 from .protocol import (
     MESSAGE_DELIMITER,
     CloneDetectionParams,
+    DeadCodeParams,
     FlagClearParams,
     FlagParams,
     PropagationCostParams,
@@ -146,7 +147,7 @@ class DaemonClient:
             source_dir: Path to invalidate, or None
             all: If True, invalidate all cached projects
         """
-        params = {}
+        params: dict[str, str | bool] = {}
         if source_dir:
             params["source_dir"] = str(Path(source_dir).resolve())
         if all:
@@ -238,6 +239,11 @@ class DaemonClient:
     def flag_clear(self, params: FlagClearParams) -> dict:
         """Remove all [CODEN] comments from source files."""
         response = self._send_request("flag_clear", params.to_dict())
+        return self._validate_result(response.result)
+
+    def detect_dead_code(self, params: DeadCodeParams) -> dict:
+        """Detect potentially dead code using in-memory indices."""
+        response = self._send_request("detect_dead_code", params.to_dict())
         return self._validate_result(response.result)
 
 
@@ -490,6 +496,27 @@ def try_daemon_flag_clear(
         Flag clear result dict, or None if daemon unavailable
     """
     return _try_daemon_request("flag_clear", params, host, port, auto_start)
+
+
+def try_daemon_dead_code(
+    params: DeadCodeParams,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
+    auto_start: bool = True,
+) -> dict | None:
+    """
+    Try to detect dead code via daemon, auto-starting if needed.
+
+    Args:
+        params: DeadCodeParams with source_dir and options
+        host: Daemon host
+        port: Daemon port
+        auto_start: Auto-start daemon if not running (default: True)
+
+    Returns:
+        Dead code detection result dict, or None if daemon unavailable
+    """
+    return _try_daemon_request("detect_dead_code", params, host, port, auto_start)
 
 
 def stop_daemon(host: str = DEFAULT_DAEMON_HOST, port: int = DEFAULT_DAEMON_PORT) -> bool:

@@ -23,19 +23,21 @@ from .models import Action, AgentResponse, Observation, ReActStep, Thought
 from .text_tool_fallback import contains_tool_call, handle_fallback_iteration
 
 
-def extract_tool_calls(message: ModelResponse) -> list[tuple[str, dict[str, Any]]]:
+def extract_tool_calls(message: ModelResponse) -> list[tuple[str, dict[str, Any], str]]:
     """Extract tool calls from a model response."""
-    tool_calls = []
+    tool_calls: list[tuple[str, dict[str, Any], str]] = []
     for part in message.parts:
         if isinstance(part, ToolCallPart):
             # Parse arguments - could be string or dict
-            args = part.args
-            if isinstance(args, str):
+            raw_args = part.args
+            if isinstance(raw_args, str):
                 try:
-                    args = json.loads(args)
+                    parsed_args: dict[str, Any] = json.loads(raw_args)
                 except json.JSONDecodeError:
-                    args = {"raw": args}
-            tool_calls.append((part.tool_name, args, part.tool_call_id))
+                    parsed_args = {"raw": raw_args}
+            else:
+                parsed_args = raw_args if isinstance(raw_args, dict) else {}
+            tool_calls.append((part.tool_name, parsed_args, part.tool_call_id))
     return tool_calls
 
 
@@ -64,7 +66,7 @@ def parse_messages_to_steps(messages: list[ModelMessage]) -> list[ReActStep]:
     """
     steps = []
     step_number = 0
-    pending_tool_calls: dict[str, tuple[str, dict]] = {}  # tool_call_id -> (name, args)
+    pending_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}  # tool_call_id -> (name, args)
 
     for msg in messages:
         if isinstance(msg, ModelResponse):

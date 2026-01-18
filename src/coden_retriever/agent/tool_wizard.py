@@ -653,7 +653,7 @@ async def run_tool_wizard(
 
         # Step 2: Collect parameters
         args, cancelled = collect_parameters(selected_tool, context)
-        if cancelled:
+        if cancelled or args is None:
             print_wizard_cancelled()
             return None
 

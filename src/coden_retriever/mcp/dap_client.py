@@ -513,8 +513,11 @@ class DAPClient:
         data = f"Content-Length: {len(content)}\r\n\r\n{content}"
 
         # Use run_in_executor for the blocking socket send
+        if self._socket is None:
+            raise ConnectionError("Socket not connected")
+        sock = self._socket  # Capture for lambda
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: self._socket.sendall(data.encode("utf-8")))
+        await loop.run_in_executor(None, lambda: sock.sendall(data.encode("utf-8")))
 
     async def _handle_message(self, message: dict) -> None:
         """Handle a message from the adapter."""
@@ -637,9 +640,9 @@ class DAPClient:
             return {"error": f"File not found: {file}"}
 
         conditions = conditions or {}
-        breakpoints = []
+        breakpoints: list[dict[str, Any]] = []
         for line in lines:
-            bp = {"line": line}
+            bp: dict[str, Any] = {"line": line}
             if line in conditions:
                 bp["condition"] = conditions[line]
             breakpoints.append(bp)
@@ -833,7 +836,7 @@ class DAPClient:
 
         frame = frame_id or self._state.current_frame_id
 
-        args = {
+        args: dict[str, Any] = {
             "expression": expression,
             "context": "repl",
         }

@@ -707,13 +707,13 @@ def cmd_cache(args: list[str], context: "CommandContext") -> str:
         console.print()
 
         total_size = 0
-        for cache in caches:
-            total_size += cache["size_mb"]
-            source = cache["source_dir"]
+        for cache_info in caches:
+            total_size += cache_info["size_mb"]
+            source = cache_info["source_dir"]
             if len(source) > 50:
                 source = "..." + source[-47:]
             console.print(f"  [cyan]{source}[/cyan]")
-            console.print(f"    [dim]Entities: {cache['entity_count']:,} | Files: {cache['file_count']:,} | Size: {cache['size_mb']:.1f} MB[/dim]")
+            console.print(f"    [dim]Entities: {cache_info['entity_count']:,} | Files: {cache_info['file_count']:,} | Size: {cache_info['size_mb']:.1f} MB[/dim]")
 
         console.print()
         console.print(f"[bold]Total: {total_size:.1f} MB[/bold]")

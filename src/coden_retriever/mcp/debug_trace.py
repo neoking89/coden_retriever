@@ -13,7 +13,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Any, Callable, Literal
 
 from pydantic import Field
 
@@ -1021,14 +1021,14 @@ def register_debug_tools(mcp: "FastMCP", disabled_tools: set[str] | None = None)
         debug_state,
     )
 
-    simplified_tools = [
+    simplified_tools: list[Callable[..., Any]] = [
         debug_session,
         debug_action,
         debug_state,
     ]
 
     # Source injection tools (simple, no debugpy needed)
-    source_tools = [
+    source_tools: list[Callable[..., Any]] = [
         add_breakpoint,
         remove_injections,
         list_injections,

@@ -265,7 +265,7 @@ def run_tool_picker(
     })
 
     # Create and run application
-    app = Application(
+    app: Application[None] = Application(
         layout=Layout(root_container),
         key_bindings=kb,
         style=style,

@@ -3,9 +3,14 @@ MCP Server Factory.
 
 Provides a generic factory function for creating MCP servers with different configurations.
 Eliminates code duplication across server creation modules.
+
+Requires the 'mcp' extra:
+    pip install 'coden-retriever[mcp]'
 """
 import logging
 from typing import TYPE_CHECKING, Callable, Optional
+
+from ..utils.optional_deps import MissingDependencyError
 
 if TYPE_CHECKING:
     from fastmcp import FastMCP
@@ -46,14 +51,14 @@ def create_mcp_server_with_config(
 
     Returns:
         FastMCP instance or None if FastMCP is not installed
+
+    Raises:
+        MissingDependencyError: If FastMCP is not installed
     """
     try:
         from fastmcp import FastMCP
-        from .constants import ERROR_FASTMCP_NOT_INSTALLED
     except ImportError:
-        from .constants import ERROR_FASTMCP_NOT_INSTALLED
-        logger.error(ERROR_FASTMCP_NOT_INSTALLED.format(install_dependency))
-        return None
+        raise MissingDependencyError("mcp")
 
     mcp = FastMCP(
         name=server_name,

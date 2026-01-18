@@ -9,7 +9,7 @@ Uses weighted harmonic mean for score aggregation with block bonus.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
@@ -69,8 +69,9 @@ def compute_combined_score(
     if semantic_weight == 0 and syntactic_weight == 0:
         raise ValueError("semantic_weight and syntactic_weight cannot both be zero")
 
-    sem = semantic_sim  # type: float
-    syn = syntactic_pct  # type: float
+    # At this point, both values are not None (due to early returns above)
+    sem = cast(float, semantic_sim)
+    syn = cast(float, syntactic_pct)
 
     # Both available: weighted harmonic mean (only when both > 0)
     if sem > 0 and syn > 0:
@@ -332,9 +333,9 @@ def detect_clones_combined(
         pair_key = (eid1, eid2) if eid1 < eid2 else (eid2, eid1)
 
         # Get indices
-        i = node_id_to_idx.get(eid1)
-        j = node_id_to_idx.get(eid2)
-        if i is None or j is None:
+        idx1: int | None = node_id_to_idx.get(eid1)
+        idx2: int | None = node_id_to_idx.get(eid2)
+        if idx1 is None or idx2 is None:
             continue
 
         match = computer.compare_functions(
@@ -346,8 +347,8 @@ def detect_clones_combined(
         if match is not None:
             if pair_key not in pair_data:
                 pair_data[pair_key] = {
-                    "i": i, "j": j,
-                    "semantic_sim": float(similarity_matrix[i, j]),
+                    "i": idx1, "j": idx2,
+                    "semantic_sim": float(similarity_matrix[idx1, idx2]),
                     "syntactic_pct": match.match_percentage,
                     "syntactic_match": match,
                 }

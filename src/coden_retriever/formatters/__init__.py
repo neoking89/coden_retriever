@@ -8,6 +8,7 @@ from .cli_metrics import (
     SeverityTier,
 )
 from .clone_formatter import CloneFormatter
+from .dead_code_formatter import DeadCodeFormatter
 from .directory_tree_formatter import generate_shallow_tree
 from .propagation_formatter import PropagationFormatter
 from .json_formatter import JSONFormatter
@@ -18,7 +19,7 @@ from .xml_formatter import XMLFormatter
 
 def get_formatter(format_type: OutputFormat) -> OutputFormatter:
     """Factory function to get the appropriate formatter."""
-    formatters = {
+    formatters: dict[OutputFormat, type[OutputFormatter]] = {
         OutputFormat.XML: XMLFormatter,
         OutputFormat.MARKDOWN: MarkdownFormatter,
         OutputFormat.TREE: TreeFormatter,
@@ -39,5 +40,6 @@ __all__ = [
     "BaseCLIMetricFormatter",
     "SeverityTier",
     "CloneFormatter",
+    "DeadCodeFormatter",
     "PropagationFormatter",
 ]

@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     import networkx as nx
     from ..cache import CachedIndices
     from .graph_analyzer import GraphAnalyzer
+    from .semantic import SemanticIndex
 
 from ..formatters.directory_tree_formatter import DirectoryTreeFormatter
 from ..formatters.terminal_style import get_terminal_style
@@ -57,7 +58,7 @@ class SearchEngine:
         self._parser = RepoParser()
 
         # Lazy load semantic index only if enabled (saves memory/startup time)
-        self._semantic_index = None
+        self._semantic_index: "SemanticIndex | None" = None
         if self.enable_semantic:
             self._init_semantic_index()
 
@@ -480,8 +481,8 @@ class SearchEngine:
             self.index()
 
         # Lexical/Semantic scores (mutually exclusive - toggle between them)
-        scores_bm25 = {}
-        scores_semantic = {}
+        scores_bm25: dict[str, float] = {}
+        scores_semantic: dict[str, float] = {}
 
         if query:
             if self.enable_semantic and self._semantic_index:
@@ -499,7 +500,7 @@ class SearchEngine:
         scores_pr = self._get_pagerank(scores_bm25)
 
         # Betweenness centrality
-        scores_bt = self._betweenness_cache if use_architecture else {}
+        scores_bt: dict[str, float] = (self._betweenness_cache or {}) if use_architecture else {}
 
         # In map mode (no query), aggregate method scores to parent classes
         # This boosts class-level entities for architectural overview
@@ -514,7 +515,7 @@ class SearchEngine:
 
         # Build results
         results = []
-        ranked_nodes = sorted(final_scores.keys(), key=final_scores.get, reverse=True)
+        ranked_nodes = sorted(final_scores.keys(), key=lambda k: final_scores[k], reverse=True)
 
         for i, node_id in enumerate(ranked_nodes[:limit]):
             entity = self._entities[node_id]
@@ -627,7 +628,7 @@ class SearchEngine:
                 return
 
             # Sort entities by their score in this ranking signal (descending)
-            ranked = sorted(scores.keys(), key=scores.get, reverse=True)
+            ranked = sorted(scores.keys(), key=lambda k: scores[k], reverse=True)
 
             # Track rank with tie handling - entities with same score share rank
             current_rank = 0

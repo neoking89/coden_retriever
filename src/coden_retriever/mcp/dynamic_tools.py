@@ -11,7 +11,7 @@ import importlib.util
 import logging
 import sys
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 from pydantic import Field
 
@@ -307,7 +307,7 @@ def _find_used_names_in_function(func_code: str) -> set[str]:
             used_names.add(node.id)
         elif isinstance(node, ast.Attribute):
             # For attribute access like "os.path", get the root name "os"
-            current = node
+            current: ast.expr = node
             while isinstance(current, ast.Attribute):
                 current = current.value
             if isinstance(current, ast.Name):
@@ -631,23 +631,24 @@ async def remove_dynamic_tool(
                 "message": f"Cleared {tool_count} dynamic tool(s). They remain registered in current session but won't load on restart.",
             }
 
-        # Remove specific tool
-        if tool_name in _manager.reserved_tool_names:
-            return {"error": f"Cannot remove built-in tool '{tool_name}'."}
+        # Remove specific tool - tool_name is guaranteed set (checked at line 614)
+        name = cast(str, tool_name)
+        if name in _manager.reserved_tool_names:
+            return {"error": f"Cannot remove built-in tool '{name}'."}
 
         async with _manager._dynamic_tools_write_lock:
             await asyncio.to_thread(
                 _remove_from_dynamic_tools_file,
                 dynamic_tools_path,
-                tool_name,
+                name,
             )
             importlib.invalidate_caches()
             _load_dynamic_tools_module()
 
         return {
             "status": "success",
-            "name": tool_name,
-            "message": f"Tool '{tool_name}' removed. It remains registered in current session but won't load on restart.",
+            "name": name,
+            "message": f"Tool '{name}' removed. It remains registered in current session but won't load on restart.",
         }
     except ValueError as e:
         return {"error": str(e)}

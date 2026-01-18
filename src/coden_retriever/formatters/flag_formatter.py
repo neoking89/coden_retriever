@@ -41,17 +41,19 @@ def format_parameters_header(
     echo_threshold: float,
     limit: int | None,
     dry_run: bool,
+    dead_code_threshold: float = 0.5,
 ) -> str:
     """Format parameter summary header showing active analysis and thresholds.
 
     Args:
-        active_flags: List of active flags (e.g., ["-H", "-P", "-C", "-E"])
+        active_flags: List of active flags (e.g., ["-H", "-P", "-C", "-E", "-D"])
         risk_threshold: Risk threshold for hotspots
         propagation_threshold: Propagation cost threshold (0-1 scale)
         clone_threshold: Clone similarity threshold (0-1 scale)
         echo_threshold: Echo comment similarity threshold (0-1 scale)
         limit: Result limit (None for no limit)
         dry_run: Whether this is a dry-run
+        dead_code_threshold: Dead code confidence threshold (0-1 scale)
 
     Returns:
         Formatted parameter header string
@@ -67,6 +69,7 @@ def format_parameters_header(
         "-P": f"Propagation (cost >= {propagation_threshold * 100:.0f}%)",
         "-C": f"Clones (similarity >= {clone_threshold * 100:.0f}%)",
         "-E": f"Echo Comments (similarity >= {echo_threshold * 100:.0f}%)",
+        "-D": f"Dead Code (confidence >= {dead_code_threshold * 100:.0f}%)",
     }
     active = [analysis_names[flag] for flag in active_flags if flag in analysis_names]
 
@@ -175,6 +178,14 @@ class FlagFormatter(BaseCLIMetricFormatter):
                 return SeverityTier.ELEVATED
             else:
                 return SeverityTier.MODERATE
+        elif flag_type in ("dead_code", "dead_code_remove"):
+            confidence = item.get("confidence", 0)
+            if confidence >= 0.80:
+                return SeverityTier.HIGH
+            elif confidence >= 0.50:
+                return SeverityTier.MODERATE
+            else:
+                return SeverityTier.LOW
         return SeverityTier.LOW
 
     def format_items(
@@ -199,8 +210,12 @@ class FlagFormatter(BaseCLIMetricFormatter):
         if not items:
             return "No items to flag at the specified thresholds."
 
-        # Sort by severity (type priority: hotspot > propagation > clone)
-        type_priority = {"hotspot": 0, "propagation": 1, "clone": 2, "echo": 3, "echo_remove": 3}
+        # Sort by severity (type priority: hotspot > propagation > clone > dead_code > echo)
+        type_priority = {
+            "hotspot": 0, "propagation": 1, "clone": 2,
+            "dead_code": 3, "dead_code_remove": 3,
+            "echo": 4, "echo_remove": 4
+        }
         sorted_items = sorted(
             items,
             key=lambda x: (
@@ -208,6 +223,7 @@ class FlagFormatter(BaseCLIMetricFormatter):
                 -x.get("risk_score", 0),
                 -x.get("propagation_cost", 0),
                 -x.get("similarity", 0),
+                -x.get("confidence", 0),
                 -x.get("similarity_score", 0),
             ),
         )
@@ -248,6 +264,8 @@ class FlagFormatter(BaseCLIMetricFormatter):
                     metric = f"Sim: {similarity * 100:.1f}%"
             elif item.get("type") in ("echo", "echo_remove"):
                 metric = f"Echo: {item.get('similarity_score', 0) * 100:.1f}%"
+            elif item.get("type") in ("dead_code", "dead_code_remove"):
+                metric = f"Conf: {item.get('confidence', 0) * 100:.0f}%"
             else:
                 metric = "N/A"
 
@@ -291,6 +309,7 @@ class FlagFormatter(BaseCLIMetricFormatter):
         hotspots = type_summary.get("hotspots", 0)
         propagation = type_summary.get("propagation", 0)
         clones = type_summary.get("clones", 0)
+        dead_code = type_summary.get("dead_code", 0)
         echo_comments = type_summary.get("echo_comments", 0)
 
         mode = "[DRY-RUN] Would flag" if dry_run else "Flagged"
@@ -303,6 +322,7 @@ class FlagFormatter(BaseCLIMetricFormatter):
             f"  HOTSPOT flags: {hotspots}",
             f"  PROPAGATION flags: {propagation}",
             f"  CLONE flags: {clones}",
+            f"  DEAD_CODE flags: {dead_code}",
             f"  ECHO flags: {echo_comments}",
         ]
 

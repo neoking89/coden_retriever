@@ -91,11 +91,11 @@ class LanguageLoader:
             # Try different Language constructor signatures for version compatibility
             try:
                 # tree-sitter 0.21+: Language(ptr, name) - preferred
-                language = Language(lang_ptr, lang_name)
+                language = Language(lang_ptr, lang_name)  # type: ignore[call-arg]
             except TypeError:
                 try:
                     # tree-sitter 0.25+: Language(library_path, name)
-                    language = Language(self._lib_path, lang_name)
+                    language = Language(self._lib_path, lang_name)  # type: ignore[call-arg]
                 except TypeError:
                     # tree-sitter 0.20: Language(ptr) - works but no name
                     language = Language(lang_ptr)

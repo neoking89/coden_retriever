@@ -46,7 +46,7 @@ class CacheManager:
     """
 
     CACHE_VERSION = "1"
-    LOGS_DIR = "logs"  # Preserved during cache clear (may have open handles)
+    LOGS_DIR = "logs"
 
     # Cache file names
     MANIFEST_FILE = "manifest.json"

@@ -2,19 +2,40 @@
 Semantic search module.
 
 Implements vector-based semantic code search using Model2Vec.
+
+Requires the 'semantic' extra:
+    pip install 'coden-retriever[semantic]'
 """
 import logging
 import tempfile
 from pathlib import Path
-from typing import Dict, Optional, Union
+from typing import TYPE_CHECKING, Dict, Optional, Union
 
-import numpy as np
-from model2vec import StaticModel
-
+from ..config import Config
 from ..models import CodeEntity
+from ..utils.optional_deps import MissingDependencyError, get_numpy
 from .base import EntitySearchIndex
 
+if TYPE_CHECKING:
+    import numpy as np
+    from model2vec import StaticModel
+
 logger = logging.getLogger(__name__)
+
+
+def _get_static_model_class():
+    """Lazy import StaticModel to avoid 67ms startup cost."""
+    global _StaticModelClass
+    try:
+        from model2vec import StaticModel
+        _StaticModelClass = StaticModel
+        return StaticModel
+    except ImportError:
+        raise MissingDependencyError("semantic")
+
+
+# Module-level reference for tests to mock (populated on first use)
+_StaticModelClass: "type | None" = None
 
 # Module-level cache for loaded models (singleton pattern)
 # StaticModel is thread-safe and read-only after loading, so safe to share
@@ -43,6 +64,7 @@ def _ensure_mmap_cache(model: "StaticModel", model_path: str) -> None:
     cache_path = _get_mmap_cache_path(model_path)
 
     if not cache_path.exists():
+        np = get_numpy()
         logger.info(f"Creating mmap cache at {cache_path}")
         _MMAP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         # Save embeddings as .npy file for fast mmap loading
@@ -65,6 +87,8 @@ def _load_model_with_mmap(model_path: str) -> "StaticModel":
     stay in RAM until memory pressure forces eviction.
     """
     cache_path = _get_mmap_cache_path(model_path)
+    StaticModel = _get_static_model_class()
+    np = get_numpy()
 
     if cache_path.exists():
         # Fast path: load model structure, then mmap the embeddings
@@ -116,9 +140,6 @@ def get_cached_model(model_path: str) -> "StaticModel":
     cache_key = str(Path(model_path).resolve())
 
     if cache_key not in _model_cache:
-        if StaticModel is None:
-            raise ImportError("model2vec is required. Install with: pip install model2vec")
-
         # Load with mmap for cross-process caching
         _model_cache[cache_key] = _load_model_with_mmap(model_path)
     else:
@@ -242,9 +263,7 @@ def load_or_distill_model(
         ValueError: If model doesn't exist and source_model is not provided.
         ImportError: If required packages are not installed.
     """
-    if StaticModel is None:
-        raise ImportError("model2vec is required. Install with: pip install model2vec")
-
+    StaticModel = _get_static_model_class()
     output_path = Path(output_path)
 
     if not force_distill and output_path.exists() and (output_path / "model.safetensors").exists():
@@ -285,9 +304,9 @@ class SemanticIndex(EntitySearchIndex):
             model_path: Path to the Model2Vec static model.
         """
         self.model_path = model_path
-        self._model = None
-        self._embeddings = None
-        self._node_ids = []
+        self._model: "StaticModel | None" = None
+        self._embeddings: "np.ndarray | None" = None
+        self._node_ids: list[str] = []
 
     @classmethod
     def from_huggingface(
@@ -369,6 +388,7 @@ class SemanticIndex(EntitySearchIndex):
 
         # Normalize embeddings for cosine similarity (||v|| = 1)
         # This allows us to use dot product instead of computing cosine each time
+        np = get_numpy()
         norms = np.linalg.norm(self._embeddings, axis=1, keepdims=True)
         # Avoid division by zero
         norms = np.where(norms == 0, 1, norms)
@@ -398,6 +418,7 @@ class SemanticIndex(EntitySearchIndex):
         query_vec = self._model.encode([query])[0]
 
         # Normalize query vector
+        np = get_numpy()
         query_norm = np.linalg.norm(query_vec)
         if query_norm == 0:
             logger.warning("Query embedding is zero vector")
@@ -412,5 +433,5 @@ class SemanticIndex(EntitySearchIndex):
         return {
             nid: float(score)
             for nid, score in zip(self._node_ids, scores)
-            if score > 0.1  # Only return scores above threshold
+            if score > Config.SEMANTIC_SCORE_THRESHOLD
         }
