@@ -1,3 +1,40 @@
+# Release Notes - Version 1.3.0
+
+**Release Date:** February 11, 2026
+
+## New Features
+
+- **Tramp Data Detection (`-T`)**: Identify parameter groups that travel together across many functions, revealing opportunities to refactor into configuration objects
+  - Uses frequent pair mining and greedy group expansion to find co-occurring parameters
+  - `--min-occurrences` to set minimum function count (default: 3)
+  - `--min-group-size` to set minimum parameters per group (default: 2)
+  - Supports flag mode: `coden flag -T --dry-run` / `coden flag -T --backup`
+
+- **Sensitive Value Detection (`-S`)**: Find hardcoded secrets, API keys, credentials, and other sensitive strings using an ML classifier (LogisticRegression) trained on entropy, character patterns, and known secret prefixes
+  - `--sensitive-threshold` to adjust confidence (default: 0.35, range: 0-1)
+  - Replace mode: `coden flag -S --replace --backup` replaces secrets with `***REDACTED***`
+  - Custom placeholder: `coden flag -S --replace "HIDDEN" --backup`
+  - Supports flag mode and dry-run previews
+
+- **Bash Language Support**: Bash/shell scripts are now parsed and analyzed alongside other supported languages
+
+## MCP Server
+
+- New tools: `detect_tramp_data` and `detect_sensitive_values` available via `coden serve`
+
+## Dependency Changes
+
+- `scikit-learn` and `numpy` are now core dependencies (required for sensitive value classifier)
+- `numpy` removed from `[semantic]` extras (no longer duplicated)
+
+## Other Improvements
+
+- Combined flag shorthand updated from `-HPCED` to `-HPCETS` to include tramp data and sensitive values
+- Propagation analysis (`-P`) now respects the `--include-tests` flag
+- Internal refactoring of flag command validation and formatting
+
+---
+
 # Release Notes - Version 1.2.0
 
 **Release Date:** January 18, 2026
