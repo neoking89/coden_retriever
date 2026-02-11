@@ -219,6 +219,7 @@ class FlagParams:
     clones: bool = False
     echo_comments: bool = False
     dead_code: bool = False
+    tramp_data: bool = False
     risk_threshold: float = 0.5
     propagation_threshold: float = 0.25
     clone_threshold: float = 0.95
@@ -237,6 +238,36 @@ class FlagParams:
     # Syntactic clone parameters
     line_threshold: float = 0.70
     func_threshold: float = 0.50
+
+    # Tramp data parameters
+    min_occurrences: int = 3
+    min_group_size: int = 2
+
+    # Sensitive value parameters
+    sensitive_values: bool = False
+    sensitive_threshold: float = 0.35
+    replace_value: str | None = None
+
+    def has_any_flag_enabled(self) -> bool:
+        """Check if at least one analysis flag is enabled.
+
+        Required because flag_code needs at least one analysis type to run.
+        """
+        return (
+            self.hotspots or self.propagation or self.clones
+            or self.echo_comments or self.dead_code or self.tramp_data
+            or self.sensitive_values
+        )
+
+    def validate(self) -> str | None:
+        """Validate flag parameters.
+
+        Returns:
+            Error message if validation fails, None if valid.
+        """
+        if not self.has_any_flag_enabled():
+            return "At least one analysis flag (-H, -P, -C, -E, -D, -T, or -S) is required"
+        return None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -286,6 +317,50 @@ class DeadCodeParams:
 
     @classmethod
     def from_dict(cls, data: dict) -> "DeadCodeParams":
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class TrampDataParams:
+    """Parameters for tramp data detection requests.
+
+    Used to find parameter groups traveling together across functions.
+    """
+
+    source_dir: str
+    min_occurrences: int = 3  # Import from constants avoided to prevent circular dependency
+    limit: int | None = 50  # Matches TRAMP_DATA_DEFAULT_RESULT_LIMIT
+    exclude_tests: bool = True
+    token_limit: int | None = None
+    min_group_size: int = 2  # Matches TRAMP_DATA_MIN_GROUP_SIZE
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "TrampDataParams":
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class SensitiveValueParams:
+    """Parameters for sensitive value detection requests.
+
+    Used to find hardcoded secrets, credentials, and sensitive data in string literals.
+    """
+
+    source_dir: str
+    confidence_threshold: float = 0.35  # Matches SENSITIVE_VALUE_DEFAULT_THRESHOLD
+    limit: int | None = 50  # Matches SENSITIVE_VALUE_DEFAULT_LIMIT
+    exclude_tests: bool = True
+    token_limit: int | None = None
+    replace_value: str | None = None
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SensitiveValueParams":
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 

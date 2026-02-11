@@ -39,8 +39,10 @@ from .protocol import (
     PropagationCostParams,
     GraphAnalysisParams,
     SearchParams,
+    SensitiveValueParams,
     StacktraceParams,
     TraceDependencyParams,
+    TrampDataParams,
 )
 if TYPE_CHECKING:
     from .server import DaemonServer
@@ -754,6 +756,46 @@ class DeadCodeHandler(BaseHandler):
         return result
 
 
+class TrampDataHandler(BaseHandler):
+    """Handler for tramp data detection requests."""
+
+    def handle(self, params: dict) -> dict:
+        from ..tramp_data.detector import detect_tramp_data
+
+        td_params = TrampDataParams.from_dict(params)
+        indices, _ = self._server._get_or_load_project(td_params.source_dir)
+
+        result = detect_tramp_data(
+            entities=indices.entities,
+            min_occurrences=td_params.min_occurrences,
+            exclude_tests=td_params.exclude_tests,
+            limit=td_params.limit,
+            min_group_size=td_params.min_group_size,
+        )
+        result["source"] = "daemon"
+        return result
+
+
+class SensitiveValueHandler(BaseHandler):
+    """Handler for sensitive value detection requests."""
+
+    def handle(self, params: dict) -> dict:
+        from ..sensitive_values.detector import detect_sensitive_values
+
+        sv_params = SensitiveValueParams.from_dict(params)
+        indices, _ = self._server._get_or_load_project(sv_params.source_dir)
+
+        result = detect_sensitive_values(
+            entities=indices.entities,
+            confidence_threshold=sv_params.confidence_threshold,
+            exclude_tests=sv_params.exclude_tests,
+            limit=sv_params.limit,
+            replace_value=sv_params.replace_value,
+        )
+        result["source"] = "daemon"
+        return result
+
+
 class FlagHandler(BaseHandler):
     """Handler for code flagging requests."""
 
@@ -767,26 +809,7 @@ class FlagHandler(BaseHandler):
             entities=indices.entities,
             graph=indices.graph,
             pagerank=indices.pagerank,
-            source_dir=flag_params.source_dir,
-            hotspots=flag_params.hotspots,
-            propagation=flag_params.propagation,
-            clones=flag_params.clones,
-            echo_comments=flag_params.echo_comments,
-            dead_code=flag_params.dead_code,
-            risk_threshold=flag_params.risk_threshold,
-            propagation_threshold=flag_params.propagation_threshold,
-            clone_threshold=flag_params.clone_threshold,
-            echo_threshold=flag_params.echo_threshold,
-            dead_code_threshold=flag_params.dead_code_threshold,
-            clone_mode=flag_params.clone_mode,
-            line_threshold=flag_params.line_threshold,
-            func_threshold=flag_params.func_threshold,
-            dry_run=flag_params.dry_run,
-            backup=flag_params.backup,
-            verbose=flag_params.verbose,
-            exclude_tests=flag_params.exclude_tests,
-            remove_comments=flag_params.remove_comments,
-            remove_dead_code=flag_params.remove_dead_code,
+            params=flag_params,
         )
         result["source"] = "daemon"
         return result
@@ -833,6 +856,8 @@ def create_handler_registry(server: "DaemonServer") -> dict[str, BaseHandler]:
         "detect_clones": CloneDetectionHandler(server),
         "propagation_cost": PropagationCostHandler(server),
         "detect_dead_code": DeadCodeHandler(server),
+        "detect_tramp_data": TrampDataHandler(server),
+        "detect_sensitive_values": SensitiveValueHandler(server),
         "flag_code": FlagHandler(server),
         "flag_clear": FlagClearHandler(server),
     }

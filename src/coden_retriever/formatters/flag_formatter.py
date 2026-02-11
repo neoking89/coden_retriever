@@ -10,6 +10,13 @@ Provides consistent formatting for flag command results with:
 import json
 from typing import Any
 
+from ..constants import (
+    SENSITIVE_VALUE_TIER_HIGH,
+    SENSITIVE_VALUE_TIER_MODERATE,
+    TRAMP_DATA_TIER_HIGH,
+    TRAMP_DATA_TIER_LOW,
+    TRAMP_DATA_TIER_MODERATE,
+)
 from .cli_metrics import BaseCLIMetricFormatter, FALSE_POSITIVE_WARNING, SeverityTier
 
 
@@ -42,11 +49,13 @@ def format_parameters_header(
     limit: int | None,
     dry_run: bool,
     dead_code_threshold: float = 0.5,
+    min_occurrences: int = 3,
+    sensitive_threshold: float = 0.35,
 ) -> str:
     """Format parameter summary header showing active analysis and thresholds.
 
     Args:
-        active_flags: List of active flags (e.g., ["-H", "-P", "-C", "-E", "-D"])
+        active_flags: List of active flags (e.g., ["-H", "-P", "-C", "-E", "-D", "-T", "-S"])
         risk_threshold: Risk threshold for hotspots
         propagation_threshold: Propagation cost threshold (0-1 scale)
         clone_threshold: Clone similarity threshold (0-1 scale)
@@ -54,6 +63,8 @@ def format_parameters_header(
         limit: Result limit (None for no limit)
         dry_run: Whether this is a dry-run
         dead_code_threshold: Dead code confidence threshold (0-1 scale)
+        min_occurrences: Minimum function occurrences for tramp data
+        sensitive_threshold: Sensitive value confidence threshold (0-1 scale)
 
     Returns:
         Formatted parameter header string
@@ -70,6 +81,8 @@ def format_parameters_header(
         "-C": f"Clones (similarity >= {clone_threshold * 100:.0f}%)",
         "-E": f"Echo Comments (similarity >= {echo_threshold * 100:.0f}%)",
         "-D": f"Dead Code (confidence >= {dead_code_threshold * 100:.0f}%)",
+        "-T": f"Tramp Data (occurrences >= {min_occurrences})",
+        "-S": f"Sensitive Values (confidence >= {sensitive_threshold * 100:.0f}%)",
     }
     active = [analysis_names[flag] for flag in active_flags if flag in analysis_names]
 
@@ -186,6 +199,24 @@ class FlagFormatter(BaseCLIMetricFormatter):
                 return SeverityTier.MODERATE
             else:
                 return SeverityTier.LOW
+        elif flag_type == "tramp_data":
+            occurrences = item.get("occurrences", 0)
+            if occurrences >= TRAMP_DATA_TIER_HIGH:
+                return SeverityTier.HIGH
+            elif occurrences >= TRAMP_DATA_TIER_MODERATE:
+                return SeverityTier.ELEVATED
+            elif occurrences >= TRAMP_DATA_TIER_LOW:
+                return SeverityTier.MODERATE
+            else:
+                return SeverityTier.LOW
+        elif flag_type in ("sensitive_value", "sensitive_value_replace"):
+            confidence = item.get("confidence", 0)
+            if confidence >= SENSITIVE_VALUE_TIER_HIGH:
+                return SeverityTier.HIGH
+            elif confidence >= SENSITIVE_VALUE_TIER_MODERATE:
+                return SeverityTier.MODERATE
+            else:
+                return SeverityTier.LOW
         return SeverityTier.LOW
 
     def format_items(
@@ -213,8 +244,10 @@ class FlagFormatter(BaseCLIMetricFormatter):
         # Sort by severity (type priority: hotspot > propagation > clone > dead_code > echo)
         type_priority = {
             "hotspot": 0, "propagation": 1, "clone": 2,
-            "dead_code": 3, "dead_code_remove": 3,
-            "echo": 4, "echo_remove": 4
+            "sensitive_value": 3, "sensitive_value_replace": 3,
+            "dead_code": 4, "dead_code_remove": 4,
+            "tramp_data": 5,
+            "echo": 6, "echo_remove": 6,
         }
         sorted_items = sorted(
             items,
@@ -224,6 +257,7 @@ class FlagFormatter(BaseCLIMetricFormatter):
                 -x.get("propagation_cost", 0),
                 -x.get("similarity", 0),
                 -x.get("confidence", 0),
+                -x.get("occurrences", 0),
                 -x.get("similarity_score", 0),
             ),
         )
@@ -265,6 +299,12 @@ class FlagFormatter(BaseCLIMetricFormatter):
             elif item.get("type") in ("echo", "echo_remove"):
                 metric = f"Echo: {item.get('similarity_score', 0) * 100:.1f}%"
             elif item.get("type") in ("dead_code", "dead_code_remove"):
+                metric = f"Conf: {item.get('confidence', 0) * 100:.0f}%"
+            elif item.get("type") == "tramp_data":
+                occurrences = item.get("occurrences", 0)
+                group_size = len(item.get("group", []))
+                metric = f"Tramp: {occurrences} funcs, {group_size} params"
+            elif item.get("type") in ("sensitive_value", "sensitive_value_replace"):
                 metric = f"Conf: {item.get('confidence', 0) * 100:.0f}%"
             else:
                 metric = "N/A"
@@ -311,6 +351,8 @@ class FlagFormatter(BaseCLIMetricFormatter):
         clones = type_summary.get("clones", 0)
         dead_code = type_summary.get("dead_code", 0)
         echo_comments = type_summary.get("echo_comments", 0)
+        tramp_data = type_summary.get("tramp_data", 0)
+        sensitive_values = type_summary.get("sensitive_values", 0)
 
         mode = "[DRY-RUN] Would flag" if dry_run else "Flagged"
 
@@ -322,7 +364,9 @@ class FlagFormatter(BaseCLIMetricFormatter):
             f"  HOTSPOT flags: {hotspots}",
             f"  PROPAGATION flags: {propagation}",
             f"  CLONE flags: {clones}",
+            f"  SENSITIVE_VALUE flags: {sensitive_values}",
             f"  DEAD_CODE flags: {dead_code}",
+            f"  TRAMP_DATA flags: {tramp_data}",
             f"  ECHO flags: {echo_comments}",
         ]
 

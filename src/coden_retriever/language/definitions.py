@@ -20,6 +20,7 @@ LANGUAGE_MAP: Dict[str, str] = {
     ".swift": "swift",
     ".kt": "kotlin", ".kts": "kotlin",
     ".scala": "scala",
+    ".sh": "bash", ".bash": "bash",
 }
 
 # Tree-sitter queries for each language
@@ -144,5 +145,9 @@ LANGUAGE_QUERIES: Dict[str, str] = {
         (function_definition name: (identifier) @def.function body: (block) @body.function)
         (call_expression function: (identifier) @ref.call)
         (import_declaration (stable_identifier) @ref.import)
+    """,
+    "bash": """
+        (function_definition name: (word) @def.function body: (compound_statement) @body.function)
+        (command name: (command_name) @ref.call)
     """,
 }

@@ -27,7 +27,7 @@ from .filtering_toolset import create_filtered_toolset
 from .interactive_loop import CommandContext, InteractiveLoop
 from .mcp_server import create_mcp_server
 from .model_factory import ModelFactory
-from .models import AgentMode, AgentResponse, ReActStep
+from .models import AgentMode, AgentResponse, ReActStep, SessionTrigger
 from .permission_toolset import wrap_toolset_with_permission
 from .prompt_builder import PromptBuilder
 from .query_executor import ErrorHandler, QueryExecutor
@@ -53,12 +53,14 @@ def get_mode_from_context(context: "CommandContext | None") -> AgentMode:
 
 
 # Session start triggers for study mode
-_SESSION_START_TRIGGERS = frozenset(("", "start", "begin"))
+_SESSION_START_TRIGGERS = frozenset(
+    (SessionTrigger.EMPTY, SessionTrigger.START, SessionTrigger.BEGIN)
+)
 _SESSION_START_PREFIXES = ("begin the study session", "start the study session")
 
 
 def build_query_prompt(
-    user_input: str,
+    user_input: str | SessionTrigger,
     root_directory: str,
     mode: AgentMode,
     topic: str | None = None,
@@ -66,7 +68,7 @@ def build_query_prompt(
     """Build the query prompt based on agent mode.
 
     Args:
-        user_input: The user's query.
+        user_input: The user's query or a SessionTrigger for study mode.
         root_directory: Working directory path.
         mode: Current agent mode (CODING or STUDY).
         topic: Optional focus topic for STUDY mode.
@@ -579,27 +581,33 @@ class CodingAgent:
                         )
                         # Auto-start study session when entering study mode
                         if context.study_mode:
-                            await self._run_query(
-                                agent=agent,
-                                user_input="begin",  # Triggers SESSION START assessment
-                                root_directory=context.root_directory,
-                                debug_logger=debug_logger,
-                                loop=loop,
-                                context=context,
-                            )
+                            try:
+                                await self._run_query(
+                                    agent=agent,
+                                    user_input=SessionTrigger.BEGIN,
+                                    root_directory=context.root_directory,
+                                    debug_logger=debug_logger,
+                                    loop=loop,
+                                    context=context,
+                                )
+                            except (KeyboardInterrupt, asyncio.CancelledError):
+                                console.print("\n[dim]Response interrupted.[/dim]")
                     continue
 
                 if not user_input:
                     continue
 
-                await self._run_query(
-                    agent=agent,
-                    user_input=user_input,
-                    root_directory=context.root_directory,
-                    debug_logger=debug_logger,
-                    loop=loop,
-                    context=context,
-                )
+                try:
+                    await self._run_query(
+                        agent=agent,
+                        user_input=user_input,
+                        root_directory=context.root_directory,
+                        debug_logger=debug_logger,
+                        loop=loop,
+                        context=context,
+                    )
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    console.print("\n[dim]Response interrupted.[/dim]")
 
             except KeyboardInterrupt:
                 console.print()
@@ -633,7 +641,7 @@ class CodingAgent:
     async def _run_query(
         self,
         agent: "Agent[Any, str]",
-        user_input: str,
+        user_input: str | SessionTrigger,
         root_directory: str,
         debug_logger: "DebugLogger",
         loop: InteractiveLoop,

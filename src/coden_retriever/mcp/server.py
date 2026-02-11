@@ -45,6 +45,8 @@ def create_mcp_server() -> "FastMCP | None":
     from .flag_insertion import register_flag_tools
     from .graph_analysis import register_graph_analysis_tools
     from .propagation_cost import register_propagation_cost_tools
+    from .sensitive_values import register_sensitive_value_tools
+    from .tramp_data import register_tramp_data_tools
 
     disabled_tools = get_disabled_tools()
 
@@ -58,6 +60,8 @@ def create_mcp_server() -> "FastMCP | None":
         lambda mcp: register_flag_tools(mcp, disabled_tools),
         lambda mcp: register_graph_analysis_tools(mcp, disabled_tools),
         lambda mcp: register_propagation_cost_tools(mcp, disabled_tools),
+        lambda mcp: register_sensitive_value_tools(mcp, disabled_tools),
+        lambda mcp: register_tramp_data_tools(mcp, disabled_tools),
     ]
 
     # Only register dynamic tools if explicitly enabled in pyproject.toml

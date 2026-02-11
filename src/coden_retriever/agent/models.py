@@ -17,6 +17,13 @@ class AgentMode(Enum):
     STUDY = "study"
 
 
+class SessionTrigger(str, Enum):
+    """Special input values that trigger study session start."""
+    EMPTY = ""
+    START = "start"
+    BEGIN = "begin"
+
+
 @dataclass
 class AgentDeps:
     """Dependencies injected into agent tools and instructions via RunContext.

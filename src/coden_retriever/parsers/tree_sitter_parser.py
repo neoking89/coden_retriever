@@ -4,6 +4,7 @@ Tree-sitter parser module.
 Parses source files using Tree-sitter and extracts code entities.
 """
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,13 @@ from ..language import LANGUAGE_MAP, LANGUAGE_QUERIES, LanguageLoader
 from ..models import CodeEntity
 
 logger = logging.getLogger(__name__)
+
+# 500 chars balances retaining useful context against embedding API token
+# limits (typically 512 tokens).  Longer docstrings rarely add retrieval value.
+MAX_DOCSTRING_LENGTH = 500
+
+# Maximum AST depth when searching for body nodes in malformed ASTs
+MAX_BODY_SEARCH_DEPTH = 5
 
 # Stub statement types (language-agnostic AST patterns)
 # These node types represent explicit stub/placeholder constructs
@@ -63,7 +71,9 @@ COMPLEXITY_NODES: dict[str, set[str]] = {
     },
     "rust": {
         "if_expression", "for_expression", "while_expression", "loop_expression",
-        "match_arm", "if_let_expression", "while_let_expression",
+        "match_arm",
+        # tree-sitter-rust parses if-let/while-let as regular if/while
+        # with a let_condition child, so they are already counted above
     },
     "cpp": {
         "if_statement", "for_statement", "while_statement", "do_statement",
@@ -73,10 +83,17 @@ COMPLEXITY_NODES: dict[str, set[str]] = {
         "if_statement", "for_statement", "while_statement", "do_statement",
         "case_statement", "conditional_expression",
     },
+    "bash": {
+        "if_statement", "elif_clause", "for_statement",
+        "c_style_for_statement", "while_statement", "case_statement",
+        "case_item",
+        "test_command",  # [ ] and [[ ]]
+        "binary_expression",  # && and ||
+    },
 }
 
 
-def _extract_python_method_call(node) -> tuple[str | None, str | None]:
+def _extract_python_method_call(node: Any) -> tuple[str | None, str | None]:
     """Extract receiver and method from Python attribute node."""
     obj_node = None
     attr_node = None
@@ -102,7 +119,7 @@ def _extract_python_method_call(node) -> tuple[str | None, str | None]:
     return receiver, method
 
 
-def _extract_js_ts_method_call(node) -> tuple[str | None, str | None]:
+def _extract_js_ts_method_call(node: Any) -> tuple[str | None, str | None]:
     """Extract receiver and method from JS/TS member_expression."""
     method = None
     receiver = None
@@ -121,7 +138,7 @@ def _extract_js_ts_method_call(node) -> tuple[str | None, str | None]:
     return receiver, method
 
 
-def _extract_go_method_call(node) -> tuple[str | None, str | None]:
+def _extract_go_method_call(node: Any) -> tuple[str | None, str | None]:
     """Extract receiver and method from Go selector_expression."""
     method = None
     receiver = None
@@ -134,7 +151,7 @@ def _extract_go_method_call(node) -> tuple[str | None, str | None]:
     return receiver, method
 
 
-def _extract_rust_cpp_method_call(node) -> tuple[str | None, str | None]:
+def _extract_rust_cpp_method_call(node: Any) -> tuple[str | None, str | None]:
     """Extract receiver and method from Rust/C++ field_expression."""
     method = None
     receiver = None
@@ -147,7 +164,7 @@ def _extract_rust_cpp_method_call(node) -> tuple[str | None, str | None]:
     return receiver, method
 
 
-def _extract_fallback_method_call(node) -> tuple[str | None, str | None]:
+def _extract_fallback_method_call(node: Any) -> tuple[str | None, str | None]:
     """Fallback: parse receiver and method from node text."""
     if not node.text:
         return None, None
@@ -175,6 +192,7 @@ DEFINITION_PARENT_TYPES: frozenset[str] = frozenset({
     # Variable definitions (LHS of assignment)
     "assignment", "augmented_assignment", "variable_declarator",
     "short_var_declaration", "let_declaration", "const_declaration",
+    "variable_assignment",  # Bash: MY_VAR="value"
     # Import definitions
     "import_statement", "import_from_statement", "import_declaration",
     "use_declaration", "aliased_import",
@@ -196,13 +214,34 @@ IDENTIFIER_NODE_TYPES: frozenset[str] = frozenset({
     "simple_identifier",    # Kotlin, Swift
     "name",                 # PHP
     "shorthand_property_identifier",  # JS destructuring
+    "variable_name",        # Bash: $VAR references and assignments
 })
+
+# Language keywords/builtins excluded from identifier usage tracking
+# because they are never user-defined names
+_BUILTIN_NAMES: frozenset[str] = frozenset({
+    "self", "this", "super", "cls", "None",
+    "True", "False", "null", "undefined",
+    "true", "false", "nil",
+})
+
+
+@dataclass
+class ExtractionContext:
+    """Shared state for a single file's entity and reference extraction pass."""
+
+    file_path: str
+    lang_name: str
+    source_bytes: bytes
+    seen_entities: set[tuple[str, int]] = field(default_factory=set)
+    body_ranges: dict[tuple[int, int], tuple[int, int]] = field(default_factory=dict)
+    references: list[tuple[int, str, str, str | None]] = field(default_factory=list)
 
 
 class RepoParser:
     """Parses source files using Tree-sitter."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._loader = LanguageLoader()
         self._parsers: dict[str, Any] = {}
         self._queries: dict[str, Any] = {}
@@ -275,47 +314,8 @@ class RepoParser:
         try:
             source_bytes = source_code.encode("utf-8")
             tree = parser.parse(source_bytes)
-
             query = self._queries[lang_name]
-
-            # Try different API methods for compatibility across tree-sitter versions
-            captures_list = []
-            try:
-                # Newer API: query.captures() returns list of (node, capture_name) tuples
-                raw_captures = query.captures(tree.root_node)
-                # Handle different return formats
-                if raw_captures:
-                    if isinstance(raw_captures, dict):
-                        # Some versions return {capture_name: [nodes]}
-                        for capture_name, nodes in raw_captures.items():
-                            if not isinstance(nodes, list):
-                                nodes = [nodes]
-                            for node in nodes:
-                                captures_list.append((node, capture_name))
-                    elif isinstance(raw_captures, list):
-                        if raw_captures and isinstance(raw_captures[0], tuple):
-                            if len(raw_captures[0]) == 2:
-                                # Format: [(node, capture_name), ...]
-                                captures_list = list(raw_captures)
-                            else:
-                                # Format might be [(node, capture_name, extra...), ...]
-                                captures_list = [(item[0], item[1]) for item in raw_captures]
-            except (AttributeError, TypeError):
-                # Fallback: try matches() API
-                try:
-                    matches = query.matches(tree.root_node)
-                    for match in matches:
-                        if isinstance(match, tuple) and len(match) >= 2:
-                            pattern_idx, capture_dict = match[0], match[1]
-                            if isinstance(capture_dict, dict):
-                                for capture_name, nodes in capture_dict.items():
-                                    if not isinstance(nodes, list):
-                                        nodes = [nodes]
-                                    for node in nodes:
-                                        captures_list.append((node, capture_name))
-                except Exception:
-                    pass
-
+            captures_list = self._build_captures_list(query, tree.root_node)
         except Exception as e:
             logger.debug(f"Parse error in {file_path}: {e}")
             return [], []
@@ -323,56 +323,138 @@ class RepoParser:
         if not captures_list:
             return [], []
 
-        entities: list[CodeEntity] = []
-        references: list[tuple[int, str, str, str | None]] = []
-        seen_entities: set[tuple[str, int]] = set()
-        body_ranges: dict[tuple[int, int], tuple[int, int]] = {}
+        return self._extract_entities_and_references(
+            captures_list, file_path, lang_name, source_bytes
+        )
 
-        # First pass: collect body ranges
+    def _build_captures_list(
+        self,
+        query: Any,
+        root_node: Any
+    ) -> list[tuple[Any, str]]:
+        """Build (node, capture_name) tuples from tree-sitter query results.
+
+        Handles different tree-sitter API versions and return formats.
+        """
+        captures_list: list[tuple[Any, str]] = []
+        try:
+            raw_captures = query.captures(root_node)
+            if raw_captures:
+                if isinstance(raw_captures, dict):
+                    for capture_name, nodes in raw_captures.items():
+                        if not isinstance(nodes, list):
+                            nodes = [nodes]
+                        for node in nodes:
+                            captures_list.append((node, capture_name))
+                elif isinstance(raw_captures, list):
+                    if raw_captures and isinstance(raw_captures[0], tuple):
+                        if len(raw_captures[0]) == 2:
+                            captures_list = list(raw_captures)
+                        else:
+                            captures_list = [
+                                (item[0], item[1]) for item in raw_captures
+                            ]
+        except (AttributeError, TypeError):
+            captures_list = self._build_captures_from_matches(query, root_node)
+        return captures_list
+
+    def _build_captures_from_matches(
+        self,
+        query: Any,
+        root_node: Any
+    ) -> list[tuple[Any, str]]:
+        """Fallback: build captures via the matches() API for older tree-sitter."""
+        captures_list: list[tuple[Any, str]] = []
+        try:
+            matches = query.matches(root_node)
+            for match in matches:
+                if isinstance(match, tuple) and len(match) >= 2:
+                    capture_dict = match[1]
+                    if isinstance(capture_dict, dict):
+                        for capture_name, nodes in capture_dict.items():
+                            if not isinstance(nodes, list):
+                                nodes = [nodes]
+                            for node in nodes:
+                                captures_list.append((node, capture_name))
+        except Exception as e:
+            logger.debug("Failed to build captures from matches: %s", e)
+        return captures_list
+
+    def _extract_entities_and_references(
+        self,
+        captures_list: list[tuple[Any, str]],
+        file_path: str,
+        lang_name: str,
+        source_bytes: bytes
+    ) -> tuple[list[CodeEntity], list[tuple[int, str, str, str | None]]]:
+        """Process captured AST nodes into entities and references."""
+        entities: list[CodeEntity] = []
+        ctx = ExtractionContext(
+            file_path=file_path,
+            lang_name=lang_name,
+            source_bytes=source_bytes,
+            body_ranges=self._collect_body_ranges(captures_list),
+        )
+
+        for node, capture_name in captures_list:
+            try:
+                text = node.text.decode("utf-8", errors="replace") if node.text else ""
+
+                if capture_name.startswith("def."):
+                    # Skip variable definitions: local variables create high-degree
+                    # nodes that distort the dependency graph and waste token budget.
+                    if capture_name == "def.variable":
+                        continue
+                    entity = self._extract_entity(node, text, capture_name, ctx)
+                    if entity:
+                        entities.append(entity)
+
+                elif capture_name.startswith("ref."):
+                    self._process_reference(node, text, capture_name, ctx)
+
+            except Exception as e:
+                logger.debug(f"Error processing node in {file_path}: {e}")
+                continue
+
+        return entities, ctx.references
+
+    def _collect_body_ranges(
+        self,
+        captures_list: list[tuple[Any, str]]
+    ) -> dict[tuple[int, int], tuple[int, int]]:
+        """Map definition ranges to their body ranges from captured nodes."""
+        body_ranges: dict[tuple[int, int], tuple[int, int]] = {}
         for node, capture_name in captures_list:
             if capture_name.startswith("body."):
                 parent = node.parent
                 if parent:
                     def_range = (parent.start_point.row, parent.end_point.row)
                     body_ranges[def_range] = (node.start_point.row, node.end_point.row)
+        return body_ranges
 
-        # Second pass: extract entities and references
-        for node, capture_name in captures_list:
-            try:
-                text = node.text.decode("utf-8", errors="replace") if node.text else ""
+    def _process_reference(
+        self,
+        node: Any,
+        text: str,
+        capture_name: str,
+        ctx: ExtractionContext
+    ) -> None:
+        """Process a single ref.* capture into reference tuples."""
+        ref_type = capture_name.split(".")[1]
+        line = node.start_point.row + 1
 
-                if capture_name.startswith("def."):
-                    # FIX: Skip variable definitions.
-                    # Local variables (e.g., 'result', 'data') create high-degree nodes
-                    # that distort the dependency graph and waste token budget.
-                    if capture_name == "def.variable":
-                        continue
+        if ref_type == "method_call":
+            receiver, method = self._extract_method_call_parts(node, ctx.lang_name)
+            if method:
+                ctx.references.append((line, method, "call", receiver))
+        else:
+            ctx.references.append((line, text, ref_type, None))
 
-                    entity = self._extract_entity(
-                        node, text, capture_name,
-                        file_path, lang_name, source_bytes,
-                        seen_entities, body_ranges
-                    )
-                    if entity:
-                        entities.append(entity)
-
-                elif capture_name.startswith("ref."):
-                    ref_type = capture_name.split(".")[1]
-                    line = node.start_point.row + 1
-
-                    # Handle method_call: extract receiver and method name
-                    if ref_type == "method_call":
-                        receiver, method = self._extract_method_call_parts(node, lang_name)
-                        if method:
-                            references.append((line, method, "call", receiver))
-                    else:
-                        references.append((line, text, ref_type, None))
-
-            except Exception as e:
-                logger.debug(f"Error processing node in {file_path}: {e}")
-                continue
-
-        return entities, references
+        # Bash source/. commands are import equivalents
+        if ctx.lang_name == "bash" and ref_type == "call" and text in ("source", "."):
+            import_target = self._extract_bash_source_target(node)
+            if import_target:
+                ctx.references.append((line, import_target, "import", None))
 
     def extract_identifier_usages(
         self,
@@ -409,77 +491,67 @@ class RepoParser:
             logger.debug(f"Parse error in {file_path}: {e}")
             return set()
 
-        used_names: set[str] = set()
+        return self._collect_identifier_usages(tree.root_node, file_path)
 
-        def is_definition_context(node: Any) -> bool:
-            """Check if this identifier is being defined (not used)."""
-            parent = node.parent
-            if not parent:
-                return False
+    @staticmethod
+    def _is_definition_context(node: Any) -> bool:
+        """Check if this identifier is being defined rather than referenced."""
+        parent = node.parent
+        if not parent:
+            return False
 
-            # Direct child of a definition node
-            if parent.type in DEFINITION_PARENT_TYPES:
-                # For assignments, only LHS is definition
-                if parent.type in ("assignment", "augmented_assignment"):
-                    # Check if this is the left side
-                    left = parent.child_by_field_name("left")
-                    if left and node.start_byte >= left.start_byte and node.end_byte <= left.end_byte:
-                        return True
-                    return False
-                return True
-
-            # Function/method name (the identifier being defined)
-            if parent.type in ("function_definition", "function_declaration",
-                              "method_definition", "method_declaration",
-                              "function_item", "class_definition",
-                              "class_declaration", "struct_item", "enum_item",
-                              "trait_item", "interface_declaration"):
-                # Check if this is the 'name' field
-                name_node = parent.child_by_field_name("name")
-                if name_node and node.id == name_node.id:
-                    return True
-
-            # Parameter name
-            if parent.type in ("parameter", "typed_parameter",
-                              "typed_default_parameter", "default_parameter",
-                              "required_parameter"):
-                return True
-
-            # Variable declarator (JS/TS: const x = ...)
-            if parent.type == "variable_declarator":
-                name_node = parent.child_by_field_name("name")
-                if name_node and node.id == name_node.id:
-                    return True
-
-            # For-in loop variable
-            if parent.type in ("for_in_clause", "for_in_statement"):
-                # The loop variable is typically the first identifier
+        if parent.type in DEFINITION_PARENT_TYPES:
+            if parent.type in ("assignment", "augmented_assignment"):
                 left = parent.child_by_field_name("left")
                 if left and node.start_byte >= left.start_byte and node.end_byte <= left.end_byte:
                     return True
+                return False
+            return True
 
-            return False
+        if parent.type in ("function_definition", "function_declaration",
+                          "method_definition", "method_declaration",
+                          "function_item", "class_definition",
+                          "class_declaration", "struct_item", "enum_item",
+                          "trait_item", "interface_declaration"):
+            name_node = parent.child_by_field_name("name")
+            if name_node and node.id == name_node.id:
+                return True
+
+        if parent.type in ("parameter", "typed_parameter",
+                          "typed_default_parameter", "default_parameter",
+                          "required_parameter"):
+            return True
+
+        if parent.type == "variable_declarator":
+            name_node = parent.child_by_field_name("name")
+            if name_node and node.id == name_node.id:
+                return True
+
+        if parent.type in ("for_in_clause", "for_in_statement"):
+            left = parent.child_by_field_name("left")
+            if left and node.start_byte >= left.start_byte and node.end_byte <= left.end_byte:
+                return True
+
+        return False
+
+    def _collect_identifier_usages(
+        self,
+        root_node: Any,
+        file_path: str
+    ) -> set[str]:
+        """Walk AST and collect all non-definition identifier references."""
+        used_names: set[str] = set()
 
         def walk(node: Any) -> None:
-            """Walk AST and collect identifier usages."""
-            # Check if this is an identifier node
-            if node.type in IDENTIFIER_NODE_TYPES:
-                if node.text:
-                    name = node.text.decode("utf-8", errors="replace")
-                    # Skip if in definition context
-                    if not is_definition_context(node):
-                        # Skip common keywords/builtins that aren't user-defined
-                        if name not in ("self", "this", "super", "cls", "None",
-                                       "True", "False", "null", "undefined",
-                                       "true", "false", "nil"):
-                            used_names.add(name)
-
-            # Recurse into children
+            if node.type in IDENTIFIER_NODE_TYPES and node.text:
+                name = node.text.decode("utf-8", errors="replace")
+                if not self._is_definition_context(node) and name not in _BUILTIN_NAMES:
+                    used_names.add(name)
             for child in node.children:
                 walk(child)
 
         try:
-            walk(tree.root_node)
+            walk(root_node)
         except Exception as e:
             logger.debug(f"Error walking AST in {file_path}: {e}")
 
@@ -520,6 +592,26 @@ class RepoParser:
         except Exception as e:
             logger.debug(f"Error extracting method call parts: {e}")
             return None, None
+
+    def _extract_bash_source_target(self, command_name_node: Any) -> str | None:
+        """Extract the file path from a bash source/. command.
+
+        In bash, 'source ./lib.sh' and '. ./lib.sh' load external scripts.
+        The command_name node's parent is the command node; sibling children
+        are the arguments.
+        """
+        try:
+            cmd_node = command_name_node.parent
+            if cmd_node is None:
+                return None
+            for child in cmd_node.children:
+                if child.type != "command_name" and child.is_named:
+                    text = child.text.decode("utf-8", errors="replace") if child.text else ""
+                    if text:
+                        return text.strip("'\"")
+        except Exception as e:
+            logger.debug("Failed to extract bash source target: %s", e)
+        return None
 
     def _has_decorator_or_annotation(self, def_node: Any) -> bool:
         """Detect if a function/method definition has decorators/annotations.
@@ -581,8 +673,7 @@ class RepoParser:
             # (e.g., identifier inside function_declarator inside function_definition)
             body = None
             current = node
-            max_depth = 5  # Prevent infinite loops
-            for _ in range(max_depth):
+            for _ in range(MAX_BODY_SEARCH_DEPTH):
                 body = current.child_by_field_name('body')
                 if body is not None:
                     break
@@ -621,6 +712,14 @@ class RepoParser:
             if stmt_type in STUB_STATEMENT_TYPES:
                 return True
 
+            # Bash: colon (:) is the no-op equivalent of Python's pass
+            if stmt_type == "command":
+                name_node = stmt.child_by_field_name("name")
+                if name_node and name_node.text:
+                    cmd_text = name_node.text.decode("utf-8", errors="replace")
+                    if cmd_text == ":":
+                        return True
+
             # Check for ellipsis (Python: ...)
             if stmt_type == "expression_statement":
                 for child in stmt.children:
@@ -639,7 +738,8 @@ class RepoParser:
             # Other single statements with actual logic = not a stub
             return False
 
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to check stub status: %s", e)
             return False
 
     def _extract_arrow_function_name(self, arrow_node: Any, line: int) -> str:
@@ -679,11 +779,7 @@ class RepoParser:
         node: Any,
         name: str,
         capture_name: str,
-        file_path: str,
-        lang_name: str,
-        source_bytes: bytes,
-        seen: set[tuple[str, int]],
-        body_ranges: dict[tuple[int, int], tuple[int, int]]
+        ctx: ExtractionContext
     ) -> CodeEntity | None:
         """Extract a CodeEntity from an AST node."""
         def_node = node.parent
@@ -702,23 +798,24 @@ class RepoParser:
             arrow_line = node.start_point.row + 1
             name = self._extract_arrow_function_name(node, arrow_line)
 
-        key = (file_path, start_line)
-        if key in seen:
+        key = (ctx.file_path, start_line)
+        if key in ctx.seen_entities:
             return None
-        seen.add(key)
+        ctx.seen_entities.add(key)
 
         try:
-            block_bytes = source_bytes[def_node.start_byte:def_node.end_byte]
+            block_bytes = ctx.source_bytes[def_node.start_byte:def_node.end_byte]
             source = block_bytes.decode("utf-8", errors="replace")
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to extract entity source: %s", e)
             source = ""
 
         def_range = (def_node.start_point.row, def_node.end_point.row)
-        body_range = body_ranges.get(def_range)
+        body_range = ctx.body_ranges.get(def_range)
         body_start = body_range[0] + 1 if body_range else None
         body_end = body_range[1] + 1 if body_range else None
 
-        docstring = self._extract_docstring(def_node, lang_name, source_bytes)
+        docstring = self._extract_docstring(def_node, ctx.lang_name, ctx.source_bytes)
         entity_type = capture_name.split(".")[1]
 
         parent_class = None
@@ -737,15 +834,17 @@ class RepoParser:
         is_stub = False
         is_decorated = False
         if entity_type in ("function", "method"):
-            complexity = self._calculate_cyclomatic_complexity(def_node, lang_name, source_bytes)
+            complexity = self._calculate_cyclomatic_complexity(
+                def_node, ctx.lang_name, ctx.source_bytes
+            )
             is_stub = self._is_stub_node(def_node)
             is_decorated = self._has_decorator_or_annotation(def_node)
 
         return CodeEntity(
             name=name,
             entity_type=entity_type,
-            file_path=file_path,
-            language=lang_name,
+            file_path=ctx.file_path,
+            language=ctx.lang_name,
             line_start=start_line,
             line_end=end_line,
             source_code=source,
@@ -776,16 +875,16 @@ class RepoParser:
                                         text = source_bytes[expr.start_byte:expr.end_byte]
                                         doc = text.decode("utf-8", errors="replace").strip('"\'')
                                         doc = doc.strip('"\'')
-                                        return doc[:500] if len(doc) > 500 else doc
+                                        return doc[:MAX_DOCSTRING_LENGTH] if len(doc) > MAX_DOCSTRING_LENGTH else doc
                         break
-            elif lang_name in ("javascript", "typescript", "java", "cpp", "c"):
+            elif lang_name in ("javascript", "typescript", "java", "cpp", "c", "bash"):
                 prev = node.prev_sibling
                 if prev and prev.type == "comment":
                     text = source_bytes[prev.start_byte:prev.end_byte]
                     doc = text.decode("utf-8", errors="replace")
-                    return doc[:500] if len(doc) > 500 else doc
-        except Exception:
-            pass
+                    return doc[:MAX_DOCSTRING_LENGTH] if len(doc) > MAX_DOCSTRING_LENGTH else doc
+        except Exception as e:
+            logger.debug("Failed to extract docstring: %s", e)
         return None
 
     def _calculate_cyclomatic_complexity(
@@ -826,10 +925,18 @@ class RepoParser:
                             if child.type in ("&&", "||"):
                                 count += 1
                                 break
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Failed to check binary operator: %s", e)
                 else:
                     count += 1
+
+            # Bash list nodes contain command-level && / || that create branching
+            # execution paths (e.g. cmd1 && cmd2 || cmd3).  These are separate from
+            # binary_expression operators inside [[ ]] tests, which are already counted.
+            if node_type == "list" and lang_name == "bash":
+                for child in current_node.children:
+                    if child.type in ("&&", "||"):
+                        count += 1
 
             # Recursively process children
             for child in current_node.children:

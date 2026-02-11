@@ -11,6 +11,8 @@ from .clone_formatter import CloneFormatter
 from .dead_code_formatter import DeadCodeFormatter
 from .directory_tree_formatter import generate_shallow_tree
 from .propagation_formatter import PropagationFormatter
+from .sensitive_value_formatter import SensitiveValueFormatter
+from .tramp_data_formatter import TrampDataFormatter
 from .json_formatter import JSONFormatter
 from .markdown_formatter import MarkdownFormatter
 from .tree_formatter import TreeFormatter
@@ -42,4 +44,6 @@ __all__ = [
     "CloneFormatter",
     "DeadCodeFormatter",
     "PropagationFormatter",
+    "SensitiveValueFormatter",
+    "TrampDataFormatter",
 ]

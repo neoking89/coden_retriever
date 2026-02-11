@@ -38,6 +38,8 @@ pip install 'coden-retriever[dev]'
 | Code map & hotspots | Core | `coden /path --map`, `coden /path -H` |
 | Propagation analysis | Core | `coden /path -P` |
 | Dead code detection | Core | `coden /path -D` |
+| Tramp data detection | Core | `coden /path -T` |
+| Sensitive value detection | Core | `coden /path -S` |
 | Semantic search | `[semantic]` | `coden /path -q "auth" --semantic` |
 | Clone detection (semantic/combined) | `[semantic]` | `coden /path -C` |
 | Echo comment detection | `[semantic]` | `coden /path -E` |
@@ -75,6 +77,12 @@ coden /path/to/repo flag -E --dry-run
 
 # Detect dead code (unused functions with no callers)
 coden /path/to/repo -D --dead-code-threshold 0.5
+
+# Detect tramp data (parameters appearing in many functions)
+coden /path/to/repo -T --min-occurrences 5
+
+# Detect sensitive values (hardcoded secrets, API keys)
+coden /path/to/repo -S --sensitive-threshold 0.5
 ```
 
 <img src="images/readme/coden_stats_reverzed.png" alt="Coden stats output showing directory tree and ranking metrics" width="700">
@@ -120,7 +128,7 @@ Semantic search uses a Model2Vec model distilled from [Qodo-Embed-1-1.5B](https:
 
 ## Supported Languages
 
-**Support:** Python, Go, Rust, Java, C, C++, C#, Kotlin, Swift, Javascript/Typescript, PHP, Scala
+**Support:** Python, Go, Rust, Java, C, C++, C#, Kotlin, Swift, Javascript/Typescript, PHP, Scala, Bash
 
 ## CLI Reference
 
@@ -139,6 +147,10 @@ coden /path/to/repo -P --breakdown           # Architecture health analysis
 coden /path/to/repo -P --critical-paths      # Show high-impact code paths
 coden /path/to/repo -D                       # Detect dead code (no callers)
 coden /path/to/repo -D --dead-code-threshold 0.7  # Stricter detection
+coden /path/to/repo -T                       # Detect tramp data (shared param groups)
+coden /path/to/repo -T --min-occurrences 5   # Tramp data with custom threshold
+coden /path/to/repo -S                       # Detect sensitive values (secrets, keys)
+coden /path/to/repo -S --sensitive-threshold 0.7  # Stricter detection
 coden /path/to/repo --map --show-deps        # Show callers/callees
 coden /path/to/repo --format json            # Output as json/markdown/xml
 coden serve                                  # Start MCP server
@@ -153,7 +165,10 @@ coden flag -E --remove-comments --backup     # Alternative: remove via flag subc
 coden flag -E --include-tests                # Include test files in analysis
 coden flag -D --dry-run                      # Preview dead code flagging
 coden flag -D --remove-dead-code --backup    # Remove dead code functions (DESTRUCTIVE)
-coden flag -HPCED --backup                   # Flag all issues (hotspots, propagation, clones, echoes, dead code)
+coden flag -S --dry-run                      # Preview sensitive value flags
+coden flag -S --replace --backup             # Replace secrets with ***REDACTED***
+coden flag -S --replace "HIDDEN" --backup    # Replace with custom placeholder
+coden flag -HPCETS --backup                  # Flag all issues (hotspots, propagation, clones, echoes, tramp data, sensitive values)
 coden flag clear                             # Remove all [CODEN] comments
 coden reset                                  # Reset everything (destructive!)
 ```
@@ -181,8 +196,11 @@ coden -E --remove-comments --backup  # Remove echo comments directly
 coden flag -C --dry-run              # Preview clone flags
 coden flag -E --dry-run              # Preview echo comment flags
 coden flag -D --dry-run              # Preview dead code flags
+coden flag -T --dry-run              # Preview tramp data flags
+coden flag -S --dry-run              # Preview sensitive value flags
+coden flag -S --replace --backup     # Replace secrets with ***REDACTED***
 coden flag -D --remove-dead-code --backup  # Remove dead code entirely (DESTRUCTIVE)
-coden flag -HPCED --backup           # Flag hotspots, propagation, clones, echoes, dead code
+coden flag -HPCETS --backup          # Flag all analysis types
 coden flag clear                     # Remove all [CODEN] comments
 ```
 
@@ -202,6 +220,8 @@ coden flag clear                     # Remove all [CODEN] comments
 | **Code Clones** | `-C` | `--clone-threshold` | 0.95 | Min semantic similarity for clones (0-1) |
 | **Echo Comments** | `-E` | `--echo-threshold` | 0.85 | Min similarity for echo detection (0-1) |
 | **Dead Code** | `-D` | `--dead-code-threshold` | 0.50 | Min confidence for dead code detection (0-1) |
+| **Tramp Data** | `-T` | `--min-occurrences` | 3 | Min functions a param group must appear in (1+) |
+| **Sensitive Values** | `-S` | `--sensitive-threshold` | 0.35 | Min confidence for secret detection (0-1) |
 
 **Usage notes:**
 - All threshold options work in both direct mode (`coden -H`) and flag mode (`coden flag -H`)
@@ -210,8 +230,10 @@ coden flag clear                     # Remove all [CODEN] comments
 - `-C`: Filters clones with `similarity >= threshold` (0-1 scale)
 - `-E`: Filters echo comments with `similarity >= threshold` (0-1 scale)
 - `-D`: Filters dead code with `confidence >= threshold` (0-1 scale)
+- `-T`: Filters tramp data with `function_count >= threshold` (1+ scale, integer)
+- `-S`: Filters sensitive values with `confidence >= threshold` (0-1 scale)
 
-**Threshold ranges:** `-P`, `-C`, `-E`, `-D` use 0-1 scale. Lower values are more permissive, higher values are stricter. `-H` uses raw risk scores (typically 50-200+).
+**Threshold ranges:** `-P`, `-C`, `-E`, `-D`, `-S` use 0-1 scale. Lower values are more recall (more results), higher values are more precision (fewer, higher-confidence results). `-H` uses raw risk scores (typically 50-200+).
 
 ### Code Clone Detection
 
@@ -314,7 +336,7 @@ coden flag -E --echo-threshold 0.75 --dry-run
 coden flag -E --include-tests --dry-run
 
 # Combine with other analysis types
-coden flag -HPCED --backup  # All analyses at once
+coden flag -HPCETS --backup  # All analyses at once
 
 # Preview only top 10 issues (limit only works in dry-run mode)
 coden flag -H --dry-run -n 10
@@ -381,6 +403,121 @@ coden flag -D --remove-dead-code --backup
 - **`--remove-dead-code`**: Delete functions instead of flagging (use with `--backup`)
 
 Automatically skipped: dunder methods (`__init__`), runtime-called functions (`init()`, `constructor`), test functions, and trivial functions (<3 lines).
+
+### Tramp Data Detection
+
+> **Note:** Tramp data detection is part of the core package (no extra required).
+
+Tramp data detection identifies parameter groups that travel together across many functions, revealing a common anti-pattern where multiple related parameters are passed individually instead of being bundled into a configuration object.
+
+For example, if you see `(host, port, timeout)` appearing together in 15 different functions, that's tramp data. The ideal refactor would be a `ConnectionConfig` object.
+
+#### What Tramp Data Is
+
+**Anti-pattern (bad)**: Parameters scattered across many functions:
+```python
+def connect(host, port, timeout):
+    ...
+
+def send_data(host, port, timeout, data):
+    ...
+
+def receive(host, port, timeout):
+    ...
+
+# (host, port, timeout) appears in 15 functions total!
+```
+
+**Better**: Grouped into a configuration object:
+```python
+@dataclass
+class ConnectionConfig:
+    host: str
+    port: int
+    timeout: float
+
+def connect(config: ConnectionConfig):
+    ...
+
+def send_data(config: ConnectionConfig, data):
+    ...
+
+def receive(config: ConnectionConfig):
+    ...
+```
+
+#### Usage Examples
+
+```bash
+# Basic detection (default: groups appearing in 3+ functions)
+coden /path/to/repo -T
+
+# Stricter (only groups appearing in 5+ functions)
+coden /path/to/repo -T --min-occurrences 5
+
+# Require larger groups (minimum 3 parameters per group)
+coden /path/to/repo -T --min-group-size 3
+
+# Limit output to top 30 results
+coden /path/to/repo -T -n 30
+
+# Flag tramp data in code with [CODEN] comments
+coden flag -T --dry-run
+coden flag -T --backup
+```
+
+#### Algorithm
+
+Tramp data detection uses:
+1. **Frequent pair mining**: Identify which parameter pairs occur together most often across functions
+2. **Greedy group expansion**: Merge pairs into larger groups based on co-occurrence patterns
+3. **Scoring**: Rank groups by `group_size * function_count` (larger groups appearing in more functions score higher)
+4. **Subset suppression**: Avoid duplicate reporting of parameter combinations
+
+#### Options
+
+- **`--min-occurrences`**: Minimum function count for a parameter group (default: 3, range: 1+)
+- **`--min-group-size`**: Minimum parameters in a group (default: 2, range: 1+)
+- **`-n/--limit`**: Maximum results to display (default: 20, use `-1` for all)
+
+#### Output Format
+
+Tramp data output shows:
+- **Parameter Group**: The co-occurring parameters (comma-separated, truncated if >4 params)
+- **Functions**: Count of functions containing this group
+- **Severity**: Color-coded by frequency (HIGH: 20+, MODERATE: 10-19, LOW: 5-9)
+- **Sample Functions**: Up to 3 example functions where the group appears
+
+### Sensitive Value Detection
+
+Sensitive value detection finds hardcoded secrets, API keys, credentials, and other sensitive strings in your codebase using an ML classifier trained on entropy, character patterns, and known secret prefixes.
+
+#### Usage Examples
+
+```bash
+# Basic detection (default 35% confidence threshold)
+coden /path/to/repo -S
+
+# Stricter (only high-confidence secrets)
+coden /path/to/repo -S --sensitive-threshold 0.7
+
+# Preview what would be flagged
+coden flag -S --dry-run
+
+# Flag with [CODEN] comments
+coden flag -S --backup
+
+# Replace secrets with ***REDACTED*** (or custom placeholder)
+coden flag -S --replace --backup
+coden flag -S --replace "HIDDEN" --backup
+```
+
+#### Options
+
+- **`--sensitive-threshold`**: Minimum confidence (0.0-1.0, default: 0.35). Lower = more recall, higher = more precision.
+- **`--replace`**: Replace detected secrets in source code. Without a value, uses `***REDACTED***`. Accepts a custom placeholder.
+- **`--include-tests`**: Include test files in analysis (default: excluded).
+- **`-n/--limit`**: Maximum results to display (default: 20, use `-1` for all).
 
 ## Caching
 
@@ -571,6 +708,8 @@ Reload VS Code (Ctrl+Shift+P -> "Developer: Reload Window").
 - **clone_detection** - Find duplicate functions (combined/semantic/syntactic modes). CLI: `-C`
 - **propagation_cost** - Measure architecture health based on coupling. CLI: `-P`
 - **detect_dead_code** - Find unused functions with no callers. CLI: `-D`
+- **detect_tramp_data** - Identify parameter groups shared across many functions. CLI: `-T`
+- **detect_sensitive_values** - Find hardcoded secrets, API keys, and credentials. CLI: `-S`
 
 **Graph Analysis**
 - **change_impact_radius** - Blast radius analysis ("if I change this, what breaks?").

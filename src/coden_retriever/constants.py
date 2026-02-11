@@ -98,6 +98,91 @@ DEAD_CODE_METHOD_PENALTY = 0.20
 DEAD_CODE_ENTRY_POINT_PENALTY = 0.50
 
 # =============================================================================
+# Tramp Data Detection Thresholds
+# =============================================================================
+
+# Default minimum functions a param must appear in to be flagged
+# 3 is the minimum meaningful threshold: appearing in 1-2 functions is normal
+TRAMP_DATA_DEFAULT_MIN_OCCURRENCES = 3
+
+# Minimum parameters in a group to report (a single param is not a group)
+# 2 is the minimum: pairs like (host, port) are the smallest meaningful group
+TRAMP_DATA_MIN_GROUP_SIZE = 2
+
+# 20+ functions: param is passed everywhere -- strong refactoring signal
+TRAMP_DATA_TIER_HIGH = 20
+# 10+ functions: param crosses many boundaries -- worth investigating
+TRAMP_DATA_TIER_MODERATE = 10
+# 5+ functions: mild tramp data pattern -- may be intentional
+TRAMP_DATA_TIER_LOW = 5
+
+# Max functions to display per parameter in CLI card view
+# 3 functions shown vertically per card; gives a clear sample without overwhelming output
+TRAMP_DATA_MAX_FUNCTIONS_DISPLAY = 3
+
+# Default result limit for MCP and CLI
+# 50 results provide comprehensive overview without overwhelming LLM context windows or terminal output
+TRAMP_DATA_DEFAULT_RESULT_LIMIT = 50
+
+# Max results allowed in MCP context
+# 500 is upper bound to prevent memory issues and token budget exhaustion in LLM interactions
+TRAMP_DATA_MAX_RESULTS = 500
+
+# =============================================================================
+# Sensitive Value Detection Thresholds
+# =============================================================================
+
+# Best F1 (91.3%) from Leave-One-Out CV on 99-sample golden set
+SENSITIVE_VALUE_DEFAULT_THRESHOLD = 0.35
+
+# Default replacement text when redacting detected secrets
+SENSITIVE_VALUE_DEFAULT_REPLACE = "***REDACTED***"
+
+# Color tier boundaries for CLI display (confidence-based)
+SENSITIVE_VALUE_TIER_HIGH = 0.80
+SENSITIVE_VALUE_TIER_MODERATE = 0.50
+
+# CLI result limits matching tramp data pattern
+SENSITIVE_VALUE_DEFAULT_LIMIT = 50
+SENSITIVE_VALUE_MAX_RESULTS = 500
+
+# String length bounds for analysis (skip trivially short/long strings)
+SENSITIVE_VALUE_MIN_STRING_LENGTH = 8
+SENSITIVE_VALUE_MAX_STRING_LENGTH = 500
+
+# Minimum lengths for hex/base64 heuristic checks
+# 16 chars = 8 bytes hex-encoded, common for hashes/tokens
+SENSITIVE_VALUE_MIN_HEX_LENGTH = 16
+# 8 chars minimum to avoid false positives on short encoded strings
+SENSITIVE_VALUE_MIN_BASE64_LENGTH = 8
+
+# AST traversal depth for finding variable assignments
+# 5 levels covers typical nesting: assignment -> expr_stmt -> block -> function -> class
+SENSITIVE_VALUE_AST_MAX_DEPTH = 5
+
+# String value preview truncation lengths for display
+# 40 chars shows enough context without wrapping in most terminals
+SENSITIVE_VALUE_PREVIEW_LENGTH = 40
+# 28 chars fits the formatter table column width
+SENSITIVE_VALUE_TABLE_DISPLAY_LENGTH = 28
+
+# Base64 padding characters for validation
+# Standard base64 uses "=" for padding to align to 4-byte boundaries
+SENSITIVE_VALUE_BASE64_PADDING = "=="
+
+# Formatter table dimensions (matching hotspots style for consistency)
+# 110 chars matches the standard hotspot/dead-code table width
+SENSITIVE_VALUE_TABLE_WIDTH = 110
+# 30 chars for value preview column allows readable context
+SENSITIVE_VALUE_VALUE_COLUMN_WIDTH = 30
+
+# Logistic Regression classifier hyperparameters
+# 1000 iterations ensures convergence on 99-sample training set
+SENSITIVE_VALUE_CLASSIFIER_MAX_ITER = 1000
+# C=1.0 provides balanced L2 regularization (sklearn default)
+SENSITIVE_VALUE_CLASSIFIER_REGULARIZATION = 1.0
+
+# =============================================================================
 # Flag Insertion Constants
 # =============================================================================
 # Used by flag_code() to set default analysis limits

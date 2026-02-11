@@ -30,8 +30,10 @@ from .protocol import (
     Request,
     Response,
     SearchParams,
+    SensitiveValueParams,
     StacktraceParams,
     TraceDependencyParams,
+    TrampDataParams,
 )
 from .server import get_log_file, is_daemon_running, get_pid_file
 
@@ -244,6 +246,16 @@ class DaemonClient:
     def detect_dead_code(self, params: DeadCodeParams) -> dict:
         """Detect potentially dead code using in-memory indices."""
         response = self._send_request("detect_dead_code", params.to_dict())
+        return self._validate_result(response.result)
+
+    def detect_tramp_data(self, params: TrampDataParams) -> dict:
+        """Detect tramp data using in-memory indices."""
+        response = self._send_request("detect_tramp_data", params.to_dict())
+        return self._validate_result(response.result)
+
+    def detect_sensitive_values(self, params: SensitiveValueParams) -> dict:
+        """Detect sensitive values using in-memory indices."""
+        response = self._send_request("detect_sensitive_values", params.to_dict())
         return self._validate_result(response.result)
 
 
@@ -517,6 +529,46 @@ def try_daemon_dead_code(
         Dead code detection result dict, or None if daemon unavailable
     """
     return _try_daemon_request("detect_dead_code", params, host, port, auto_start)
+
+
+def try_daemon_tramp_data(
+    params: TrampDataParams,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
+    auto_start: bool = True,
+) -> dict | None:
+    """Try to detect tramp data via daemon, auto-starting if needed.
+
+    Args:
+        params: TrampDataParams with source_dir and options
+        host: Daemon host
+        port: Daemon port
+        auto_start: Auto-start daemon if not running (default: True)
+
+    Returns:
+        Tramp data detection result dict, or None if daemon unavailable
+    """
+    return _try_daemon_request("detect_tramp_data", params, host, port, auto_start)
+
+
+def try_daemon_sensitive_values(
+    params: SensitiveValueParams,
+    host: str = DEFAULT_DAEMON_HOST,
+    port: int = DEFAULT_DAEMON_PORT,
+    auto_start: bool = True,
+) -> dict | None:
+    """Try to detect sensitive values via daemon, auto-starting if needed.
+
+    Args:
+        params: SensitiveValueParams with source_dir and options
+        host: Daemon host
+        port: Daemon port
+        auto_start: Auto-start daemon if not running (default: True)
+
+    Returns:
+        Sensitive value detection result dict, or None if daemon unavailable
+    """
+    return _try_daemon_request("detect_sensitive_values", params, host, port, auto_start)
 
 
 def stop_daemon(host: str = DEFAULT_DAEMON_HOST, port: int = DEFAULT_DAEMON_PORT) -> bool:

@@ -354,33 +354,26 @@ class CodeEntity:
 
     @property
     def is_test(self) -> bool:
-        """Check if this is a test function/file."""
+        """Check if this is a test function/file.
+
+        Uses only reliable name-based patterns to avoid false positives from
+        absolute paths containing 'test' (e.g., /users/bob/test/myproject/).
+        """
         name_lower = self.name.lower()
 
-        # Check function/class name patterns
+        # Check function/class name patterns (e.g., test_foo, FooTest)
         if (name_lower.startswith("test") or
             name_lower.endswith("test") or
             name_lower.startswith("spec") or
             name_lower.endswith("spec")):
             return True
 
-        # Check filename patterns (not full path to avoid matching dirs like "test_projects")
+        # Check filename patterns (e.g., test_foo.py, foo_test.py)
         filename = Path(self.file_path).name.lower()
         if (filename.startswith("test_") or
             filename.endswith("_test.py") or
             filename.endswith("_spec.py") or
             filename.startswith("spec_")):
-            return True
-
-        # Check for test directories in path (use path separators to be precise)
-        # Exclude "fixtures/" subdirectories which contain sample code, not tests
-        path_lower = self.file_path.lower().replace("\\", "/")
-        if "/fixtures/" in path_lower:
-            return False
-        if ("/tests/" in path_lower or
-            "/test/" in path_lower or
-            "/spec/" in path_lower or
-            "/__tests__/" in path_lower):
             return True
 
         return False

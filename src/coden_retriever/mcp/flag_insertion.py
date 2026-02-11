@@ -16,7 +16,14 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 from pydantic import Field
 
-from ..constants import FLAG_ANALYSIS_LIMIT, FLAG_MIN_LINES
+from ..constants import (
+    FLAG_ANALYSIS_LIMIT,
+    FLAG_MIN_LINES,
+    SENSITIVE_VALUE_DEFAULT_THRESHOLD,
+    TRAMP_DATA_DEFAULT_MIN_OCCURRENCES,
+    TRAMP_DATA_MIN_GROUP_SIZE,
+)
+from ..daemon.protocol import FlagParams
 from ..graph_utils import compute_coupling_hotspots
 from ..language.definitions import LANGUAGE_MAP
 
@@ -574,6 +581,144 @@ def _collect_dead_code_items(
     return items
 
 
+def _collect_tramp_data_items(
+    entities: dict[str, "CodeEntity"],
+    min_occurrences: int,
+    exclude_tests: bool,
+    min_group_size: int,
+) -> list[dict]:
+    """Collect flaggable items from tramp data detection."""
+    from ..tramp_data.detector import detect_tramp_data
+
+    items = []
+    result = detect_tramp_data(
+        entities=entities,
+        min_occurrences=min_occurrences,
+        exclude_tests=exclude_tests,
+        limit=FLAG_ANALYSIS_LIMIT,
+        min_group_size=min_group_size,
+    )
+
+    for group in result.get("tramp_data", []):
+        param_group = group.get("group", [])
+        occurrences = group.get("count", 0)
+        for func in group.get("functions", []):
+            items.append({
+                "type": "tramp_data",
+                "file": func.get("file"),
+                "line": func.get("line"),
+                "name": func.get("name"),
+                "group": param_group,
+                "occurrences": occurrences,
+            })
+    return items
+
+
+def _generate_tramp_data_comment(item: dict, comment_prefix: str) -> list[str]:
+    """Generate comment lines for a tramp data flag."""
+    group = item.get("group", [])
+    occurrences = item.get("occurrences", 0)
+    group_str = ", ".join(group)
+
+    lines = [
+        f"{comment_prefix} {CODEN_MARKER} TRAMP_DATA: Params ({group_str}) appear together in {occurrences} functions",
+        f"{comment_prefix} {CODEN_MARKER} Consider grouping into a config/data object to reduce parameter passing.",
+    ]
+    return lines
+
+
+def _collect_sensitive_value_items(
+    entities: dict[str, "CodeEntity"],
+    threshold: float,
+    exclude_tests: bool,
+    replace_value: str | None,
+) -> list[dict]:
+    """Collect flaggable items from sensitive value detection."""
+    from ..sensitive_values.detector import detect_sensitive_values
+
+    result = detect_sensitive_values(
+        entities=entities,
+        confidence_threshold=threshold,
+        exclude_tests=exclude_tests,
+        limit=FLAG_ANALYSIS_LIMIT,
+        replace_value=replace_value,
+    )
+
+    items = []
+    for sv in result.get("sensitive_values", []):
+        item_type = "sensitive_value_replace" if replace_value else "sensitive_value"
+        items.append({
+            "type": item_type,
+            "file": sv.get("file"),
+            "line": sv.get("line"),
+            "name": sv.get("name"),
+            "confidence": sv.get("confidence", 0),
+            "value_preview": sv.get("value_preview", ""),
+            "original_value": sv.get("original_value", ""),
+            "variable_name": sv.get("variable_name"),
+            "replace_value": replace_value,
+        })
+    return items
+
+
+def _generate_sensitive_value_comment(item: dict, comment_prefix: str) -> list[str]:
+    """Generate comment lines for a sensitive value flag."""
+    confidence = item.get("confidence", 0) * 100
+    preview = item.get("value_preview", "???")
+    var_name = item.get("variable_name") or "unknown"
+
+    lines = [
+        f'{comment_prefix} {CODEN_MARKER} SENSITIVE_VALUE: {confidence:.0f}% confidence | var: {var_name} | "{preview}"',
+        f"{comment_prefix} {CODEN_MARKER} Potential hardcoded secret. Move to environment variable or secrets manager.",
+    ]
+    return lines
+
+
+def _replace_string_literal_in_line(
+    lines: list[str],
+    target_line: int,
+    original: str,
+    replacement: str,
+) -> list[str]:
+    """Replace a string literal value in the target line.
+
+    Args:
+        lines: List of file lines
+        target_line: 1-based line number
+        original: Original string value (unquoted)
+        replacement: Replacement string value (unquoted)
+
+    Returns:
+        Modified lines with the replacement applied
+
+    Note:
+        This handles quoted strings by trying multiple quote styles.
+        For example, if original="secret", it will try replacing "secret", 'secret', etc.
+    """
+    if target_line <= 0 or target_line > len(lines):
+        return lines
+
+    idx = target_line - 1
+    line = lines[idx]
+
+    # Try different quote styles to match how the string appears in code
+    # Priority order: double quotes (most common), single quotes, backticks (JS/TS)
+    quote_styles = ['"', "'", '`']
+    for quote in quote_styles:
+        quoted_original = f"{quote}{original}{quote}"
+        if quoted_original in line:
+            quoted_replacement = f"{quote}{replacement}{quote}"
+            new_line = line.replace(quoted_original, quoted_replacement, 1)
+            return lines[:idx] + [new_line] + lines[idx + 1:]
+
+    # Fallback: if no quoted version found, try unquoted (edge case for unusual syntax)
+    if original in line:
+        new_line = line.replace(original, replacement, 1)
+        return lines[:idx] + [new_line] + lines[idx + 1:]
+
+    return lines
+
+
 def _apply_flag_to_item(
     modified_lines: list[str],
     item: dict,
@@ -584,7 +729,7 @@ def _apply_flag_to_item(
     """Apply a single flag to modified_lines. Returns (new_lines, was_flagged)."""
     item_type: str | None = item.get("type")
 
-    # Handle removal types first
+    # Handle removal/replacement types first
     if item_type == "echo_remove":
         new_lines = _remove_echo_comment_at_line(modified_lines, target_line, comment_prefix)
         return new_lines, True
@@ -592,6 +737,15 @@ def _apply_flag_to_item(
         end_line = item.get("end_line", target_line)
         new_lines = _remove_dead_code_function(modified_lines, target_line, end_line, language)
         return new_lines, True
+    if item_type == "sensitive_value_replace":
+        original = item.get("original_value", "")
+        replacement = item.get("replace_value", "")
+        if original and replacement:
+            new_lines = _replace_string_literal_in_line(
+                modified_lines, target_line, original, replacement,
+            )
+            return new_lines, True
+        return modified_lines, False
 
     # Generate comment based on type
     if not item_type:
@@ -603,6 +757,8 @@ def _apply_flag_to_item(
         "clone": _generate_clone_comment,
         "echo": _generate_echo_comment,
         "dead_code": _generate_dead_code_comment,
+        "tramp_data": _generate_tramp_data_comment,
+        "sensitive_value": _generate_sensitive_value_comment,
     }
     generator = comment_generators.get(item_type)
     if not generator:
@@ -729,33 +885,72 @@ def _build_flag_summary(items: list[dict]) -> dict[str, int]:
         "clones": type_counts.get("clone", 0),
         "dead_code": type_counts.get("dead_code", 0) + type_counts.get("dead_code_remove", 0),
         "echo_comments": type_counts.get("echo", 0) + type_counts.get("echo_remove", 0),
+        "tramp_data": type_counts.get("tramp_data", 0),
+        "sensitive_values": (
+            type_counts.get("sensitive_value", 0)
+            + type_counts.get("sensitive_value_replace", 0)
+        ),
     }
+
+
+def _collect_all_flaggable_items(
+    entities: dict[str, "CodeEntity"],
+    graph: "nx.DiGraph",
+    pagerank: dict[str, float],
+    params: FlagParams,
+) -> list[dict] | dict[str, Any]:
+    """Collect flaggable items from all enabled analysis types.
+
+    Returns a list of items on success, or an error dict if no flags are selected.
+    """
+    if error := params.validate():
+        return {
+            "error": error,
+            "flagged_count": 0,
+            "files_modified": 0,
+        }
+
+    items: list[dict] = []
+
+    if params.hotspots:
+        items.extend(_collect_hotspot_items(
+            graph, entities, pagerank, params.risk_threshold, params.exclude_tests,
+        ))
+    if params.propagation:
+        items.extend(_collect_propagation_items(
+            graph, entities, params.propagation_threshold, params.exclude_tests,
+        ))
+    if params.clones:
+        items.extend(_collect_clone_items(
+            entities, params.clone_threshold, params.clone_mode,
+            params.line_threshold, params.func_threshold, params.exclude_tests,
+        ))
+    if params.echo_comments:
+        items.extend(_collect_echo_items(
+            entities, params.echo_threshold, params.exclude_tests, params.remove_comments,
+        ))
+    if params.dead_code:
+        items.extend(_collect_dead_code_items(
+            entities, graph, params.dead_code_threshold,
+            params.exclude_tests, params.remove_dead_code,
+        ))
+    if params.tramp_data:
+        items.extend(_collect_tramp_data_items(
+            entities, params.min_occurrences, params.exclude_tests, params.min_group_size,
+        ))
+    if params.sensitive_values:
+        items.extend(_collect_sensitive_value_items(
+            entities, params.sensitive_threshold, params.exclude_tests, params.replace_value,
+        ))
+
+    return items
 
 
 def flag_code(
     entities: dict[str, "CodeEntity"],
     graph: "nx.DiGraph",
     pagerank: dict[str, float],
-    source_dir: str,
-    hotspots: bool = False,
-    propagation: bool = False,
-    clones: bool = False,
-    echo_comments: bool = False,
-    dead_code: bool = False,
-    risk_threshold: float = 50.0,
-    propagation_threshold: float = 0.25,
-    clone_threshold: float = 0.95,
-    echo_threshold: float = 0.85,
-    dead_code_threshold: float = 0.5,
-    clone_mode: str = "combined",
-    line_threshold: float = 0.70,
-    func_threshold: float = 0.50,
-    dry_run: bool = False,
-    backup: bool = False,
-    verbose: bool = False,
-    exclude_tests: bool = True,
-    remove_comments: bool = False,
-    remove_dead_code: bool = False,
+    params: FlagParams,
 ) -> dict[str, Any]:
     """Flag code objects with [CODEN] comments based on analysis.
 
@@ -763,76 +958,32 @@ def flag_code(
         entities: Dict of entity_id -> CodeEntity
         graph: Call graph (nx.DiGraph)
         pagerank: PageRank scores for entities
-        source_dir: Root directory of the codebase
-        hotspots: Flag hotspots from coupling analysis
-        propagation: Flag high propagation cost functions
-        clones: Flag detected code clones
-        echo_comments: Flag echo comments (redundant comments)
-        dead_code: Flag dead code (uncalled functions)
-        risk_threshold: Min risk score for hotspot flagging (raw score, typically 50-200+)
-        propagation_threshold: Min propagation cost % for flagging
-        clone_threshold: Min similarity for clone flagging (0-1)
-        echo_threshold: Min similarity for echo detection (0-1)
-        dead_code_threshold: Min confidence for dead code flagging (0-1)
-        dry_run: Preview changes without modifying files
-        backup: Create .coden-backup files before modifying
-        verbose: Show detailed output
-        exclude_tests: Exclude test files from flagging
-        remove_comments: Remove echo comments directly (no markers)
-        remove_dead_code: Remove dead code functions directly (destructive)
+        params: Configuration for which analyses to run and their thresholds
 
     Returns:
         Dict with flagged_count, files_modified, items (list of flagged items)
     """
-    if not (hotspots or propagation or clones or echo_comments or dead_code):
-        return {
-            "error": "At least one analysis flag (-H, -P, -C, -E, or -D) is required",
-            "flagged_count": 0,
-            "files_modified": 0,
-        }
+    result = _collect_all_flaggable_items(entities, graph, pagerank, params)
+    if isinstance(result, dict):
+        return result
 
-    flaggable_items: list[dict] = []
+    flaggable_items: list[dict] = result
 
-    # Collect items from each analysis type using helper functions
-    if hotspots:
-        flaggable_items.extend(_collect_hotspot_items(
-            graph, entities, pagerank, risk_threshold, exclude_tests
-        ))
-
-    if propagation:
-        flaggable_items.extend(_collect_propagation_items(
-            graph, entities, propagation_threshold, exclude_tests
-        ))
-
-    if clones:
-        flaggable_items.extend(_collect_clone_items(
-            entities, clone_threshold, clone_mode, line_threshold, func_threshold, exclude_tests
-        ))
-
-    if echo_comments:
-        flaggable_items.extend(_collect_echo_items(
-            entities, echo_threshold, exclude_tests, remove_comments
-        ))
-
-    if dead_code:
-        flaggable_items.extend(_collect_dead_code_items(
-            entities, graph, dead_code_threshold, exclude_tests, remove_dead_code
-        ))
-
-    # Group items by file and apply flags
     by_file = _group_items_by_file(flaggable_items)
     files_modified = 0
     total_flagged = 0
 
     for file_path, items in by_file.items():
-        modified, flagged = _process_flagged_file(file_path, items, dry_run, backup)
+        modified, flagged = _process_flagged_file(
+            file_path, items, params.dry_run, params.backup,
+        )
         files_modified += modified
         total_flagged += flagged
 
     return {
         "flagged_count": total_flagged,
         "files_modified": files_modified,
-        "dry_run": dry_run,
+        "dry_run": params.dry_run,
         "items": flaggable_items,
         "summary": _build_flag_summary(flaggable_items),
     }
@@ -1002,20 +1153,7 @@ def register_flag_tools(mcp, disabled_tools: set[str] | None = None) -> None:
                     entities=indices.entities,
                     graph=indices.graph,
                     pagerank=indices.pagerank,
-                    source_dir=root_directory,
-                    hotspots=hotspots,
-                    propagation=propagation,
-                    clones=clones,
-                    echo_comments=echo_comments,
-                    risk_threshold=risk_threshold,
-                    propagation_threshold=propagation_threshold,
-                    clone_threshold=clone_threshold,
-                    echo_threshold=echo_threshold,
-                    dry_run=dry_run,
-                    backup=False,
-                    verbose=False,
-                    exclude_tests=True,
-                    remove_comments=remove_comments,
+                    params=params,
                 )
 
             return await asyncio.to_thread(_run_direct)

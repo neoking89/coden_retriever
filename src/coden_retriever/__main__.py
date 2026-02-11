@@ -11,9 +11,12 @@ import traceback
 from pathlib import Path
 import io
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, TYPE_CHECKING
 
 from .utils.optional_deps import MissingDependencyError, require_feature
+
+if TYPE_CHECKING:
+    from .formatters.flag_formatter import FlagFormatter
 
 
 def _get_asyncio():
@@ -82,6 +85,15 @@ THRESHOLD_CONFIGS = {
         short_help="Dead code confidence threshold (0.0-1.0)",
         detailed_help="Dead Code (-D): min confidence score for flagging. Range: 0-1. Default: 0.5 (medium confidence)",
         example_value=0.7,
+    ),
+    "sensitive_value": ThresholdConfig(
+        name="sensitive-threshold",
+        default=0.35,
+        analysis_flag="-S",
+        analysis_name="Sensitive Values",
+        short_help="Sensitive value confidence threshold (0.0-1.0)",
+        detailed_help="Sensitive Values (-S): min confidence for flagging. Range: 0-1. Default: 0.35. Lower = more recall, higher = more precision",
+        example_value=0.50,
     ),
 }
 
@@ -162,6 +174,8 @@ from .daemon.client import (
     try_daemon_clones,
     try_daemon_dead_code,
     try_daemon_propagation_cost,
+    try_daemon_sensitive_values,
+    try_daemon_tramp_data,
     try_daemon_flag,
     try_daemon_flag_clear,
 )
@@ -175,11 +189,15 @@ from .daemon.protocol import (
     GraphAnalysisParams,
     PropagationCostParams,
     SearchParams,
+    SensitiveValueParams,
+    TrampDataParams,
 )
 from .daemon.server import get_log_file, is_daemon_running, run_daemon
-from .formatters import CloneFormatter, DeadCodeFormatter, PropagationFormatter
+from .formatters import CloneFormatter, DeadCodeFormatter, PropagationFormatter, SensitiveValueFormatter, TrampDataFormatter
 from .formatters.cli_metrics import FALSE_POSITIVE_WARNING
 from .formatters.dead_code_formatter import format_dead_code_parameters_header
+from .formatters.sensitive_value_formatter import format_sensitive_value_parameters_header
+from .formatters.tramp_data_formatter import format_tramp_data_parameters_header
 from .formatters.flag_formatter import FlagFormatter
 from .formatters.terminal_style import get_terminal_style
 from .pipeline import SearchConfig, SearchPipeline
@@ -756,9 +774,10 @@ def handle_propagation_command(args: argparse.Namespace, root_path: Path, config
 
     # Print parameter header before results
     from .formatters.propagation_formatter import format_propagation_parameters_header
+    exclude_tests = not getattr(args, 'include_tests', False)
     header = format_propagation_parameters_header(
         propagation_threshold=args.propagation_threshold,
-        exclude_tests=True,
+        exclude_tests=exclude_tests,
         limit=args.limit,
     )
     print(header)
@@ -768,7 +787,7 @@ def handle_propagation_command(args: argparse.Namespace, root_path: Path, config
         source_dir=str(root_path),
         include_breakdown=args.breakdown,
         show_critical_paths=args.critical_paths,
-        exclude_tests=True,
+        exclude_tests=exclude_tests,
         token_limit=args.tokens,  # None = no limit for CLI
     )
 
@@ -799,7 +818,7 @@ def handle_propagation_command(args: argparse.Namespace, root_path: Path, config
             root_directory=str(root_path),
             include_breakdown=args.breakdown,
             show_critical_paths=args.critical_paths,
-            exclude_tests=True,
+            exclude_tests=exclude_tests,
             token_limit=args.tokens,  # None = no limit for CLI
         ))
 
@@ -849,12 +868,8 @@ def _print_flag_output(formatted_output: str, stats_output: str | None, reverse:
         print(formatted_output)
 
 
-def handle_flag_command(args: argparse.Namespace, root_path: Path, config) -> int:
-    """Handle flag command to insert [CODEN] comments."""
-    args.limit = normalize_limit(args.limit)
-    start_time = time.time()
-    formatter = FlagFormatter()
-
+def _validate_flag_args(args: argparse.Namespace, root_path: Path) -> int:
+    """Validate flag command arguments. Returns 0 on success, 1 on error."""
     if not root_path.exists():
         print(f"Error: Path does not exist: {root_path}", file=sys.stderr)
         return 1
@@ -862,12 +877,22 @@ def handle_flag_command(args: argparse.Namespace, root_path: Path, config) -> in
         print(f"Error: Path is not a directory: {root_path}", file=sys.stderr)
         return 1
 
-    # Check if at least one analysis type is selected
-    if not (args.hotspots or args.propagation or args.clones or args.echo_comments or args.dead_code):
-        print("Error: At least one analysis flag (-H, -P, -C, -E, or -D) is required.", file=sys.stderr)
+    # Create temporary params to validate flags
+    from .daemon.protocol import FlagParams
+    temp_params = FlagParams(
+        source_dir=str(root_path),
+        hotspots=args.hotspots,
+        propagation=args.propagation,
+        clones=args.clones,
+        echo_comments=args.echo_comments,
+        dead_code=args.dead_code,
+        tramp_data=args.tramp_data,
+        sensitive_values=args.sensitive_values,
+    )
+    if error := temp_params.validate():
+        print(f"Error: {error}", file=sys.stderr)
         return 1
 
-    # Echo comments and clone detection (except syntactic-only) require semantic feature
     clone_mode = _get_clone_mode(args)
     needs_semantic = args.echo_comments or (args.clones and clone_mode in ("semantic", "combined"))
     if needs_semantic:
@@ -877,22 +902,116 @@ def handle_flag_command(args: argparse.Namespace, root_path: Path, config) -> in
             print(str(e), file=sys.stderr)
             return 1
 
-    # Determine active flags for parameter header
-    active_flags = []
-    if args.hotspots:
-        active_flags.append("-H")
-    if args.propagation:
-        active_flags.append("-P")
-    if args.clones:
-        active_flags.append("-C")
-    if args.echo_comments:
-        active_flags.append("-E")
-    if args.dead_code:
-        active_flags.append("-D")
+    return 0
 
-    # Print parameter header
+
+# Centralized flag mapping enables consistent validation and formatting
+# Prevents string literal duplication across codebase
+_FLAG_ATTR_TO_SHORT: list[tuple[str, str]] = [
+    ("hotspots", "-H"),
+    ("propagation", "-P"),
+    ("clones", "-C"),
+    ("echo_comments", "-E"),
+    ("dead_code", "-D"),
+    ("tramp_data", "-T"),
+    ("sensitive_values", "-S"),
+]
+
+# Syntactic clone detection thresholds
+# Line threshold: Jaccard similarity for line-level matching (higher = stricter)
+# Based on empirical testing to balance precision (avoid false positives) vs recall (catch real clones)
+DEFAULT_SYNTACTIC_LINE_THRESHOLD = 0.70
+
+# Function threshold: Percentage of lines that must match (lower = more lenient)
+# Allows for some structural variation while catching meaningful clones
+DEFAULT_SYNTACTIC_FUNC_THRESHOLD = 0.50
+
+
+def _build_flag_active_flags(args: argparse.Namespace) -> list[str]:
+    """Build list of active short-flag strings from args."""
+    return [short for attr, short in _FLAG_ATTR_TO_SHORT if getattr(args, attr, False)]
+
+
+def _process_flag_result(
+    result: dict,
+    args: argparse.Namespace,
+    formatter: "FlagFormatter",
+    start_time: float,
+    mode_label: str,
+) -> int:
+    """Process flag_code result: format, print, and return exit code."""
+    if "error" in result:
+        logger.error(f"Flag command error: {result['error']}")
+        return 1
+
+    items = result.get("items", [])
+
+    if args.dry_run and args.limit is not None:
+        items = items[: args.limit]
+
+    formatted_output = formatter.format_items(items, args.format, args.reverse)
+    stats_output = formatter.format_stats(result) if args.stats else None
+    _print_flag_output(formatted_output, stats_output, args.reverse)
+
+    if args.verbose:
+        elapsed_ms = (time.time() - start_time) * 1000
+        count = result.get("flagged_count", 0)
+        files = result.get("files_modified", 0)
+        run_mode = "preview" if args.dry_run else "applied"
+        print(
+            f"\n[{mode_label}] Flagged {count} objects in {files} files ({run_mode}) in {elapsed_ms:.1f}ms",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _build_flag_params(args: argparse.Namespace, root_path: Path) -> FlagParams:
+    """Build FlagParams from CLI args."""
+    return FlagParams(
+        source_dir=str(root_path),
+        hotspots=args.hotspots,
+        propagation=args.propagation,
+        clones=args.clones,
+        echo_comments=args.echo_comments,
+        dead_code=args.dead_code,
+        tramp_data=args.tramp_data,
+        risk_threshold=args.risk_threshold,
+        propagation_threshold=args.propagation_threshold,
+        clone_threshold=args.clone_threshold,
+        echo_threshold=args.echo_threshold,
+        dead_code_threshold=args.dead_code_threshold,
+        clone_mode=_get_clone_mode(args),
+        line_threshold=getattr(args, "line_threshold", DEFAULT_SYNTACTIC_LINE_THRESHOLD),
+        func_threshold=getattr(args, "func_threshold", DEFAULT_SYNTACTIC_FUNC_THRESHOLD),
+        dry_run=args.dry_run,
+        backup=args.backup,
+        verbose=args.verbose,
+        exclude_tests=not args.include_tests,
+        remove_comments=args.remove_comments,
+        remove_dead_code=args.remove_dead_code,
+        output_format=args.format,
+        limit=args.limit,
+        min_occurrences=args.min_occurrences,
+        min_group_size=args.min_group_size,
+        sensitive_values=args.sensitive_values,
+        sensitive_threshold=args.sensitive_threshold,
+        replace_value=getattr(args, "replace", None),
+    )
+
+
+def handle_flag_command(args: argparse.Namespace, root_path: Path, config) -> int:
+    """Handle flag command to insert [CODEN] comments."""
+    args.limit = normalize_limit(args.limit)
+    start_time = time.time()
+    formatter = FlagFormatter()
+
+    validation_code = _validate_flag_args(args, root_path)
+    if validation_code != 0:
+        return validation_code
+
     from .formatters.flag_formatter import format_parameters_header
 
+    active_flags = _build_flag_active_flags(args)
     header = format_parameters_header(
         active_flags=active_flags,
         risk_threshold=args.risk_threshold,
@@ -902,55 +1021,17 @@ def handle_flag_command(args: argparse.Namespace, root_path: Path, config) -> in
         limit=args.limit,
         dry_run=args.dry_run,
         dead_code_threshold=args.dead_code_threshold,
+        min_occurrences=args.min_occurrences,
+        sensitive_threshold=args.sensitive_threshold,
     )
     print(header)
-    print()  # Blank line
+    print()
 
-    params = FlagParams(
-        source_dir=str(root_path),
-        hotspots=args.hotspots,
-        propagation=args.propagation,
-        clones=args.clones,
-        echo_comments=args.echo_comments,
-        dead_code=args.dead_code,
-        risk_threshold=args.risk_threshold,
-        propagation_threshold=args.propagation_threshold,
-        clone_threshold=args.clone_threshold,
-        echo_threshold=args.echo_threshold,
-        dead_code_threshold=args.dead_code_threshold,
-        dry_run=args.dry_run,
-        backup=args.backup,
-        verbose=args.verbose,
-        exclude_tests=not args.include_tests,
-        remove_comments=args.remove_comments,
-        remove_dead_code=args.remove_dead_code,
-        output_format=args.format,
-        limit=args.limit,
-    )
+    params = _build_flag_params(args, root_path)
 
     daemon_result = try_daemon_flag(params, host=config.daemon.host, port=config.daemon.port)
-
     if daemon_result is not None:
-        if "error" in daemon_result:
-            logger.error(f"Flag command error: {daemon_result['error']}")
-            return 1
-
-        items = daemon_result.get("items", [])
-
-        # Apply limit ONLY in dry-run mode
-        if args.dry_run and args.limit is not None:
-            items = items[: args.limit]
-
-        formatted_output = formatter.format_items(items, args.format, args.reverse)
-        stats_output = formatter.format_stats(daemon_result) if args.stats else None
-        _print_flag_output(formatted_output, stats_output, args.reverse)
-        elapsed_ms = (time.time() - start_time) * 1000
-        if args.verbose:
-            count = daemon_result.get("flagged_count", 0)
-            files = daemon_result.get("files_modified", 0)
-            mode = "preview" if args.dry_run else "applied"
-            print(f"\n[Daemon mode] Flagged {count} objects in {files} files ({mode}) in {elapsed_ms:.1f}ms", file=sys.stderr)
-        return 0
+        return _process_flag_result(daemon_result, args, formatter, start_time, "Daemon mode")
 
     logger.warning("Daemon not available, falling back to direct analysis...")
     try:
@@ -960,53 +1041,13 @@ def handle_flag_command(args: argparse.Namespace, root_path: Path, config) -> in
         cache = CacheManager(root_path)
         indices = cache.load_or_rebuild()
 
-        clone_mode = _get_clone_mode(args)
         result = flag_code(
             entities=indices.entities,
             graph=indices.graph,
             pagerank=indices.pagerank,
-            source_dir=str(root_path),
-            hotspots=args.hotspots,
-            propagation=args.propagation,
-            clones=args.clones,
-            echo_comments=args.echo_comments,
-            dead_code=args.dead_code,
-            risk_threshold=args.risk_threshold,
-            propagation_threshold=args.propagation_threshold,
-            clone_threshold=args.clone_threshold,
-            echo_threshold=args.echo_threshold,
-            dead_code_threshold=args.dead_code_threshold,
-            clone_mode=clone_mode,
-            line_threshold=getattr(args, "line_threshold", 0.70),
-            func_threshold=getattr(args, "func_threshold", 0.50),
-            dry_run=args.dry_run,
-            backup=args.backup,
-            verbose=args.verbose,
-            exclude_tests=not args.include_tests,
-            remove_comments=args.remove_comments,
-            remove_dead_code=args.remove_dead_code,
+            params=params,
         )
-
-        if "error" in result:
-            logger.error(f"Flag command error: {result['error']}")
-            return 1
-
-        items = result.get("items", [])
-
-        # Apply limit ONLY in dry-run mode
-        if args.dry_run and args.limit is not None:
-            items = items[: args.limit]
-
-        formatted_output = formatter.format_items(items, args.format, args.reverse)
-        stats_output = formatter.format_stats(result) if args.stats else None
-        _print_flag_output(formatted_output, stats_output, args.reverse)
-        elapsed_ms = (time.time() - start_time) * 1000
-        if args.verbose:
-            count = result.get("flagged_count", 0)
-            files = result.get("files_modified", 0)
-            mode = "preview" if args.dry_run else "applied"
-            print(f"\n[Direct mode] Flagged {count} objects in {files} files ({mode}) in {elapsed_ms:.1f}ms", file=sys.stderr)
-        return 0
+        return _process_flag_result(result, args, formatter, start_time, "Direct mode")
 
     except Exception as e:
         logger.error(f"Flag command failed: {e}")
@@ -1655,11 +1696,19 @@ def _add_flag_arguments(parser: argparse.ArgumentParser, config) -> None:
                                 help="Detect and flag echo comments. Requires [semantic] extra")
     analysis_group.add_argument("-D", "--dead-code", action="store_true",
                                 help="Flag dead code - functions/methods with no callers in the codebase")
+    analysis_group.add_argument("-T", "--tramp-data", action="store_true",
+                                help="Flag tramp data - parameters appearing across many functions")
+    analysis_group.add_argument("-S", "--sensitive-values", action="store_true",
+                                help="Flag sensitive values - hardcoded secrets, API keys, credentials")
 
     # Threshold options (uses centralized THRESHOLD_CONFIGS for maintainability)
     threshold_group = parser.add_argument_group("Threshold Options")
     for threshold_config in THRESHOLD_CONFIGS.values():
         add_threshold_argument(threshold_group, threshold_config, use_detailed_help=True)
+    threshold_group.add_argument("--min-occurrences", type=int, default=3,
+                                 help="Minimum function count for tramp data detection (default: 3)")
+    threshold_group.add_argument("--min-group-size", type=int, default=2,
+                                 help="Minimum parameters in a tramp data group (default: 2)")
 
     # Behavior options
     parser.add_argument("--dry-run", action="store_true",
@@ -1670,6 +1719,8 @@ def _add_flag_arguments(parser: argparse.ArgumentParser, config) -> None:
                         help="Delete detected echo comments entirely instead of flagging with [CODEN] markers (use with -E)")
     parser.add_argument("--remove-dead-code", action="store_true",
                         help="Delete dead code functions entirely instead of flagging with [CODEN] markers (DESTRUCTIVE - use with --backup)")
+    parser.add_argument("--replace", nargs="?", const="***REDACTED***", default=None,
+                        help="Replace detected sensitive values with placeholder (default: ***REDACTED***, or specify custom value)")
     parser.add_argument("--include-tests", action="store_true",
                         help="Include test files in analysis. By default, test files are excluded to focus on production code")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -1854,6 +1905,16 @@ Examples:
                         help="Detect echo comments - comments that merely restate what the code already says. Requires [semantic] extra")
     parser.add_argument("-D", "--dead-code", action="store_true",
                         help="Detect dead code - functions/methods with no callers")
+    parser.add_argument("-T", "--tramp-data", action="store_true",
+                        help="Detect tramp data - parameters appearing across many functions")
+    parser.add_argument("--min-occurrences", type=int, default=3,
+                        help="Minimum function count for tramp data detection (default: 3)")
+    parser.add_argument("--min-group-size", type=int, default=2,
+                        help="Minimum parameters in a tramp data group (default: 2)")
+    parser.add_argument("-S", "--sensitive-values", action="store_true",
+                        help="Detect sensitive values - hardcoded secrets, API keys, credentials")
+    parser.add_argument("--replace", nargs="?", const="***REDACTED***", default=None,
+                        help="Replace detected sensitive values (default replacement: ***REDACTED***, or specify custom)")
     parser.add_argument("--breakdown", action="store_true",
                         help="Include per-module breakdown (with -P)")
     parser.add_argument("--critical-paths", action="store_true",
@@ -1865,6 +1926,7 @@ Examples:
     add_threshold_argument(parser, THRESHOLD_CONFIGS["clone"], use_detailed_help=False)
     add_threshold_argument(parser, THRESHOLD_CONFIGS["echo"], use_detailed_help=False)
     add_threshold_argument(parser, THRESHOLD_CONFIGS["dead_code"], use_detailed_help=False)
+    add_threshold_argument(parser, THRESHOLD_CONFIGS["sensitive_value"], use_detailed_help=False)
     def _validate_min_lines(value):
         ival = int(value)
         if ival < 1:
@@ -2192,6 +2254,199 @@ def handle_dead_code_command(
     return _run_direct_dead_code(root_path, formatter, args, start_time)
 
 
+def _filter_tramp_data_results(
+    results: list[dict],
+    min_occurrences: int,
+    limit: int | None,
+) -> list[dict]:
+    """Filter tramp data results by min occurrences and apply limit."""
+    threshold_filtered = [
+        d for d in results
+        if d.get("count", 0) >= min_occurrences
+    ]
+    return apply_defensive_limit(threshold_filtered, limit)
+
+
+def _process_tramp_data_result(
+    result: dict,
+    formatter: TrampDataFormatter,
+    args: argparse.Namespace,
+    start_time: float,
+    mode: str,
+) -> int:
+    """Process tramp data detection result and output."""
+    if "error" in result:
+        logger.error(f"Tramp data detection error: {result['error']}")
+        return 1
+
+    all_tramp_data = result.get("tramp_data", [])
+    summary = result.get("summary", {})
+
+    tramp_data = _filter_tramp_data_results(all_tramp_data, args.min_occurrences, args.limit)
+
+    formatted_output = formatter.format_items(tramp_data, args.format, args.reverse)
+    stats_output = formatter.format_stats(summary) if args.stats else None
+    print_metric_output(formatted_output, stats_output, args.reverse)
+
+    elapsed_ms = (time.time() - start_time) * 1000
+    if args.verbose:
+        print(f"\n[{mode} mode] Tramp data detection: {elapsed_ms:.1f}ms, Groups: {len(tramp_data)}", file=sys.stderr)
+    return 0
+
+
+def _run_direct_tramp_data(
+    root_path: Path,
+    formatter: TrampDataFormatter,
+    args: argparse.Namespace,
+    start_time: float,
+) -> int:
+    """Run tramp data detection directly (non-daemon)."""
+    from .mcp.tramp_data import detect_tramp_data_tool
+    try:
+        result = _get_asyncio().run(detect_tramp_data_tool(
+            root_directory=str(root_path),
+            min_occurrences=args.min_occurrences,
+            limit=args.limit,
+            exclude_tests=True,
+            min_group_size=args.min_group_size,
+        ))
+        return _process_tramp_data_result(result, formatter, args, start_time, "Direct")
+    except Exception as e:
+        logger.error(f"Tramp data detection failed: {e}")
+        if args.verbose:
+            traceback.print_exc()
+        return 1
+
+
+def handle_tramp_data_command(
+    args: argparse.Namespace,
+    root_path: Path,
+    config: AppConfig,
+) -> int:
+    """Handle tramp data detection (-T/--tramp-data flag)."""
+    args.limit = normalize_limit(args.limit)
+    start_time = time.time()
+    formatter = TrampDataFormatter()
+
+    header = format_tramp_data_parameters_header(
+        min_occurrences=args.min_occurrences,
+        exclude_tests=True,
+        limit=args.limit,
+        min_group_size=args.min_group_size,
+    )
+    print(header)
+    print()
+
+    params = TrampDataParams(
+        source_dir=str(root_path),
+        min_occurrences=args.min_occurrences,
+        limit=args.limit,
+        exclude_tests=True,
+        token_limit=args.tokens,
+        min_group_size=args.min_group_size,
+    )
+
+    daemon_result = try_daemon_tramp_data(params, host=config.daemon.host, port=config.daemon.port)
+    if daemon_result is not None:
+        return _process_tramp_data_result(daemon_result, formatter, args, start_time, "Daemon")
+
+    logger.warning("Daemon not available, falling back to direct analysis...")
+    return _run_direct_tramp_data(root_path, formatter, args, start_time)
+
+
+def _process_sensitive_value_result(
+    result: dict,
+    formatter: SensitiveValueFormatter,
+    args: argparse.Namespace,
+    start_time: float,
+    mode: str,
+) -> int:
+    """Process sensitive value detection result and output."""
+    if "error" in result:
+        logger.error(f"Sensitive value detection error: {result['error']}")
+        return 1
+
+    all_values = result.get("sensitive_values", [])
+    summary = result.get("summary", {})
+
+    values = apply_defensive_limit(all_values, args.limit)
+
+    formatted_output = formatter.format_items(values, args.format, args.reverse)
+    stats_output = formatter.format_stats(summary) if args.stats else None
+    print_metric_output(formatted_output, stats_output, args.reverse)
+
+    elapsed_ms = (time.time() - start_time) * 1000
+    if args.verbose:
+        print(f"\n[{mode} mode] Sensitive value detection: {elapsed_ms:.1f}ms, Found: {len(values)}", file=sys.stderr)
+    return 0
+
+
+def _run_direct_sensitive_values(
+    root_path: Path,
+    formatter: SensitiveValueFormatter,
+    args: argparse.Namespace,
+    start_time: float,
+) -> int:
+    """Run sensitive value detection directly (non-daemon)."""
+    from .mcp.sensitive_values import detect_sensitive_values_tool
+    try:
+        result = _get_asyncio().run(detect_sensitive_values_tool(
+            root_directory=str(root_path),
+            confidence_threshold=args.sensitive_threshold,
+            limit=args.limit,
+            exclude_tests=True,
+            replace_value=getattr(args, "replace", None),
+        ))
+        return _process_sensitive_value_result(result, formatter, args, start_time, "Direct")
+    except Exception as e:
+        logger.error(f"Sensitive value detection failed: {e}")
+        if args.verbose:
+            traceback.print_exc()
+        return 1
+
+
+def handle_sensitive_values_command(
+    args: argparse.Namespace,
+    root_path: Path,
+    config: AppConfig,
+) -> int:
+    """Handle sensitive value detection (-S/--sensitive-values flag)."""
+    from .sensitive_values.classifier import is_available as _sklearn_check
+    if not _sklearn_check():
+        print("Error: scikit-learn is required for sensitive value detection (-S).", file=sys.stderr)
+        print("Install with: pip install scikit-learn", file=sys.stderr)
+        return 1
+
+    args.limit = normalize_limit(args.limit)
+    start_time = time.time()
+    formatter = SensitiveValueFormatter()
+
+    header = format_sensitive_value_parameters_header(
+        confidence_threshold=args.sensitive_threshold,
+        exclude_tests=True,
+        limit=args.limit,
+        replace_value=getattr(args, "replace", None),
+    )
+    print(header)
+    print()
+
+    params = SensitiveValueParams(
+        source_dir=str(root_path),
+        confidence_threshold=args.sensitive_threshold,
+        limit=args.limit,
+        exclude_tests=True,
+        token_limit=args.tokens,
+        replace_value=getattr(args, "replace", None),
+    )
+
+    daemon_result = try_daemon_sensitive_values(params, host=config.daemon.host, port=config.daemon.port)
+    if daemon_result is not None:
+        return _process_sensitive_value_result(daemon_result, formatter, args, start_time, "Daemon")
+
+    logger.warning("Daemon not available, falling back to direct analysis...")
+    return _run_direct_sensitive_values(root_path, formatter, args, start_time)
+
+
 def handle_search_command(args: argparse.Namespace, config) -> int:
     """Handle search (default) mode."""
     args.limit = normalize_limit(args.limit)
@@ -2230,6 +2485,14 @@ def handle_search_command(args: argparse.Namespace, config) -> int:
     # Handle dead code mode separately
     if args.dead_code:
         return handle_dead_code_command(args, root_path, config)
+
+    # Handle tramp data mode separately
+    if args.tramp_data:
+        return handle_tramp_data_command(args, root_path, config)
+
+    # Handle sensitive values mode separately
+    if args.sensitive_values:
+        return handle_sensitive_values_command(args, root_path, config)
 
     # Create cache manager (use config for model_path)
     cache = CacheManager(

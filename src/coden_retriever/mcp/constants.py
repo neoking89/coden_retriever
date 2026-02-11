@@ -40,6 +40,7 @@ _BASE_TOOL_CATEGORIES = [
     ("Graph Analysis", ["change_impact_radius", "coupling_hotspots", "architectural_bottlenecks"]),
     ("Symbol Lookup", ["find_identifier", "trace_dependency_path"]),
     ("Code Inspection", ["read_source_range", "read_source_ranges", "git_history_context", "code_evolution"]),
+    ("Security", ["detect_sensitive_values"]),
     ("File Editing", ["write_file", "edit_file", "delete_file", "undo_file_change"]),
     ("Debugging", [
         "debug_stacktrace",

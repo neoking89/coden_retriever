@@ -48,6 +48,8 @@ For CODE QUALITY ("Find issues", "Clean up code"):
 2. detect_dead_code (unused functions)
 3. detect_echo_comments (redundant comments)
 4. propagation_cost (architecture health)
+5. detect_tramp_data (parameters repeated across functions)
+6. detect_sensitive_values (hardcoded secrets, API keys, credentials)
 
 For THIRD-PARTY CODE ("How does library X work?"):
 1. check_python_virtual_env → get_python_package_path → code_search
@@ -70,6 +72,8 @@ For CODE FLAGGING ("Mark issues in source"):
 | Architecture health | propagation_cost |
 | Duplicate code | detect_clones (combined/semantic/syntactic) |
 | Unused code | detect_dead_code |
+| Tramp data / coupling | detect_tramp_data |
+| Hardcoded secrets/sensitive values | detect_sensitive_values |
 | Useless comments | detect_echo_comments |
 | Parse error stacktrace | debug_stacktrace |
 | Line-level blame | git_history_context |
