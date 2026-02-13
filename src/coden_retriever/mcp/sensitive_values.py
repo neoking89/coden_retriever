@@ -18,6 +18,11 @@ from ..constants import (
     SENSITIVE_VALUE_MAX_RESULTS,
 )
 
+# Pre-import classifier (and its sklearn dependency) at module level.
+# On Windows, first importing sklearn DLLs inside asyncio.to_thread
+# causes a deadlock in the MCP subprocess.
+from ..sensitive_values import classifier  # noqa: F401
+
 logger = logging.getLogger(__name__)
 
 

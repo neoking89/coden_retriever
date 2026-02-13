@@ -2411,12 +2411,6 @@ def handle_sensitive_values_command(
     config: AppConfig,
 ) -> int:
     """Handle sensitive value detection (-S/--sensitive-values flag)."""
-    from .sensitive_values.classifier import is_available as _sklearn_check
-    if not _sklearn_check():
-        print("Error: scikit-learn is required for sensitive value detection (-S).", file=sys.stderr)
-        print("Install with: pip install scikit-learn", file=sys.stderr)
-        return 1
-
     args.limit = normalize_limit(args.limit)
     start_time = time.time()
     formatter = SensitiveValueFormatter()

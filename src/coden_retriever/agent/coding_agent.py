@@ -140,6 +140,7 @@ class CodingAgent:
         settings: ModelSettings = {
             "temperature": gen.temperature,
             "timeout": gen.timeout,
+            "parallel_tool_calls": False,
         }
         if gen.max_tokens is not None:
             settings["max_tokens"] = gen.max_tokens

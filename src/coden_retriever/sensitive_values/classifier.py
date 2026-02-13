@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import warnings
 from typing import Any
+
 import numpy as np
 
 from ..constants import (
@@ -17,36 +18,24 @@ from ..constants import (
 from .features import extract_features
 from .golden_data import SAFE_VALUES, SENSITIVE_VALUES
 
+# sklearn imported at module level — importing inside asyncio.to_thread
+# on Windows causes DLL loader deadlocks in the MCP server subprocess
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+
 logger = logging.getLogger(__name__)
 
 # Module-level singleton state for lazy initialization
 _model: Any | None = None
 _scaler: Any | None = None
-_sklearn_available: bool | None = None
 
 
 def _ensure_trained() -> bool:
     """Train the classifier on first call. Returns True if model is ready."""
-    global _model, _scaler, _sklearn_available
+    global _model, _scaler
 
-    if _sklearn_available is False:
-        return False
     if _model is not None:
         return True
-
-    try:
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.preprocessing import StandardScaler
-        import numpy as np
-    except ImportError:
-        _sklearn_available = False
-        logger.warning(
-            "scikit-learn not installed; sensitive value detection unavailable. "
-            "Install with: pip install scikit-learn"
-        )
-        return False
-
-    _sklearn_available = True
 
     all_values = list(SENSITIVE_VALUES) + list(SAFE_VALUES)
     labels = np.array([1] * len(SENSITIVE_VALUES) + [0] * len(SAFE_VALUES))
@@ -74,12 +63,6 @@ def classify_value(text: str) -> float:
     features = np.array([extract_features(text)])
     features_scaled = _scaler.transform(features)
     return float(_model.predict_proba(features_scaled)[0, 1])
-
-
-def is_available() -> bool:
-    """Check if the classifier can run (sklearn installed)."""
-    _ensure_trained()
-    return _sklearn_available is not False
 
 
 def classify_batch(texts: list[str]) -> list[float]:

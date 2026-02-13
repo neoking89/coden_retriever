@@ -1,3 +1,14 @@
+# Release Notes - Version 1.3.1
+
+**Release Date:** February 13, 2026
+
+## Bug Fix
+
+- **detect_sensitive_values** MCP-tool had a bug, which caused indefinite hanging on execution. 
+This bug is now fixed.
+
+---
+
 # Release Notes - Version 1.3.0
 
 **Release Date:** February 11, 2026
