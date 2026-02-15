@@ -1,3 +1,18 @@
+# Release Notes - Version 1.4.0
+
+**Release Date:** February 15, 2026
+
+## New Features
+
+- **Whitelist Scanning (`--whitelist`)**: Scan text files (`.env`, `.json`, `.yaml`, `.toml`, etc.) for sensitive values alongside source code
+  - `coden /path -S --whitelist "*.env" "*.json"`
+
+## Improvements
+
+- Improved sensitive value detection accuracy
+
+---
+
 # Release Notes - Version 1.3.1
 
 **Release Date:** February 13, 2026
