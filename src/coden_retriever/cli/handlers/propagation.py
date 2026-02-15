@@ -6,7 +6,7 @@ import time
 import traceback
 from pathlib import Path
 
-from ...cli_metrics_contract import apply_defensive_limit, print_metric_output
+from ...cli_metrics_contract import print_metric_output
 from ...daemon.client import try_daemon_propagation_cost
 from ...daemon.protocol import PropagationCostParams
 from ...formatters import PropagationFormatter

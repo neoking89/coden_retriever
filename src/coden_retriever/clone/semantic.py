@@ -17,7 +17,6 @@ from ..token_estimator import count_tokens
 from ..utils.optional_deps import get_numpy
 
 if TYPE_CHECKING:
-    import numpy as np
     from ..models import CodeEntity
 
 # Token budget constants for output size estimation

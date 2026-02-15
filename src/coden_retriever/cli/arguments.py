@@ -3,7 +3,6 @@ import argparse
 
 from ..config_loader import get_config
 from ..constants import MCP_DEFAULT_HTTP_PORT
-from .threshold_config import THRESHOLD_CONFIGS, add_threshold_argument
 from .utils import DefaultValueHelpFormatter
 
 

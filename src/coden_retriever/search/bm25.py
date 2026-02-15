@@ -15,7 +15,6 @@ from ..utils.optional_deps import get_numpy
 from .base import SearchIndex
 
 if TYPE_CHECKING:
-    import numpy as np
     from numpy import ndarray
 
 

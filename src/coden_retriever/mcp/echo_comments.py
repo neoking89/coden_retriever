@@ -27,7 +27,6 @@ from ..utils.optional_deps import get_numpy
 from .flag_insertion import CODEN_MARKER
 
 if TYPE_CHECKING:
-    import numpy as np
     from ..models import CodeEntity
 
 logger = logging.getLogger(__name__)

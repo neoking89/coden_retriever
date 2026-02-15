@@ -19,9 +19,6 @@ from pydantic import Field
 from ..constants import (
     FLAG_ANALYSIS_LIMIT,
     FLAG_MIN_LINES,
-    SENSITIVE_VALUE_DEFAULT_THRESHOLD,
-    TRAMP_DATA_DEFAULT_MIN_OCCURRENCES,
-    TRAMP_DATA_MIN_GROUP_SIZE,
 )
 from ..daemon.protocol import FlagParams
 from ..graph_utils import compute_coupling_hotspots
