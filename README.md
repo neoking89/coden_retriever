@@ -83,6 +83,9 @@ coden /path/to/repo -T --min-occurrences 5
 
 # Detect sensitive values (hardcoded secrets, API keys)
 coden /path/to/repo -S --sensitive-threshold 0.5
+
+# Detect secrets in source files + text files (.env, .json, etc.)
+coden /path/to/repo -S --whitelist "*.env" "*.json"
 ```
 
 <img src="images/readme/coden_stats_reverzed.png" alt="Coden stats output showing directory tree and ranking metrics" width="700">
@@ -151,6 +154,7 @@ coden /path/to/repo -T                       # Detect tramp data (shared param g
 coden /path/to/repo -T --min-occurrences 5   # Tramp data with custom threshold
 coden /path/to/repo -S                       # Detect sensitive values (secrets, keys)
 coden /path/to/repo -S --sensitive-threshold 0.7  # Stricter detection
+coden /path/to/repo -S --whitelist "*.env" "*.json" # Scan text files too
 coden /path/to/repo --map --show-deps        # Show callers/callees
 coden /path/to/repo --format json            # Output as json/markdown/xml
 coden serve                                  # Start MCP server
@@ -166,6 +170,7 @@ coden flag -E --include-tests                # Include test files in analysis
 coden flag -D --dry-run                      # Preview dead code flagging
 coden flag -D --remove-dead-code --backup    # Remove dead code functions (DESTRUCTIVE)
 coden flag -S --dry-run                      # Preview sensitive value flags
+coden flag -S --whitelist "*.env" --dry-run  # Preview with text file scanning
 coden flag -S --replace --backup             # Replace secrets with ***REDACTED***
 coden flag -S --replace "HIDDEN" --backup    # Replace with custom placeholder
 coden flag -HPCETS --backup                  # Flag all issues (hotspots, propagation, clones, echoes, tramp data, sensitive values)
@@ -501,8 +506,14 @@ coden /path/to/repo -S
 # Stricter (only high-confidence secrets)
 coden /path/to/repo -S --sensitive-threshold 0.7
 
+# Scan source code + text files (.env, .json, .yaml, etc.)
+coden /path/to/repo -S --whitelist "*.env" "*.json" "*.toml" "*.yaml"
+
 # Preview what would be flagged
 coden flag -S --dry-run
+
+# Preview with whitelist scanning
+coden flag -S --whitelist "*.env" --dry-run
 
 # Flag with [CODEN] comments
 coden flag -S --backup
@@ -515,6 +526,7 @@ coden flag -S --replace "HIDDEN" --backup
 #### Options
 
 - **`--sensitive-threshold`**: Minimum confidence (0.0-1.0, default: 0.35). Lower = more recall, higher = more precision.
+- **`--whitelist`**: Space-separated glob patterns to scan text files for secrets (e.g., `"*.env" "*.json" "*.yaml"`). By default, only source code files (Python, JavaScript, etc.) are scanned. Whitelist adds text file scanning on top. Supported formats: `.env`, `.properties`, `.ini`, `.conf`, `.cfg`, `.json`, `.yaml`, `.yml`, `.toml`.
 - **`--replace`**: Replace detected secrets in source code. Without a value, uses `***REDACTED***`. Accepts a custom placeholder.
 - **`--include-tests`**: Include test files in analysis (default: excluded).
 - **`-n/--limit`**: Maximum results to display (default: 20, use `-1` for all).

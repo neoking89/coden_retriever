@@ -38,6 +38,7 @@ def format_sensitive_value_parameters_header(
     exclude_tests: bool,
     limit: int | None,
     replace_value: str | None = None,
+    whitelist: list[str] | None = None,
 ) -> str:
     """Format parameter summary header for sensitive value detection."""
     lines = []
@@ -51,6 +52,9 @@ def format_sensitive_value_parameters_header(
         lines.append(f"Replace Mode: ON (replacement: \"{replace_value}\")")
     else:
         lines.append("Replace Mode: OFF (detection only)")
+
+    if whitelist:
+        lines.append(f"Whitelist Patterns: {', '.join(whitelist)}")
 
     if limit is None:
         lines.append("[!] Result Limit: ALL (may be slow for large repos)")

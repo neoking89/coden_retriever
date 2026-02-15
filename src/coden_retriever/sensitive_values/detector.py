@@ -37,6 +37,8 @@ def detect_sensitive_values(
     exclude_tests: bool = True,
     limit: int | None = SENSITIVE_VALUE_DEFAULT_LIMIT,
     replace_value: str | None = None,
+    whitelist: list[str] | None = None,
+    root_dir: str | None = None,
 ) -> dict[str, Any]:
     """Detect sensitive values in string literals across the codebase.
 
@@ -46,6 +48,8 @@ def detect_sensitive_values(
         exclude_tests: Exclude test files from analysis.
         limit: Maximum results to return (None for all).
         replace_value: Replacement string for redaction (None = no replace).
+        whitelist: Glob patterns for text files to scan (e.g. ``["*.env"]``).
+        root_dir: Project root directory (required when whitelist is set).
 
     Returns:
         Dict with sensitive_values list and summary statistics.
@@ -86,6 +90,11 @@ def detect_sensitive_values(
                 "entity_type": entity_type,
             })
 
+    if whitelist and root_dir:
+        _collect_whitelist_values(
+            root_dir, whitelist, flat_items, flat_texts,
+        )
+
     if not flat_texts:
         return _build_empty_result(len(filtered_entities))
 
@@ -119,6 +128,33 @@ def detect_sensitive_values(
             results, len(filtered_entities), len(flat_texts),
         ),
     }
+
+
+def _collect_whitelist_values(
+    root_dir: str,
+    whitelist: list[str],
+    flat_items: list[dict[str, Any]],
+    flat_texts: list[str],
+) -> None:
+    """Scan whitelisted text files and append their values to the flat lists."""
+    from .file_scanner import scan_whitelist_files
+    from .text_extractor import extract_text_file_values
+
+    matched_files = scan_whitelist_files(Path(root_dir), whitelist)
+    for fp in matched_files:
+        literals = extract_text_file_values(fp)
+        file_str = str(fp)
+        file_name = fp.name
+        for sl in literals:
+            flat_texts.append(sl.value)
+            flat_items.append({
+                "value": sl.value,
+                "file": file_str,
+                "line": sl.line,
+                "name": file_name,
+                "variable_name": sl.variable_name,
+                "entity_type": "text_file",
+            })
 
 
 def _build_empty_result(entity_count: int) -> dict[str, Any]:

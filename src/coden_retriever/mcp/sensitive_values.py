@@ -32,6 +32,7 @@ def _load_and_detect(
     exclude_tests: bool,
     limit: int,
     replace_value: str | None,
+    whitelist: list[str] | None = None,
 ) -> dict[str, Any]:
     """Load cache and run sensitive value detection (sync helper)."""
     from ..cache import CacheManager
@@ -46,6 +47,8 @@ def _load_and_detect(
         exclude_tests=exclude_tests,
         limit=limit,
         replace_value=replace_value,
+        whitelist=whitelist,
+        root_dir=root_directory,
     )
 
 
@@ -63,6 +66,9 @@ async def detect_sensitive_values_tool(
     replace_value: Annotated[
         str | None, Field(description="Replacement string for redaction (None = detect only)")
     ] = None,
+    whitelist: Annotated[
+        list[str] | None, Field(description="Glob patterns for text files to scan (e.g. ['*.env', '*.json'])")
+    ] = None,
 ) -> dict[str, Any]:
     """Detect hardcoded sensitive values (secrets, credentials, API keys) in source code."""
     if not root_directory:
@@ -75,6 +81,7 @@ async def detect_sensitive_values_tool(
         exclude_tests,
         limit,
         replace_value,
+        whitelist,
     )
 
 

@@ -632,6 +632,8 @@ def _collect_sensitive_value_items(
     threshold: float,
     exclude_tests: bool,
     replace_value: str | None,
+    whitelist: list[str] | None = None,
+    root_dir: str | None = None,
 ) -> list[dict]:
     """Collect flaggable items from sensitive value detection."""
     from ..sensitive_values.detector import detect_sensitive_values
@@ -642,6 +644,8 @@ def _collect_sensitive_value_items(
         exclude_tests=exclude_tests,
         limit=FLAG_ANALYSIS_LIMIT,
         replace_value=replace_value,
+        whitelist=whitelist,
+        root_dir=root_dir,
     )
 
     items = []
@@ -941,6 +945,7 @@ def _collect_all_flaggable_items(
     if params.sensitive_values:
         items.extend(_collect_sensitive_value_items(
             entities, params.sensitive_threshold, params.exclude_tests, params.replace_value,
+            whitelist=params.sensitive_whitelist, root_dir=params.source_dir,
         ))
 
     return items

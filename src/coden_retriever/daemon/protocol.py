@@ -56,7 +56,7 @@ class SearchParams:
     query: str = ""
     enable_semantic: bool = False
     model_path: str | None = None
-    limit: int = 20
+    limit: int | None = 20
     tokens: int | None = None
     show_deps: bool = False
     output_format: str = "tree"
@@ -247,6 +247,7 @@ class FlagParams:
     sensitive_values: bool = False
     sensitive_threshold: float = 0.35
     replace_value: str | None = None
+    sensitive_whitelist: list[str] | None = None
 
     def has_any_flag_enabled(self) -> bool:
         """Check if at least one analysis flag is enabled.
@@ -355,6 +356,7 @@ class SensitiveValueParams:
     exclude_tests: bool = True
     token_limit: int | None = None
     replace_value: str | None = None
+    whitelist: list[str] | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)

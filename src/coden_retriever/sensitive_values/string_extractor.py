@@ -100,7 +100,7 @@ def _get_or_create_parser(
             parser = Parser(language)
         except TypeError:
             parser = Parser()
-            parser.set_language(language)
+            parser.set_language(language)  # type: ignore[attr-defined]
         cache[lang_name] = parser
         return parser
     except Exception as e:

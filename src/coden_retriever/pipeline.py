@@ -11,6 +11,7 @@ from typing import Optional
 
 from .cache.manager import CacheManager
 from .config import OutputFormat
+from .constants import DEFAULT_SEARCH_RESULT_LIMIT
 from .formatters import get_formatter
 from .formatters.base import OutputFormatter
 from .search.engine import SearchEngine
@@ -31,7 +32,7 @@ class SearchConfig:
     dir_tree: bool = False
     map_mode: bool = False
     find_mode: Optional[str] = None
-    limit: int = 20
+    limit: int | None = 20
     verbose: bool = False
     show_stats: bool = False
     reverse: bool = False
@@ -141,11 +142,13 @@ class SearchPipeline:
 
         config = self.config
 
+        limit = config.limit if config.limit is not None else DEFAULT_SEARCH_RESULT_LIMIT
+
         if config.find_mode:
             # Find identifier mode
             return engine.find_identifiers(
                 config.find_mode,
-                limit=config.limit,
+                limit=limit,
                 include_deps=config.show_deps,
             )
         elif config.map_mode or not config.query:
@@ -154,14 +157,14 @@ class SearchPipeline:
                 query="",
                 use_architecture=True,
                 include_deps=config.show_deps,
-                limit=config.limit,
+                limit=limit,
             )
         else:
             # Regular search mode
             return engine.search(
                 query=config.query,
                 include_deps=config.show_deps,
-                limit=config.limit,
+                limit=limit,
             )
 
     def filter_results(self, results: list) -> tuple[list, int]:

@@ -19,7 +19,7 @@ from ..constants import AMBIGUOUS_METHOD_NAMES
 from ..models import PathTraceResult
 
 if TYPE_CHECKING:
-    import networkx as nx
+    from networkx import DiGraph
     from ..models.entities import CodeEntity
 
 logger = logging.getLogger(__name__)
@@ -73,12 +73,12 @@ class GraphAnalyzer:
         self._verbose = verbose
 
         nx = _get_nx()
-        self._graph: "nx.DiGraph" = nx.DiGraph()
+        self._graph: "DiGraph" = nx.DiGraph()
         self._pagerank_cache: dict[str, float] = {}
         self._betweenness_cache: dict[str, float] = {}
 
     @property
-    def graph(self) -> "nx.DiGraph":
+    def graph(self) -> "DiGraph":
         """Get the underlying graph."""
         return self._graph
 

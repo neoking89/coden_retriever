@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from ..cache import CachedIndices
 from ..config import OutputFormat
+from ..constants import DEFAULT_SEARCH_RESULT_LIMIT
 from ..formatters import get_formatter
 from ..formatters.base import OutputFormatter
 from ..graph_utils import (
@@ -278,18 +279,19 @@ class SearchHandler(SearchHandlerBase):
 
     def handle(self, params: dict) -> dict:
         def do_search(search_params: SearchParams, engine: SearchEngine) -> list:
+            limit = search_params.limit if search_params.limit is not None else DEFAULT_SEARCH_RESULT_LIMIT
             if search_params.map_mode or not search_params.query:
                 return engine.search(
                     query="",
                     use_architecture=True,
                     include_deps=search_params.show_deps,
-                    limit=search_params.limit,
+                    limit=limit,
                 )
             else:
                 return engine.search(
                     query=search_params.query,
                     include_deps=search_params.show_deps,
-                    limit=search_params.limit,
+                    limit=limit,
                 )
 
         return self._execute_search_operation(params, do_search)
@@ -303,13 +305,13 @@ class FindHandler(SearchHandlerBase):
         if not search_params.find_identifier:
             raise ValueError("find_identifier is required")
 
-        # Mypy: find_identifier is guaranteed non-None after the check above
         identifier = search_params.find_identifier
 
         def do_find(search_params: SearchParams, engine: SearchEngine) -> list:
+            limit = search_params.limit if search_params.limit is not None else DEFAULT_SEARCH_RESULT_LIMIT
             return engine.find_identifiers(
                 identifier,
-                limit=search_params.limit,
+                limit=limit,
                 include_deps=search_params.show_deps,
             )
 
@@ -791,6 +793,8 @@ class SensitiveValueHandler(BaseHandler):
             exclude_tests=sv_params.exclude_tests,
             limit=sv_params.limit,
             replace_value=sv_params.replace_value,
+            whitelist=sv_params.whitelist,
+            root_dir=sv_params.source_dir,
         )
         result["source"] = "daemon"
         return result

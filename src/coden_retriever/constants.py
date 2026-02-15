@@ -42,6 +42,32 @@ DEFAULT_MAX_RETRIES: int = 5
 # - Linux (well-architected): PC ~10% - modular design with clear boundaries
 # - Mozilla (pre-refactor): PC ~43% - high coupling, difficult to maintain
 
+# === CLI Daemon Constants ===
+# Polling interval when waiting for daemon startup (seconds)
+DAEMON_POLL_INTERVAL_SECONDS = 0.1
+# Maximum polling attempts before giving up on daemon start
+DAEMON_MAX_POLL_ATTEMPTS = 20
+# Delay between stop and start operations during restart (seconds)
+DAEMON_RESTART_DELAY_SECONDS = 0.5
+# Timeout for cache clear operations (seconds)
+DAEMON_CACHE_TIMEOUT_SECONDS = 5.0
+# Default port for MCP HTTP server
+MCP_DEFAULT_HTTP_PORT = 8000
+# Output section separator width for formatted output
+OUTPUT_SEPARATOR_WIDTH = 60
+# Statistics separator width for detailed analysis output
+STATS_SEPARATOR_WIDTH = 80
+
+# === CLI Flag Constants ===
+# Syntactic clone detection: line-level Jaccard similarity threshold
+DEFAULT_SYNTACTIC_LINE_THRESHOLD = 0.70
+# Syntactic clone detection: minimum percentage of matching lines required
+DEFAULT_SYNTACTIC_FUNC_THRESHOLD = 0.50
+# Time conversion factor for millisecond display
+MILLISECONDS_PER_SECOND = 1000
+# Percentage conversion factor for display formatting
+PERCENT = 100
+
 # 10%: Excellent - matches well-designed systems like Linux
 PC_THRESHOLD_GOOD = 0.10
 # 25%: Moderate - the midpoint indicating coupling warrants monitoring
@@ -128,11 +154,15 @@ TRAMP_DATA_DEFAULT_RESULT_LIMIT = 50
 # 500 is upper bound to prevent memory issues and token budget exhaustion in LLM interactions
 TRAMP_DATA_MAX_RESULTS = 500
 
+# Default result limit for search and find operations
+# 20 balances relevance density with comprehensive coverage for most queries
+DEFAULT_SEARCH_RESULT_LIMIT = 20
+
 # =============================================================================
 # Sensitive Value Detection Thresholds
 # =============================================================================
 
-# Best F1 (91.3%) from Leave-One-Out CV on 99-sample golden set
+# Best F1 (94.4%) from 5-fold stratified CV on 280-sample golden set
 SENSITIVE_VALUE_DEFAULT_THRESHOLD = 0.35
 
 # Default replacement text when redacting detected secrets
@@ -176,11 +206,23 @@ SENSITIVE_VALUE_TABLE_WIDTH = 110
 # 30 chars for value preview column allows readable context
 SENSITIVE_VALUE_VALUE_COLUMN_WIDTH = 30
 
-# Logistic Regression classifier hyperparameters
+# SVM-RBF classifier hyperparameters
 # 1000 iterations ensures convergence on 99-sample training set
 SENSITIVE_VALUE_CLASSIFIER_MAX_ITER = 1000
-# C=1.0 provides balanced L2 regularization (sklearn default)
-SENSITIVE_VALUE_CLASSIFIER_REGULARIZATION = 1.0
+# C=5.0 optimal from grid search: Val-F1=0.957, perfect precision
+SENSITIVE_VALUE_CLASSIFIER_REGULARIZATION = 5.0
+
+# Feature extraction thresholds
+# 2 distinct special chars required to distinguish passwords from CSS/format strings
+SENSITIVE_VALUE_MIN_PASSWORD_SPECIAL_CHARS = 2
+# 5 chars minimum to avoid incorrect plural stripping of short words like "bus", "gas"
+SENSITIVE_VALUE_MIN_PLURAL_STRIP_LENGTH = 5
+# 0.8 (80%) printable ratio threshold for base64 decoded text to be considered readable
+# Above this threshold indicates safe config data, below indicates encrypted/random bytes
+SENSITIVE_VALUE_BASE64_READABLE_RATIO = 0.8
+# 2 minimum alphabetic characters required for all-caps phrase detection
+# Avoids false positives on single-letter abbreviations or punctuation-only strings
+SENSITIVE_VALUE_MIN_ALPHA_CHARS_FOR_CAPS = 2
 
 # =============================================================================
 # Flag Insertion Constants

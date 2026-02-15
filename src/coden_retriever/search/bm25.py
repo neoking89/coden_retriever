@@ -16,6 +16,7 @@ from .base import SearchIndex
 
 if TYPE_CHECKING:
     import numpy as np
+    from numpy import ndarray
 
 
 # Pre-compiled regex patterns for tokenization (module-level for performance)
@@ -62,10 +63,10 @@ class BM25Index(SearchIndex):
         self._doc_ids: list[str] = []
         self._idf: dict[str, float] = {}
         # Inverted index: term -> (doc_indices array, term_frequencies array)
-        self._inverted_index: dict[str, tuple["np.ndarray", "np.ndarray"]] = {}
+        self._inverted_index: dict[str, tuple["ndarray", "ndarray"]] = {}
         # Pre-computed: k1 * (1 - b + b * (doc_len / avg_len)) per document
         np = get_numpy()
-        self._doc_denom_part: "np.ndarray" = np.array([], dtype=np.float32)
+        self._doc_denom_part: "ndarray" = np.array([], dtype=np.float32)
 
     @staticmethod
     def tokenize(text: str) -> tuple[str, ...]:
