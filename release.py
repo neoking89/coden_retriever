@@ -218,7 +218,17 @@ def main():
     print("=" * 60)
 
     tag_name = f"v{version}"
-    run_command(f'git tag -a {tag_name} -m "New release version {version}"', dry_run=args.dry_run)
+    # Check if tag already exists
+    tag_check = subprocess.run(f"git tag -l {tag_name}", shell=True, capture_output=True, text=True)
+    if tag_check.stdout.strip() == tag_name:
+        if confirm(f"Tag {tag_name} already exists. Delete and recreate it?", default=False):
+            run_command(f"git tag -d {tag_name}", dry_run=args.dry_run)
+        else:
+            print(f"    Keeping existing tag {tag_name}")
+            tag_name = None  # Skip tag creation
+
+    if tag_name:
+        run_command(f'git tag -a {tag_name} -m "New release version {version}"', dry_run=args.dry_run)
 
     # Step 5: Push changes and tags
     print("\n" + "=" * 60)
