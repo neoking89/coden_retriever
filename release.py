@@ -223,6 +223,8 @@ def main():
     if tag_check.stdout.strip() == tag_name:
         if confirm(f"Tag {tag_name} already exists. Delete and recreate it?", default=False):
             run_command(f"git tag -d {tag_name}", dry_run=args.dry_run)
+            # Also delete from remote if it exists there
+            run_command(f"git push origin --delete {tag_name}", dry_run=args.dry_run, check=False)
         else:
             print(f"    Keeping existing tag {tag_name}")
             tag_name = None  # Skip tag creation
