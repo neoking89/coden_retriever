@@ -1,3 +1,47 @@
+# Release Notes - Version 2.0.0
+
+**Release Date:** May 11, 2026
+
+## Breaking Changes
+
+- **Unified install — optional extras removed.** All features (semantic search, MCP server, interactive agent) are now bundled into the base package. There are no more `[semantic]`, `[mcp]`, `[agent]`, or `[all]` extras.
+  - `pip install coden-retriever` now installs the complete tool.
+  - Users with `pip install 'coden-retriever[semantic]'` (or other extras) should switch to plain `pip install -U coden-retriever`. The extras are gone and pip will warn/error.
+- **Bundled semantic model.** A MiniLM ONNX embedding model now ships inside the wheel under `coden_retriever/models/embeddings/minilm_onnx/`. Semantic search, clone detection, and echo comments work out of the box with no extra download step. The embedding backend switched from `model2vec` to `onnxruntime`.
+- **New required core dependencies:** `onnxruntime`, `scipy`, `pathspec`, `fastmcp>=3.0`, `pydantic-ai-slim[mcp,openai]`. Install size grows accordingly — this is the trade-off for the single-install experience.
+
+## New Features
+
+- **Magic Constant Detection (`-K`)**: Find repeated literal values (numbers, strings) scattered across files that should be named constants.
+  - `coden /path -K` — scan for magic constants
+  - `--min-constant-occurrences` (default: 3) — minimum number of occurrences to flag
+  - `--min-constant-files` (default: 2) — minimum distinct files the literal appears in
+  - `--constant-types` — filter by literal type (numeric, string, all)
+  - Supported in flag mode: `coden flag -K --dry-run` / `coden flag -K --backup`
+
+- **`debug-availability` subcommand**: Check whether a language has a working debug adapter on the current machine.
+  - `coden debug-availability` — list adapters across all supported languages
+  - `coden debug-availability python` — check one language
+  - `coden debug-availability cpp --format json` — machine-readable output
+  - improved debugging support for all supported languages
+
+## Improvements
+
+- AST-based constant extraction (numeric + string literals, including default parameter values) shared between magic-constant and sensitive-value detection — fewer false positives from keywords and structural tokens.
+- Semantic embeddings now load from a bundled ONNX model — first run no longer requires network access.
+
+## Migration Guide
+
+Coming from 1.4.x:
+
+```bash
+pip install -U coden-retriever
+```
+
+If previously installed an extra, drop the bracket suffix — everything is now in the base package. No CLI flags were removed; existing scripts keep working.
+
+---
+
 # Release Notes - Version 1.4.0
 
 **Release Date:** February 15, 2026
