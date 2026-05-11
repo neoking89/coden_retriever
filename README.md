@@ -8,44 +8,34 @@ pip install coden-retriever
 
 **Requires Python 3.10-3.12.** Python 3.13+ is not supported because `tree-sitter-languages` (required for multi-language parsing) only provides wheels up to Python 3.12.
 
-### Optional Extras
+### What's Included
 
-The core package provides BM25 keyword search, code mapping, hotspot detection, and propagation analysis. Advanced features require optional extras:
+Everything ships in a single install — semantic search, clone detection, echo-comment detection, the MCP server, and the interactive agent are all bundled. The MiniLM ONNX embedding model is packaged inside the wheel, so semantic features work out of the box with no extra download step. There are no `[semantic]`, `[mcp]`, `[agent]`, or `[all]` extras anymore.
 
 ```bash
-# Core only (BM25 search, code map, hotspots, propagation)
+# Everything (search + analysis + MCP server + agent)
 pip install coden-retriever
-
-# Semantic search, clone detection, echo comment detection
-pip install 'coden-retriever[semantic]'
-
-# MCP server mode
-pip install 'coden-retriever[mcp]'
-
-# Interactive agent mode
-pip install 'coden-retriever[agent]'
-
-# All features
-pip install 'coden-retriever[all]'
 
 # Development (tests, linting)
 pip install 'coden-retriever[dev]'
 ```
 
-| Feature | Required Extra | Command Example |
-|---------|----------------|-----------------|
-| BM25 keyword search | Core | `coden /path -q "auth"` |
-| Code map & hotspots | Core | `coden /path --map`, `coden /path -H` |
-| Propagation analysis | Core | `coden /path -P` |
-| Dead code detection | Core | `coden /path -D` |
-| Tramp data detection | Core | `coden /path -T` |
-| Sensitive value detection | Core | `coden /path -S` |
-| Magic constant detection | Core | `coden /path -K` |
-| Semantic search | `[semantic]` | `coden /path -q "auth" --semantic` |
-| Clone detection (semantic/combined) | `[semantic]` | `coden /path -C` |
-| Echo comment detection | `[semantic]` | `coden /path -E` |
-| MCP server | `[mcp]` | `coden serve` |
-| Interactive agent | `[agent]` | `coden --agent` |
+> **Upgrading from 1.x?** Drop any bracket suffix you were using (`pip install 'coden-retriever[semantic]'`, `[mcp]`, `[agent]`, `[all]`) — `pip install -U coden-retriever` now installs the complete tool.
+
+| Feature | Command Example |
+|---------|-----------------|
+| BM25 keyword search | `coden /path -q "auth"` |
+| Semantic search | `coden /path -q "auth" --semantic` |
+| Code map & hotspots | `coden /path --map`, `coden /path -H` |
+| Propagation analysis | `coden /path -P` |
+| Dead code detection | `coden /path -D` |
+| Tramp data detection | `coden /path -T` |
+| Sensitive value detection | `coden /path -S` |
+| Magic constant detection | `coden /path -K` |
+| Clone detection | `coden /path -C` |
+| Echo comment detection | `coden /path -E` |
+| MCP server | `coden serve` |
+| Interactive agent | `coden --agent` |
 
 ```bash
 # Get a ranked map of a repo
@@ -147,7 +137,7 @@ Results are ranked using Reciprocal Rank Fusion across:
 | `--query "auth" --semantic` | Natural language questions (e.g., "how does auth work") | Yes |
 | `coden src --map-mode simple` | Quick overview ranked by historical edit frequency | No |
 
-**Semantic search** uses an all-MiniLM-L6-v2 ONNX model (INT8 quantized) that ships with the package. Requires the `[semantic]` extra: `pip install 'coden-retriever[semantic]'`
+**Semantic search** uses an all-MiniLM-L6-v2 ONNX model (INT8 quantized) bundled inside the wheel — no separate download or extra needed.
 
 **Simple mode** (`--map-mode simple`) is designed for speed: it ranks by per-file git commit count, bypasses the daemon entirely, and uses a warm disk cache (~88ms). Ideal for quick architectural overviews or repeated queries on a single codebase where the semantic/structural ranking is less important than turnaround time.
 
@@ -274,8 +264,6 @@ coden flag clear                     # Remove all [CODEN] comments
 
 ### Code Clone Detection
 
-> **Note:** Combined and semantic clone detection require the `[semantic]` extra: `pip install 'coden-retriever[semantic]'`. Syntactic-only mode (`--clone-syntactic`) works with the core package.
-
 Clone detection finds duplicate or near-duplicate functions that are candidates for refactoring. Three detection modes are available:
 
 | Mode | Flag | Description | Best For |
@@ -322,8 +310,6 @@ coden flag -C --backup
 ```
 
 ### Echo Comment Detection
-
-> **Note:** Echo comment detection requires the `[semantic]` extra: `pip install 'coden-retriever[semantic]'`
 
 Echo comments are comments that provide no additional value because they simply repeat what the code identifier already conveys. For example:
 
@@ -443,8 +429,6 @@ coden flag -D --remove-dead-code --backup
 Automatically skipped: dunder methods (`__init__`), runtime-called functions (`init()`, `constructor`), test functions, and trivial functions (<3 lines).
 
 ### Tramp Data Detection
-
-> **Note:** Tramp data detection is part of the core package (no extra required).
 
 Tramp data detection identifies parameter groups that travel together across many functions, revealing a common anti-pattern where multiple related parameters are passed individually instead of being bundled into a configuration object.
 
@@ -694,8 +678,6 @@ These override the config file:
 
 ## Interactive Agent
 
-> **Note:** Interactive agent requires the `[agent]` extra: `pip install 'coden-retriever[agent]'`
-
 <img src="images/readme/coden_agentic_mode.png" alt="Coden agent mode welcome screen" width="700">
 
 Activate coden in agent mode and use an LLM to chat about your codebase.
@@ -795,8 +777,6 @@ Useful for testing a tool's behaviour, inspecting exactly what a tool returns, o
 ```
 
 ## MCP Server
-
-> **Note:** MCP server mode requires the `[mcp]` extra: `pip install 'coden-retriever[mcp]'`
 
 Transport options: `stdio` (default), `http`, `sse`, `streamable-http`
 

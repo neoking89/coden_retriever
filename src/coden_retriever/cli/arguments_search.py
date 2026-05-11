@@ -29,7 +29,7 @@ _SEARCH_EPILOG = """\
 [bold green]Looking for something specific? Search by keyword, or go semantic:[/] 
 
   coden src -q "auth"                    keyword search for "auth"
-  coden src -q "how does login work" -s  semantic search (needs \[semantic] extra)
+  coden src -q "how does login work" -s  semantic search (bundled MiniLM ONNX)
   coden --find UserAuth --show-deps      find a symbol and its callers/callees
 
 [bold yellow]Now dig deeper. Run analysis to find what needs attention:[/] 
@@ -93,7 +93,7 @@ def add_flag_arguments(parser: argparse.ArgumentParser, config: AppConfig) -> No
     analysis_group.add_argument("-P", "--propagation", action="store_true",
                                 help="Flag high propagation cost functions")
     analysis_group.add_argument("-C", "--clones", action="store_true",
-                                help="Flag code clones. Requires \[semantic] extra for semantic/combined modes")
+                                help="Flag code clones (combined semantic + syntactic by default)")
     analysis_group.add_argument("--clone-semantic", action="store_true",
                                 help="Clone detection: semantic only (MiniLM ONNX embeddings)")
     analysis_group.add_argument("--clone-syntactic", action="store_true",
@@ -107,7 +107,7 @@ def add_flag_arguments(parser: argparse.ArgumentParser, config: AppConfig) -> No
     analysis_group.add_argument("--syntactic-weight", type=float, default=DEFAULT_CLONE_SYNTACTIC_WEIGHT,
                                 help="Weight for syntactic similarity in combined score")
     analysis_group.add_argument("-E", "--echo-comments", action="store_true",
-                                help="Detect and flag echo comments. Requires \[semantic] extra")
+                                help="Detect and flag echo comments")
     analysis_group.add_argument("-D", "--dead-code", action="store_true",
                                 help="Flag dead code - functions/methods with no callers in the codebase")
     analysis_group.add_argument("-T", "--tramp-data", action="store_true",
@@ -184,17 +184,17 @@ def create_search_parser(config: AppConfig) -> argparse.ArgumentParser:
                              "Ignored when a query is supplied without --map.")
     search.add_argument("--find", metavar="IDENT", help="Find specific identifier")
     search.add_argument("-s", "--semantic", dest="enable_semantic", action="store_true",
-                        help="Enable semantic search (MiniLM ONNX). Requires \[semantic] extra")
+                        help="Enable semantic search (bundled MiniLM ONNX)")
 
     analysis = parser.add_argument_group("Code Analysis")
     analysis.add_argument("-H", "--hotspots", action="store_true",
                           help="Find refactoring hotspots (high coupling + complexity)")
     analysis.add_argument("-C", "--clones", action="store_true",
-                          help="Detect code clones. Requires \[semantic] extra for semantic/combined")
+                          help="Detect code clones (combined semantic + syntactic by default)")
     analysis.add_argument("-P", "--propagation", action="store_true",
                           help="Analyze propagation cost (architecture coupling)")
     analysis.add_argument("-E", "--echo-comments", action="store_true",
-                          help="Detect echo comments. Requires \[semantic] extra")
+                          help="Detect echo comments")
     analysis.add_argument("-D", "--dead-code", action="store_true",
                           help="Detect dead code - functions/methods with no callers")
     analysis.add_argument("-T", "--tramp-data", action="store_true",
