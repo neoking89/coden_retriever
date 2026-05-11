@@ -449,8 +449,10 @@ def get_pattern_matcher() -> PatternMatcher:
     return _default_pattern_matcher
 
 
+# WHY KEPT: Not called in production, but every test in test_file_edit_core.py
+# depends on this via autouse fixture to isolate singleton state between tests.
 def reset_singletons() -> None:
-    """Reset all singleton instances. Useful for testing."""
+    """Reset all singleton instances. Used by test fixtures to isolate state between test cases."""
     global _default_file_cache, _default_path_permissions, _default_undo_manager, _default_pattern_matcher
     with _init_lock:
         _default_file_cache = None

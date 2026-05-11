@@ -10,7 +10,8 @@ Provides styled console components for the coding agent:
 import io
 import sys
 import threading
-from typing import Any, Sequence
+from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 from rich import box
 from rich.console import Console, Group
@@ -20,11 +21,14 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.rule import Rule
-from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
+from ..constants import WALL_CLOCK_FORMAT
 from .models import ReActStep
+
+if TYPE_CHECKING:
+    from .shell_exec import ShellResult
 
 # Fix Windows console encoding for Unicode support
 if sys.platform == "win32":
@@ -50,6 +54,7 @@ AGENT_THEME = Theme({
     "warning": "bold yellow",
     "error": "bold red",
     "info": "dim",
+    "tokens": "dim cyan",
 })
 
 # Create themed console with force_terminal for better Windows compatibility
@@ -237,19 +242,6 @@ def print_agent_response(response_text: str) -> None:
     console.print()
 
 
-def print_streaming_response(text: str, is_complete: bool = False) -> Markdown:
-    """Create a Markdown renderable for streaming display.
-
-    Args:
-        text: The current accumulated text.
-        is_complete: Whether the response is complete.
-
-    Returns:
-        A Markdown renderable for use with Live.
-    """
-    return Markdown(text)
-
-
 def get_user_input() -> str:
     """Get styled user input with Rich prompt.
 
@@ -297,6 +289,8 @@ def print_welcome(
     welcome_lines.append("     Then run local models in agent model: ", style="dim")
     welcome_lines.append("/model ollama:qwen2.5-coder:14b\n", style="cyan")
     welcome_lines.append("     Or cloud models (ollama signin): ", style="dim")
+    welcome_lines.append("/model ollama:gemma4:31b-cloud", style="cyan")
+    welcome_lines.append(" or ", style="dim")
     welcome_lines.append("/model ollama:gpt-oss:20b-cloud\n", style="cyan")
     welcome_lines.append("     For GGUF: ", style="dim")
     welcome_lines.append("llama-server -m model.gguf", style="cyan")
@@ -329,7 +323,7 @@ def print_welcome(
 
     # Commands line
     welcome_lines.append("Commands: ", style="bold green")
-    commands = ["/help", "/cd", "/config", "/model", "/tools", "/run", "/study", "/clear", "/exit"]
+    commands = ["/help", "/cd", "/config", "/model", "/tools", "/run", "/study", "/copy", "/clear", "/exit"]
     for i, cmd in enumerate(commands):
         welcome_lines.append(cmd, style="cyan")
         if i < len(commands) - 1:
@@ -358,55 +352,97 @@ def print_goodbye() -> None:
     console.print()
 
 
-def print_help_table(tools: Sequence[Any]) -> None:
-    """Print the MCP tools help table.
-
-    Displays available tools with their descriptions, fetched dynamically
-    from the MCP server.
+def print_token_usage(
+    context_tokens: int,
+    estimated: bool = False,
+    elapsed_seconds: float | None = None,
+    wall_start: datetime | None = None,
+    wall_end: datetime | None = None,
+) -> None:
+    """Print a compact context-usage line after the agent's response.
 
     Args:
-        tools: List of MCP tool objects with 'name' and 'description' attributes.
+        context_tokens: Retained tokens in the active context window after the turn.
+        estimated: Whether the count is a local estimate (prefix with ~).
+        elapsed_seconds: Total response duration in seconds (monotonic).
+        wall_start: Wall-clock time when the query started.
+        wall_end: Wall-clock time when the response finished.
     """
+    if context_tokens == 0:
+        return
+
+    prefix = "~" if estimated else ""
+    line = Text()
+    line.append(f"  {prefix}{context_tokens:,}", style="cyan")
+    line.append(" tokens in context", style="dim")
+
+    if elapsed_seconds is not None and wall_start is not None and wall_end is not None:
+        start_str = wall_start.strftime(WALL_CLOCK_FORMAT)
+        end_str = wall_end.strftime(WALL_CLOCK_FORMAT)
+        line.append("  \u2502  ", style="dim")
+        line.append(f"{elapsed_seconds:.1f}s", style="bold green")
+        line.append(f"  {start_str} \u2192 {end_str}", style="dim")
+
+    console.print(line)
+
+
+def print_session_baseline(baseline_tokens: int, tool_count: int) -> None:
+    """Print the measured system+tools context floor after the first turn."""
+    if baseline_tokens == 0:
+        return
+
+    line = Text()
+    line.append("  base context: ", style="dim")
+    line.append(f"{baseline_tokens:,}", style="cyan")
+    line.append(" tokens (system + ", style="dim")
+    line.append(f"{tool_count}", style="cyan")
+    line.append(" tool defs, measured)", style="dim")
+    console.print(line)
+
+
+def print_shell_result(result: "ShellResult") -> None:
+    """Render a ShellResult in a styled panel.
+
+    Border colour encodes outcome at-a-glance: green=success, red=non-zero,
+    yellow=timeout. ShellResult is imported under TYPE_CHECKING only so there
+    is no runtime circular dependency between rich_console and shell_exec.
+    """
+    title = Text()
+    title.append("$ ", style="dim")
+    title.append(result.cmd, style="bold")
+    title.append(f"   [{result.shell_kind.value}]", style="dim")
+
+    body = Text()
+    if result.stdout:
+        body.append(result.stdout.rstrip("\n"))
+    if result.stderr.strip():
+        if body.plain:
+            body.append("\n")
+        body.append("[stderr] ", style="observation.error")
+        body.append(result.stderr.rstrip("\n"), style="observation.error")
+    if not body.plain:
+        body.append("(no output)", style="dim")
+
+    if result.timed_out:
+        border = "yellow"
+    elif result.returncode != 0:
+        border = "red"
+    else:
+        border = "dim green"
+
+    footer_bits = [f"exit {result.returncode}", f"{result.elapsed_s:.2f}s"]
+    if result.timed_out:
+        footer_bits.append("timed out")
+    if result.truncated:
+        footer_bits.append("truncated")
+    subtitle = Text(" · ".join(footer_bits), style="dim")
+
     console.print()
-
-    table = Table(
-        title="Available MCP Tools",
-        box=box.ROUNDED,
-        header_style="bold cyan",
-        title_style="bold green",
-    )
-    table.add_column("Tool", style="cyan", no_wrap=True)
-    table.add_column("Description", style="green")
-
-    for tool in tools:
-        # Get first line of description for concise display
-        description = tool.description or ""
-        first_line = description.split("\n")[0].strip()
-        # Truncate if too long
-        if len(first_line) > 80:
-            first_line = first_line[:77] + "..."
-        table.add_row(tool.name, first_line)
-
-    console.print(table)
-
-    # Additional help info
-    console.print()
-    help_text = Text()
-    help_text.append("Commands: ", style="bold")
-    help_text.append("tools", style="bold cyan")
-    help_text.append(" (show this list), ")
-    help_text.append("run", style="bold yellow")
-    help_text.append("/")
-    help_text.append("execute", style="bold yellow")
-    help_text.append(" (run a tool manually), ")
-    help_text.append("exit", style="bold red")
-    help_text.append("/")
-    help_text.append("quit", style="bold red")
-    help_text.append("/")
-    help_text.append("q", style="bold red")
-    help_text.append(" (stop agent)")
-    console.print(help_text)
-    console.print()
+    console.print(title)
+    console.print(Panel(
+        body, border_style=border, box=box.MINIMAL,
+        padding=(0, 1), subtitle=subtitle, subtitle_align="right",
+    ))
 
 
 def print_warning(message: str) -> None:
@@ -537,12 +573,3 @@ def print_fatal_error(e: BaseException, show_traceback: bool = True) -> None:
 
         # Print traceback in dim style so error message stands out
         console.print(Text(tb_str, style="dim"))
-
-
-def print_thinking() -> Text:
-    """Create a 'thinking' indicator for live display.
-
-    Returns:
-        A Text object with a spinner-like indicator.
-    """
-    return Text("🤔 Thinking...", style="dim italic")

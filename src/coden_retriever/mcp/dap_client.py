@@ -7,31 +7,36 @@ The model can set breakpoints, step through code, inspect variables, and more.
 Uses debugpy in server mode (--listen --wait-for-client) with socket connection.
 """
 import asyncio
-import json
 import logging
-import platform
-import socket
-import subprocess
-import sys
-import threading
 import queue
+import threading
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..constants import DEFAULT_DEBUG_PORT
+from .adapters.base import DebugAdapter, IdentityPathMapper, LaunchConfig, PathMapper
+from .dap_breakpoint_ops import DAPBreakpointOps
+from .dap_breakpoint_tracker import BreakpointTracker, DebugBreakpoint
+from .dap_constants import (
+    DAP_MSG_POLL_INTERVAL,
+    DAP_STACK_PAUSE_TIMEOUT,
+)
+from .dap_inspection import DAPInspection
+from .dap_lifecycle import DAPLifecycle
+from .dap_protocol import DAPProtocol
+from .dap_status import DebugResult
+from .dap_transport import DAPTransport, SocketTransport
+
+# Re-export DebugBreakpoint for back-compat with callers that import it from
+# this module's old location (e.g. tests/mcp/test_dap_client_fixes.py).
+__all__ = ["DAPClient", "DebugBreakpoint", "PROGRAM_OUTPUT_BUFFER_CAP"]
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass
-class DebugBreakpoint:
-    """A verified breakpoint."""
-    id: int
-    file: str
-    line: int
-    verified: bool = True
-    condition: str | None = None
+# Keep program_output bounded — a chatty test can otherwise grow the list
+# unboundedly over a long debug session. 100 lines is enough context for
+# the termination summary; older output is trimmed FIFO.
+PROGRAM_OUTPUT_BUFFER_CAP = 100
 
 
 @dataclass
@@ -61,6 +66,7 @@ class DebugState:
     stopped_reason: str | None = None
     stopped_file: str | None = None
     stopped_line: int | None = None
+    stopped_description: str | None = None  # Exception text from DAP stopped event
     thread_id: int | None = None
     current_frame_id: int | None = None
     program: str | None = None
@@ -70,30 +76,65 @@ class DebugState:
 
 class DAPClient:
     """
-    Debug Adapter Protocol client for communicating with debugpy.
+    Debug Adapter Protocol client for communicating with DAP servers.
 
-    Uses debugpy in server mode: starts the script with debugpy --listen --wait-for-client,
-    then connects via socket for DAP communication.
+    Per-adapter transport: socket (debugpy) or stdio (everything else) via
+    the `DebugAdapter` abstraction.
+
+    Note on public method count: this class has ~22 public methods,
+    exceeding the project 7-method limit (CLAUDE.md). Exempt by design —
+    each public method maps 1:1 to a DAP protocol command, and the class
+    is a thin wire-level façade. Splitting into sub-objects (`.wire`,
+    `.introspection`) would fragment the protocol surface without adding
+    value. Invariant traded: MCP envelopes stay OUT of this class — no
+    error-dict shapes, no capability checks here. Those live one layer
+    up in debug_inspect.py / debug_simplified.py.
     """
 
     DEFAULT_PORT = DEFAULT_DEBUG_PORT
 
-    def __init__(self):
-        self._socket: socket.socket | None = None
-        self._process: subprocess.Popen | None = None
-        self._seq = 0
-        self._pending_requests: dict[int, asyncio.Future] = {}
-        self._reader_thread: threading.Thread | None = None
+    def __init__(self) -> None:
+        # Default to SocketTransport; launch() swaps in StdioTransport when
+        # the adapter declares transport_type="stdio".
+        self.transport: DAPTransport = SocketTransport()
+        self.protocol = DAPProtocol(self.transport)
+        self._adapter: DebugAdapter | None = None
+        self._path_mapper: PathMapper = IdentityPathMapper()
+        # Port obtained from `adapter.prepare_launch(cfg)` — when non-None AND
+        # the adapter uses socket transport AND its argv is empty, `_spawn_adapter_process`
+        # bypasses the subprocess spawn and dials this port directly. Reset in stop().
+        self._prepared_port: int | None = None
         self._message_processor_task: asyncio.Task | None = None
         self._state = DebugState()
-        self._breakpoints: dict[str, list[DebugBreakpoint]] = {}  # file -> breakpoints
-        self._capabilities: dict[str, Any] = {}
+        self.breakpoints = BreakpointTracker()
         self._stop_event = asyncio.Event()
-        self._lock = asyncio.Lock()
-        self._message_queue: queue.Queue = queue.Queue()
+        # Per DAP spec, the adapter emits 'initialized' after the initialize
+        # response to signal it's ready for configuration (setBreakpoints,
+        # configurationDone). Sending those before the event causes debugpy
+        # to reject configurationDone with 'only allowed during handling of
+        # a launch or an attach request'.
+        self._initialized_event = asyncio.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._running = False
-        self._port = self.DEFAULT_PORT
+        self.last_reset_dirty: bool = False  # True when stop() couldn't join the reader thread cleanly
+        self._event_handlers: dict[str, Callable[[dict], None]] = {
+            "initialized": self._on_initialized,
+            "stopped": self._on_stopped,
+            "terminated": self._on_terminated,
+            "exited": self._on_exited,
+            "thread": self._on_thread,
+            "output": self._on_output,
+            "continued": self._on_continued,
+        }
+        # `_append_program_output` is invoked from BOTH the asyncio event
+        # loop (via `_on_output`) AND the stderr drain `threading.Thread`.
+        # Without a mutex the non-atomic append + slice-trim can drop
+        # lines or raise IndexError under load. A `threading.Lock` (not
+        # asyncio.Lock) is required because one caller is a pure thread.
+        self._program_output_lock = threading.Lock()
+        self._inspection = DAPInspection(self)
+        self._bp_ops = DAPBreakpointOps(self)
+        self._lifecycle = DAPLifecycle(self)
 
     @property
     def state(self) -> DebugState:
@@ -103,7 +144,27 @@ class DAPClient:
     @property
     def is_connected(self) -> bool:
         """Check if connected to debug adapter."""
-        return self._socket is not None and self._running
+        return self.transport.is_connected and self._running
+
+    def capability(self, name: str) -> bool:
+        """Read a single capability reported by the adapter's initialize response.
+
+        Used by MCP tools to gate capability-dependent requests (e.g., conditional
+        breakpoints) before they reach the adapter. `.get(..., False)` is
+        deliberately conservative: an adapter that omits a flag is treated as
+        not supporting it.
+        """
+        return bool(self.protocol.capabilities.get(name))
+
+    @property
+    def adapter_name(self) -> str:
+        """Registered adapter name for the active session, or a placeholder if none."""
+        return self._adapter.name if self._adapter else "<unknown>"
+
+    @property
+    def adapter(self) -> DebugAdapter | None:
+        """Adapter instance for the active session, or None before launch/attach."""
+        return self._adapter
 
     async def start(self, python_path: str | None = None) -> dict[str, Any]:
         """
@@ -115,453 +176,169 @@ class DAPClient:
         Returns:
             Status dict.
         """
-        # Connection happens during launch, just return ready status
-        return {"status": "ready", "message": "Use debug_launch to start debugging a script"}
+        return DebugResult.ready("Use debug_launch to start debugging a script").to_dict()
 
     async def stop(self) -> dict[str, Any]:
         """Stop the debug session and clean up."""
-        self._running = False
+        return await self._lifecycle.stop()
 
-        # Cancel message processor task
-        if self._message_processor_task and not self._message_processor_task.done():
-            self._message_processor_task.cancel()
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(self._message_processor_task),
-                    timeout=1.0
-                )
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
-            self._message_processor_task = None
-
-        if self._socket:
-            try:
-                # Try graceful disconnect with short timeout
-                await asyncio.wait_for(
-                    self._send_request("disconnect", {"terminateDebuggee": True}),
-                    timeout=2.0
-                )
-            except Exception:
-                pass
-            try:
-                self._socket.close()
-            except Exception:
-                pass
-            self._socket = None
-
-        # Wait for reader thread to finish
-        if self._reader_thread and self._reader_thread.is_alive():
-            self._reader_thread.join(timeout=1.0)
-            self._reader_thread = None
-
-        if self._process:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-            self._process = None
-
-        self._state = DebugState()
-        self._breakpoints.clear()
-        self._pending_requests.clear()
-        self._seq = 0
-
-        return {"status": "stopped"}
+    async def attach(
+        self,
+        adapter: DebugAdapter,
+        *,
+        host: str = "127.0.0.1",
+        port: int = DEFAULT_DEBUG_PORT,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        """Attach to an already-running DAP adapter on `host:port`."""
+        return await self._lifecycle.attach(
+            adapter, host=host, port=port, timeout=timeout,
+        )
 
     async def launch(
         self,
-        program: str,
-        args: list[str] | None = None,
-        cwd: str | None = None,
-        env: dict[str, str] | None = None,
-        stop_on_entry: bool = False,
+        cfg: LaunchConfig,
+        adapter: DebugAdapter,
+        *,
         timeout: float = 30.0,
-        python_path: str | None = None,
     ) -> dict[str, Any]:
-        """
-        Launch a Python script for debugging.
-
-        Args:
-            program: Path to the Python script to debug.
-            args: Command line arguments for the script.
-            cwd: Working directory.
-            env: Environment variables.
-            stop_on_entry: If True, break at the first line.
-            timeout: Maximum time to wait for launch (seconds).
-            python_path: Path to Python interpreter.
-
-        Returns:
-            Launch result.
-        """
-        # Clean up any existing session
-        if self.is_connected:
-            await self.stop()
-
-        program_path = Path(program).resolve()
-        if not program_path.exists():
-            return {"error": f"Program not found: {program}"}
-
-        python = python_path or sys.executable
-        self._port = self._find_free_port()
-
-        # Build debugpy command
-        cmd = [
-            python, "-m", "debugpy",
-            "--listen", f"127.0.0.1:{self._port}",
-            "--wait-for-client",
-            str(program_path),
-        ]
-
-        if args:
-            cmd.extend(args)
-
-        # Set up working directory and environment
-        proc_cwd = cwd or str(program_path.parent)
-        proc_env = None
-        if env:
-            import os
-            proc_env = os.environ.copy()
-            proc_env.update(env)
-
-        # Start the debug server
-        # Use DEVNULL and CREATE_NEW_PROCESS_GROUP on Windows to avoid
-        # pipe deadlock and handle inheritance issues in nested subprocess contexts
-        try:
-            creation_flags = 0
-            if platform.system() == "Windows":
-                creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
-
-            self._process = subprocess.Popen(
-                cmd,
-                cwd=proc_cwd,
-                env=proc_env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL,
-                creationflags=creation_flags,
-            )
-        except Exception as e:
-            return {"error": f"Failed to start debugpy: {e}"}
-
-        # Wait for debugpy to start
-        await asyncio.sleep(0.5)
-
-        # Check if process is still running
-        if self._process.poll() is not None:
-            return {"error": f"debugpy exited immediately with code {self._process.returncode}"}
-
-        # Connect to the debug server
-        try:
-            await self._connect(timeout=timeout)
-        except Exception as e:
-            self._process.terminate()
-            self._process = None
-            return {"error": f"Failed to connect to debugpy: {e}"}
-
-        # Initialize the adapter
-        try:
-            response = await self._send_request("initialize", {
-                "clientID": "mcp-debugger",
-                "clientName": "MCP Debug Client",
-                "adapterID": "debugpy",
-                "pathFormat": "path",
-                "linesStartAt1": True,
-                "columnsStartAt1": True,
-                "supportsVariableType": True,
-            }, timeout=timeout)
-        except asyncio.TimeoutError:
-            await self.stop()
-            return {"error": "Initialize timed out"}
-
-        if not response.get("success"):
-            await self.stop()
-            return {"error": response.get("message", "Initialize failed")}
-
-        self._capabilities = response.get("body", {})
-
-        # Use attach (not launch) because debugpy is already running
-        # Send attach request - response may come after other events
-        await self._send_request("attach", {"justMyCode": False}, timeout=timeout)
-
-        # Set breakpoint at first executable line if stop_on_entry
-        # Find first non-docstring/non-comment line
-        first_line = self._find_first_code_line(program_path) if stop_on_entry else None
-        if first_line:
-            await self._send_request("setBreakpoints", {
-                "source": {"path": str(program_path)},
-                "breakpoints": [{"line": first_line}],
-            })
-
-        # Send configurationDone to start execution
-        try:
-            cfg_response = await self._send_request("configurationDone", {}, timeout=timeout)
-        except asyncio.TimeoutError:
-            await self.stop()
-            return {"error": "configurationDone timed out"}
-
-        if not cfg_response.get("success"):
-            await self.stop()
-            return {"error": cfg_response.get("message", "configurationDone failed")}
-
-        self._state.is_running = True
-        self._state.is_stopped = False
-        self._state.program = str(program_path)
-        self._state.program_output = []
-        self._state.program_terminated = False
-
-        # Wait for stop if stop_on_entry
-        if stop_on_entry:
-            stopped = await self._wait_for_stop(timeout=timeout)
-            if stopped:
-                return {
-                    "status": "launched",
-                    "program": str(program_path),
-                    "stopped": True,
-                    "reason": self._state.stopped_reason,
-                    "file": self._state.stopped_file,
-                    "line": self._state.stopped_line,
-                }
-
-        return {
-            "status": "launched",
-            "program": str(program_path),
-            "stopped": self._state.is_stopped,
-        }
-
-    def _find_free_port(self) -> int:
-        """Find a free port for debugpy."""
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('127.0.0.1', 0))
-            return s.getsockname()[1]
-
-    def _find_first_code_line(self, program_path: Path) -> int | None:
-        """Find the first executable line in a Python file."""
-        try:
-            content = program_path.read_text()
-            lines = content.split("\n")
-            in_docstring = False
-            docstring_char = None
-
-            for i, line in enumerate(lines, 1):
-                stripped = line.strip()
-
-                # Skip empty lines
-                if not stripped:
-                    continue
-
-                # Skip comments
-                if stripped.startswith("#"):
-                    continue
-
-                # Handle docstrings
-                if stripped.startswith('"""') or stripped.startswith("'''"):
-                    quote = stripped[:3]
-                    if in_docstring and docstring_char == quote:
-                        in_docstring = False
-                        docstring_char = None
-                    elif not in_docstring:
-                        # Check if docstring ends on same line
-                        if stripped.count(quote) >= 2:
-                            continue
-                        in_docstring = True
-                        docstring_char = quote
-                    continue
-
-                if in_docstring:
-                    if docstring_char and docstring_char in stripped:
-                        in_docstring = False
-                        docstring_char = None
-                    continue
-
-                # This is a code line
-                return i
-
-            return 1  # Fallback to line 1
-        except Exception:
-            return 1
-
-    async def _connect(self, timeout: float = 10.0) -> None:
-        """Connect to the debugpy server."""
-        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._socket.settimeout(timeout)
-
-        # Retry connection a few times
-        start = asyncio.get_event_loop().time()
-        while asyncio.get_event_loop().time() - start < timeout:
-            try:
-                self._socket.connect(('127.0.0.1', self._port))
-                break
-            except (ConnectionRefusedError, socket.timeout):
-                await asyncio.sleep(0.2)
-        else:
-            raise ConnectionError(f"Could not connect to debugpy on port {self._port}")
-
-        self._socket.setblocking(False)
-        self._running = True
-        self._loop = asyncio.get_event_loop()
-
-        # Start reader thread
-        self._message_queue = queue.Queue()
-        self._reader_thread = threading.Thread(target=self._reader_thread_func, daemon=True)
-        self._reader_thread.start()
-
-        # Start message processor
-        self._message_processor_task = asyncio.create_task(self._process_messages())
-
-    def _reader_thread_func(self) -> None:
-        """Read messages from socket in a separate thread."""
-        if not self._socket:
-            return
-
-        buffer = b""
-        self._socket.setblocking(True)
-        self._socket.settimeout(0.5)
-
-        while self._running:
-            try:
-                chunk = self._socket.recv(4096)
-                if not chunk:
-                    if self._running:
-                        logger.debug("Socket closed by server")
-                    break
-
-                buffer += chunk
-
-                # Parse complete messages
-                while True:
-                    header_end = buffer.find(b"\r\n\r\n")
-                    if header_end == -1:
-                        break
-
-                    header = buffer[:header_end].decode("utf-8")
-                    content_length = 0
-                    for line in header.split("\r\n"):
-                        if line.lower().startswith("content-length:"):
-                            content_length = int(line.split(":")[1].strip())
-                            break
-
-                    if content_length == 0:
-                        break
-
-                    msg_start = header_end + 4
-                    msg_end = msg_start + content_length
-
-                    if len(buffer) < msg_end:
-                        break
-
-                    content = buffer[msg_start:msg_end].decode("utf-8")
-                    buffer = buffer[msg_end:]
-
-                    try:
-                        msg = json.loads(content)
-                        self._message_queue.put(msg)
-                    except json.JSONDecodeError:
-                        logger.warning(f"Invalid JSON: {content[:100]}")
-
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self._running:
-                    logger.debug(f"Reader thread error: {e}")
-                break
+        """Spawn the adapter for `cfg.program` and drive the DAP handshake."""
+        return await self._lifecycle.launch(cfg, adapter, timeout=timeout)
 
     async def _process_messages(self) -> None:
-        """Process messages from the queue."""
+        """Drain the transport's queue into the message handler."""
         while self._running:
             try:
-                msg = self._message_queue.get_nowait()
+                msg = self.transport.message_queue.get_nowait()
                 await self._handle_message(msg)
             except queue.Empty:
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(DAP_MSG_POLL_INTERVAL)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.debug(f"Message processor error: {e}")
 
-    async def _send_request(self, command: str, arguments: dict, timeout: float = 30.0) -> dict:
-        """Send a DAP request and wait for response."""
-        async with self._lock:
-            self._seq += 1
-            seq = self._seq
-
-            message = {
-                "seq": seq,
-                "type": "request",
-                "command": command,
-                "arguments": arguments,
-            }
-
-            future: asyncio.Future = asyncio.Future()
-            self._pending_requests[seq] = future
-
-            await self._write_message(message)
-
-            try:
-                response = await asyncio.wait_for(future, timeout=timeout)
-                return response
-            except asyncio.TimeoutError:
-                self._pending_requests.pop(seq, None)
-                return {"success": False, "message": f"Timeout waiting for {command} response"}
-
-    async def _write_message(self, message: dict) -> None:
-        """Write a DAP message to the socket."""
-        if not self._socket:
-            return
-
-        content = json.dumps(message)
-        data = f"Content-Length: {len(content)}\r\n\r\n{content}"
-
-        # Use run_in_executor for the blocking socket send
-        if self._socket is None:
-            raise ConnectionError("Socket not connected")
-        sock = self._socket  # Capture for lambda
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, lambda: sock.sendall(data.encode("utf-8")))
-
     async def _handle_message(self, message: dict) -> None:
-        """Handle a message from the adapter."""
+        """Handle a message from the adapter (response, event, or reverse request)."""
         msg_type = message.get("type")
-
         if msg_type == "response":
-            request_seq = message.get("request_seq")
-            if request_seq in self._pending_requests:
-                future = self._pending_requests.pop(request_seq)
-                if not future.done():
-                    future.set_result(message)
+            self.protocol.route_response(message)
+            return
+        if msg_type == "request":
+            await self._handle_reverse_request(message)
+            return
+        if msg_type != "event":
+            return
+        event_name = message.get("event", "")
+        body = message.get("body", {})
+        handler = self._event_handlers.get(event_name)
+        if handler is not None:
+            handler(body)
+        # Adapter-level hook runs for every event, built-in or not — lets
+        # adapters like R service vscDebugger's `custom/writeToStdin` events
+        # that the built-in handlers don't cover.
+        if self._adapter is not None:
+            await self._adapter.handle_adapter_event(self, event_name, body)
 
-        elif msg_type == "event":
-            event = message.get("event")
-            body = message.get("body", {})
+    async def _handle_reverse_request(self, message: dict) -> None:
+        """Route a server→client DAP `request` through the active adapter.
 
-            if event == "stopped":
-                self._state.is_stopped = True
-                self._state.stopped_reason = body.get("reason", "unknown")
-                self._state.thread_id = body.get("threadId")
-                self._stop_event.set()
+        Every request must get a response per DAP spec, even on error — we
+        never drop the message. Adapter exceptions become a well-formed
+        failure response rather than propagating up into the message loop.
+        """
+        command = message.get("command", "")
+        arguments = message.get("arguments", {}) or {}
+        request_seq = message.get("seq", 0)
+        if self._adapter is None:
+            success, body = False, {"error": "no adapter bound to this session"}
+        else:
+            try:
+                success, body = await self._adapter.handle_reverse_request(
+                    command, arguments,
+                )
+            except Exception as exc:
+                success, body = False, {
+                    "error": f"reverse-request handler raised: {exc}",
+                }
+        await self.protocol.send_response(request_seq, command, success, body)
 
-            elif event == "terminated":
-                self._state.is_running = False
-                self._state.is_stopped = False
-                self._state.program_terminated = True
-                self._stop_event.set()
+    def _on_initialized(self, body: dict) -> None:
+        self._initialized_event.set()
 
-            elif event == "exited":
-                exit_code = body.get("exitCode", 0)
-                self._state.is_running = False
-                self._state.program_terminated = True
-                self._state.program_output.append(f"[Process exited with code {exit_code}]")
-                self._stop_event.set()
+    def _clear_stop_state(self) -> None:
+        """Clear stop-related state when execution resumes or the program exits.
 
-            elif event == "output":
-                category = body.get("category", "console")
-                output = body.get("output", "")
-                if output.strip() and category not in ("telemetry",):
-                    self._state.program_output.append(output.rstrip())
-                    if len(self._state.program_output) > 100:
-                        self._state.program_output = self._state.program_output[-100:]
-                if category == "telemetry":
-                    logger.debug(f"[{category}] {output.strip()}")
+        Without this, get_status() reports a stale stopped_reason (e.g.
+        "breakpoint") even while is_stopped=False, confusing callers.
+        """
+        self._state.stopped_reason = None
+        self._state.stopped_description = None
+        self._state.stopped_file = None
+        self._state.stopped_line = None
+
+    def _on_stopped(self, body: dict) -> None:
+        self._state.is_stopped = True
+        self._state.stopped_reason = body.get("reason", "unknown")
+        self._state.thread_id = body.get("threadId")
+        if body.get("reason") == "exception":
+            self._state.stopped_description = body.get("text") or body.get("description")
+        else:
+            self._state.stopped_description = None
+        self.breakpoints.track_hit_event(body)
+        self._stop_event.set()
+        # Adapter-level side-effect hook — R injects a `.vsc.listenForDAP()`
+        # kickoff into stdin when paused on exception so the DAP channel
+        # stays reachable. Default no-op on every other adapter.
+        if self._adapter is not None:
+            self._adapter.on_stopped(self, body)
+
+    def _on_terminated(self, body: dict) -> None:
+        self._state.is_running = False
+        self._state.is_stopped = False
+        self._state.program_terminated = True
+        self._clear_stop_state()
+        self._stop_event.set()
+
+    def _on_exited(self, body: dict) -> None:
+        exit_code = body.get("exitCode", 0)
+        self._state.is_running = False
+        self._state.program_terminated = True
+        self._state.program_output.append(f"[Process exited with code {exit_code}]")
+        self._clear_stop_state()
+        self._stop_event.set()
+
+    def _on_thread(self, body: dict) -> None:
+        logger.debug(
+            f"Thread event: {body.get('reason', 'unknown')} (id={body.get('threadId')})"
+        )
+
+    def _on_continued(self, body: dict) -> None:
+        self._state.is_stopped = False
+        self._clear_stop_state()
+
+    def _on_output(self, body: dict) -> None:
+        category = body.get("category", "console")
+        output = body.get("output", "")
+        if output.strip() and category not in ("telemetry",):
+            self._append_program_output(output.rstrip())
+        if category == "telemetry":
+            logger.debug(f"[{category}] {output.strip()}")
+
+    def _append_program_output(self, line: str) -> None:
+        """Append a single line to program_output, capped at PROGRAM_OUTPUT_BUFFER_CAP.
+
+        Used by DAP `output` events and by the stderr drain thread (SC-003).
+        The append + trim runs under `_program_output_lock` because the two
+        call sites live in different concurrency domains (asyncio loop vs
+        OS thread) and the list mutation is not atomic.
+        """
+        if not line:
+            return
+        with self._program_output_lock:
+            self._state.program_output.append(line)
+            if len(self._state.program_output) > PROGRAM_OUTPUT_BUFFER_CAP:
+                self._state.program_output = self._state.program_output[-PROGRAM_OUTPUT_BUFFER_CAP:]
 
     async def _wait_for_stop(self, timeout: float = 30.0) -> bool:
         """Wait for the debugger to stop or terminate."""
@@ -575,128 +352,70 @@ class DAPClient:
 
         # Auto-populate frame_id and location when stopped
         if self._state.is_stopped and not self._state.program_terminated:
-            await self._refresh_frame_context()
+            await self._inspection.refresh_frame_context()
 
         return True
-
-    async def _refresh_frame_context(self) -> None:
-        """Refresh frame context (frame_id, file, line) after stopping.
-
-        This is called automatically after any stop to ensure evaluate() and
-        get_variables() work correctly with the current frame.
-        """
-        if not self._state.thread_id:
-            return
-
-        try:
-            response = await self._send_request("stackTrace", {
-                "threadId": self._state.thread_id,
-                "startFrame": 0,
-                "levels": 1,
-            }, timeout=5.0)
-
-            if response.get("success"):
-                frames = response.get("body", {}).get("stackFrames", [])
-                if frames:
-                    top_frame = frames[0]
-                    self._state.current_frame_id = top_frame.get("id")
-                    source = top_frame.get("source", {})
-                    self._state.stopped_file = source.get("path")
-                    self._state.stopped_line = top_frame.get("line", 0)
-        except Exception as e:
-            logger.debug(f"Failed to refresh frame context: {e}")
 
     def _get_stop_info(self) -> dict[str, Any]:
         """Get info about current stop."""
         if self._state.is_stopped:
-            return {
-                "status": "stopped",
-                "reason": self._state.stopped_reason,
-                "file": self._state.stopped_file,
-                "line": self._state.stopped_line,
-            }
-        elif self._state.program_terminated:
-            return {
-                "status": "terminated",
-                "output": self._state.program_output[-10:] if self._state.program_output else [],
-            }
-        elif not self._state.is_running:
-            return {"status": "not_running"}
-        else:
-            return {"status": "running"}
+            return DebugResult.stop_info(
+                reason=self._state.stopped_reason,
+                file=self._state.stopped_file,
+                line=self._state.stopped_line,
+                exception=self._state.stopped_description,
+            ).to_dict()
+        if self._state.program_terminated:
+            output = self._state.program_output[-10:] if self._state.program_output else []
+            return DebugResult.terminated(output=output).to_dict()
+        if not self._state.is_running:
+            return DebugResult.not_running().to_dict()
+        return DebugResult.running().to_dict()
 
     async def set_breakpoints(
         self,
         file: str,
         lines: list[int],
         conditions: dict[int, str] | None = None,
+        log_messages: dict[int, str] | None = None,
     ) -> dict[str, Any]:
         """Set breakpoints in a file."""
-        if not self.is_connected:
-            return {"error": "Not connected. Launch a program first."}
+        return await self._bp_ops.set_breakpoints(
+            file, lines, conditions=conditions, log_messages=log_messages,
+        )
 
-        file_path = Path(file).resolve()
-        if not file_path.exists():
-            return {"error": f"File not found: {file}"}
-
-        conditions = conditions or {}
-        breakpoints: list[dict[str, Any]] = []
-        for line in lines:
-            bp: dict[str, Any] = {"line": line}
-            if line in conditions:
-                bp["condition"] = conditions[line]
-            breakpoints.append(bp)
-
-        response = await self._send_request("setBreakpoints", {
-            "source": {"path": str(file_path)},
-            "breakpoints": breakpoints,
-        })
-
-        if response.get("success"):
-            verified = []
-            for bp in response.get("body", {}).get("breakpoints", []):
-                dbp = DebugBreakpoint(
-                    id=bp.get("id", 0),
-                    file=str(file_path),
-                    line=bp.get("line", 0),
-                    verified=bp.get("verified", False),
-                )
-                verified.append(dbp)
-
-            self._breakpoints[str(file_path)] = verified
-
-            return {
-                "status": "success",
-                "breakpoints": [
-                    {"id": bp.id, "file": bp.file, "line": bp.line, "verified": bp.verified}
-                    for bp in verified
-                ],
-            }
-        else:
-            return {"error": response.get("message", "Failed to set breakpoints")}
+    async def set_exception_breakpoints(self, filters: list[str]) -> dict[str, Any]:
+        """Set exception breakpoints (filters: 'raised', 'uncaught', 'userUnhandled')."""
+        return await self._bp_ops.set_exception_breakpoints(filters)
 
     async def continue_execution(self, timeout: float = 60.0) -> dict[str, Any]:
         """Continue execution until next breakpoint or program end."""
         if not self.is_connected:
             return {"error": "Not connected"}
-        if not self._state.thread_id:
+        # `is None` (not falsy) so threadId=0 is honoured — js-debug's child
+        # session uses 0 as its primary thread id.
+        if self._state.thread_id is None:
             return {"error": "No active thread"}
 
         # Clear state BEFORE clearing event to avoid race condition
         self._state.is_stopped = False
+        self._clear_stop_state()
         self._stop_event.clear()
 
-        response = await self._send_request("continue", {
+        # singleThread tells debugpy to resume only the reporting thread; others
+        # stay paused so their queued 'stopped' events surface on the next wait.
+        # Without this, debugpy coalesces sibling breakpoint hits into one event.
+        response = await self.protocol.send_request("continue", {
             "threadId": self._state.thread_id,
+            "singleThread": True,
         })
 
         if response.get("success"):
             stopped = await self._wait_for_stop(timeout=timeout)
             if not stopped and not self._state.program_terminated:
-                return {
-                    "status": "timeout",
-                    "message": f"Program did not stop within {timeout} seconds.",
-                }
+                return DebugResult.timeout(
+                    f"Program did not stop within {timeout} seconds."
+                ).to_dict()
             return self._get_stop_info()
         else:
             return {"error": response.get("message", "Continue failed")}
@@ -713,147 +432,109 @@ class DAPClient:
         """Step out of the current function."""
         return await self._step("stepOut")
 
+    async def pause(self, thread_id: int | None = None) -> dict[str, Any]:
+        """Pause execution of a running thread.
+
+        If no thread_id is known yet (no prior stop event), queries the adapter,
+        picks MainThread (or the first thread if MainThread is absent), and uses that.
+        """
+        if not self.is_connected:
+            return {"error": "Not connected"}
+        tid = thread_id if thread_id is not None else self._state.thread_id
+        if tid is None:
+            tid = await self._resolve_pause_thread()
+            if tid is None:
+                return {"error": "No threads available to pause"}
+            self._state.thread_id = tid
+
+        self._stop_event.clear()
+        response = await self.protocol.send_request("pause", {"threadId": tid})
+        if response.get("success"):
+            await self._wait_for_stop(timeout=DAP_STACK_PAUSE_TIMEOUT)
+            return self._get_stop_info()
+        return {"error": response.get("message", "Pause failed")}
+
+    async def _resolve_pause_thread(self) -> int | None:
+        """Query adapter for threads and pick MainThread or the first available."""
+        threads_result = await self.get_threads()
+        threads = threads_result.get("threads", [])
+        if not threads:
+            return None
+        for t in threads:
+            if t.get("name") == "MainThread":
+                return t["id"]
+        return threads[0]["id"]
+
+    async def get_threads(self) -> dict[str, Any]:
+        """Get all threads in the debug session."""
+        return await self._inspection.get_threads()
+
     async def _step(self, command: str, timeout: float = 30.0) -> dict[str, Any]:
         """Execute a step command."""
         if not self.is_connected:
             return {"error": "Not connected"}
-        if not self._state.thread_id:
+        if self._state.thread_id is None:
             return {"error": "No active thread"}
         if not self._state.is_stopped:
             return {"error": "Program is running. Wait for it to stop."}
 
         # Clear state BEFORE clearing event to avoid race condition
         self._state.is_stopped = False
+        self._clear_stop_state()
         self._stop_event.clear()
 
-        response = await self._send_request(command, {
+        response = await self.protocol.send_request(command, {
             "threadId": self._state.thread_id,
             "granularity": "statement",
+            "singleThread": True,
         })
 
         if response.get("success"):
             stopped = await self._wait_for_stop(timeout=timeout)
             if not stopped and not self._state.program_terminated:
-                return {
-                    "status": "timeout",
-                    "message": f"Step did not complete within {timeout} seconds.",
-                }
+                return DebugResult.timeout(
+                    f"Step did not complete within {timeout} seconds."
+                ).to_dict()
             return self._get_stop_info()
         else:
             return {"error": response.get("message", f"{command} failed")}
 
-    async def get_stack_trace(self, levels: int = 20) -> dict[str, Any]:
-        """Get the current stack trace."""
-        if not self.is_connected:
-            return {"error": "Not connected"}
-        if not self._state.thread_id:
-            return {"error": "No active thread"}
-        if not self._state.is_stopped:
-            return {"error": "Program is running"}
-
-        response = await self._send_request("stackTrace", {
-            "threadId": self._state.thread_id,
-            "startFrame": 0,
-            "levels": levels,
-        })
-
-        if response.get("success"):
-            frames = []
-            for frame in response.get("body", {}).get("stackFrames", []):
-                source = frame.get("source", {})
-                sf = StackFrame(
-                    id=frame.get("id", 0),
-                    name=frame.get("name", ""),
-                    file=source.get("path"),
-                    line=frame.get("line", 0),
-                    column=frame.get("column", 0),
-                )
-                frames.append(sf)
-
-                # Update state with current location
-                if not self._state.stopped_file and source.get("path"):
-                    self._state.stopped_file = source.get("path")
-                    self._state.stopped_line = frame.get("line", 0)
-
-            if frames:
-                self._state.current_frame_id = frames[0].id
-
-            return {
-                "status": "success",
-                "frames": [
-                    {"id": f.id, "name": f.name, "file": f.file, "line": f.line}
-                    for f in frames
-                ],
-            }
-        else:
-            return {"error": response.get("message", "Failed to get stack trace")}
+    async def get_stack_trace(
+        self, levels: int = 20, thread_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Get the stack trace for a thread (defaults to active thread)."""
+        return await self._inspection.get_stack_trace(levels=levels, thread_id=thread_id)
 
     async def get_variables(self, frame_id: int | None = None) -> dict[str, Any]:
-        """Get variables in the current scope."""
-        if not self.is_connected:
-            return {"error": "Not connected"}
-        if not self._state.is_stopped:
-            return {"error": "Program is running"}
+        """Get variables in the current scope, grouped by scope name."""
+        return await self._inspection.get_variables(frame_id=frame_id)
 
-        frame = frame_id or self._state.current_frame_id
-        if not frame:
-            return {"error": "No frame selected. Get stack trace first."}
+    async def get_scopes(self, frame_id: int) -> dict[str, Any]:
+        """Return the DAP `scopes` response body for a given frame."""
+        return await self._inspection.get_scopes(frame_id)
 
-        scopes_response = await self._send_request("scopes", {"frameId": frame})
+    async def set_variable(
+        self,
+        variables_reference: int,
+        name: str,
+        value: str,
+    ) -> dict[str, Any]:
+        """DAP `setVariable` request — wire-level only."""
+        return await self._inspection.set_variable(variables_reference, name, value)
 
-        if not scopes_response.get("success"):
-            return {"error": scopes_response.get("message", "Failed to get scopes")}
+    async def get_variable_children(self, variables_reference: int) -> dict[str, Any]:
+        """Expand a variable to see its children (object properties, list items, etc.)."""
+        return await self._inspection.get_variable_children(variables_reference)
 
-        all_variables = {}
-
-        for scope in scopes_response.get("body", {}).get("scopes", []):
-            scope_name = scope.get("name", "Unknown")
-            var_ref = scope.get("variablesReference", 0)
-
-            if var_ref > 0:
-                vars_response = await self._send_request("variables", {
-                    "variablesReference": var_ref,
-                })
-
-                if vars_response.get("success"):
-                    scope_vars = []
-                    for var in vars_response.get("body", {}).get("variables", []):
-                        scope_vars.append({
-                            "name": var.get("name", ""),
-                            "value": var.get("value", ""),
-                            "type": var.get("type"),
-                        })
-                    all_variables[scope_name] = scope_vars
-
-        return {"status": "success", "variables": all_variables}
-
-    async def evaluate(self, expression: str, frame_id: int | None = None) -> dict[str, Any]:
+    async def evaluate(
+        self, expression: str, frame_id: int | None = None,
+    ) -> dict[str, Any]:
         """Evaluate an expression in the current context."""
-        if not self.is_connected:
-            return {"error": "Not connected"}
-        if not self._state.is_stopped:
-            return {"error": "Program is running"}
+        return await self._inspection.evaluate(expression, frame_id=frame_id)
 
-        frame = frame_id or self._state.current_frame_id
-
-        args: dict[str, Any] = {
-            "expression": expression,
-            "context": "repl",
-        }
-        if frame:
-            args["frameId"] = frame
-
-        response = await self._send_request("evaluate", args)
-
-        if response.get("success"):
-            body = response.get("body", {})
-            return {
-                "status": "success",
-                "result": body.get("result", ""),
-                "type": body.get("type"),
-            }
-        else:
-            return {"error": response.get("message", "Evaluation failed")}
+    def get_breakpoint_summary(self) -> dict[str, Any] | None:
+        """Summarize breakpoint hit/miss status. Returns None if no breakpoints were set."""
+        return self.breakpoints.get_summary()
 
     def get_status(self) -> dict[str, Any]:
         """Get the current debug session status."""
@@ -874,14 +555,22 @@ class DAPClient:
 # Global singleton
 _dap_client: DAPClient | None = None
 _dap_lock: asyncio.Lock | None = None
+# Guards the lazy init of `_dap_lock`. Without this, two coroutines can
+# each observe `_dap_lock is None` and construct their own `asyncio.Lock`,
+# leaving later callers acquiring *different* objects — zero mutual
+# exclusion. `threading.Lock` is intentional: coroutines interleave at
+# every `await`, so the check-and-set must run under a non-async
+# synchronisation primitive.
+_dap_lock_init_guard = threading.Lock()
 
 
 def _get_lock() -> asyncio.Lock:
     """Get or create the global lock (lazy initialization for event loop compatibility)."""
     global _dap_lock
-    if _dap_lock is None:
-        _dap_lock = asyncio.Lock()
-    return _dap_lock
+    with _dap_lock_init_guard:
+        if _dap_lock is None:
+            _dap_lock = asyncio.Lock()
+        return _dap_lock
 
 
 def get_dap_client() -> DAPClient:
@@ -907,8 +596,11 @@ async def reset_dap_client() -> None:
             except (asyncio.TimeoutError, Exception):
                 pass  # Force cleanup even if stop fails
             _dap_client = None
-    # Also reset the lock for next event loop
-    _dap_lock = None
+    # Also reset the lock for next event loop. Mutate under the same
+    # init guard used by `_get_lock()` so a concurrent lazy-init sees
+    # a consistent view.
+    with _dap_lock_init_guard:
+        _dap_lock = None
 
 
 async def get_or_reset_dap_client() -> DAPClient:
@@ -921,8 +613,8 @@ async def get_or_reset_dap_client() -> DAPClient:
     async with lock:
         if _dap_client is not None:
             # Check if client is in a potentially bad state
-            if _dap_client._process is not None:
-                poll_result = _dap_client._process.poll()
+            if _dap_client.transport.process is not None:
+                poll_result = _dap_client.transport.process.poll()
                 if poll_result is not None:
                     # Process has exited - reset the client
                     try:

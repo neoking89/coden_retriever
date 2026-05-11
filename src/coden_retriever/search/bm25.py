@@ -8,14 +8,12 @@ import math
 import re
 from collections import Counter, defaultdict
 from functools import lru_cache
-from typing import TYPE_CHECKING
+
+import numpy as np
+from numpy import ndarray
 
 from ..config import Config
-from ..utils.optional_deps import get_numpy
 from .base import SearchIndex
-
-if TYPE_CHECKING:
-    from numpy import ndarray
 
 
 # Pre-compiled regex patterns for tokenization (module-level for performance)
@@ -62,10 +60,9 @@ class BM25Index(SearchIndex):
         self._doc_ids: list[str] = []
         self._idf: dict[str, float] = {}
         # Inverted index: term -> (doc_indices array, term_frequencies array)
-        self._inverted_index: dict[str, tuple["ndarray", "ndarray"]] = {}
+        self._inverted_index: dict[str, tuple[ndarray, ndarray]] = {}
         # Pre-computed: k1 * (1 - b + b * (doc_len / avg_len)) per document
-        np = get_numpy()
-        self._doc_denom_part: "ndarray" = np.array([], dtype=np.float32)
+        self._doc_denom_part: ndarray = np.array([], dtype=np.float32)
 
     @staticmethod
     def tokenize(text: str) -> tuple[str, ...]:
@@ -81,7 +78,6 @@ class BM25Index(SearchIndex):
         if self._corpus_size == 0:
             return
 
-        np = get_numpy()
         self._doc_ids = list(documents.keys())
         doc_id_to_idx = {doc_id: i for i, doc_id in enumerate(self._doc_ids)}
 
@@ -130,7 +126,6 @@ class BM25Index(SearchIndex):
         except ValueError:
             return 0.0
 
-        np = get_numpy()
         score = 0.0
         for term in self.tokenize(query):
             if term not in self._inverted_index:
@@ -150,6 +145,26 @@ class BM25Index(SearchIndex):
 
         return score
 
+    def static_idf_score_all(self) -> dict[str, float]:
+        """Per-document score: sum of IDF for the document's *unique* tokens.
+
+        A query-less lexical signal: documents rich in distinctive corpus terms
+        rank higher. Reuses index-time `_idf` and `_inverted_index` — no new
+        tokenization or corpus pass.
+        """
+        if self._corpus_size == 0:
+            return {}
+
+        scores = np.zeros(self._corpus_size, dtype=np.float32)
+        for term, (indices, _freqs) in self._inverted_index.items():
+            idf = self._idf.get(term, 0.0)
+            if idf <= 0:
+                continue
+            scores[indices] += idf
+
+        relevant_indices = np.nonzero(scores)[0]
+        return {self._doc_ids[idx]: float(scores[idx]) for idx in relevant_indices}
+
     def score_all(self, query: str) -> dict[str, float]:
         """Score all documents against a query using inverted index.
 
@@ -160,7 +175,6 @@ class BM25Index(SearchIndex):
         if not query_terms or self._corpus_size == 0:
             return {}
 
-        np = get_numpy()
         # Initialize scores for all documents
         scores = np.zeros(self._corpus_size, dtype=np.float32)
 

@@ -109,7 +109,7 @@ def handle_tramp_data_command(
         min_group_size=args.min_group_size,
     )
 
-    daemon_result = try_daemon_tramp_data(params, host=config.daemon.host, port=config.daemon.port)
+    daemon_result = try_daemon_tramp_data(params, address=config.daemon.address)
     if daemon_result is not None:
         return _process_tramp_data_result(daemon_result, formatter, args, start_time, "Daemon")
 

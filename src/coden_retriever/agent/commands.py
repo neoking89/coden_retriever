@@ -12,26 +12,45 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from rich import box
 from rich.table import Table
+from rich.text import Text
 
 from ..cache import CacheManager
 from ..config import get_central_cache_root, get_project_cache_dir
+from ..constants import DEFAULT_MAX_STEPS
 from ..config_loader import (
     SETTING_LOCATIONS,
     SETTING_METADATA,
     assign_config_value,
     get_config_file,
+    get_semantic_model_path,
     load_config,
     parse_config_value,
+    read_config_value,
     reload_config,
     reset_config,
     save_config,
     validate_config_value,
 )
 from .debug_logger import create_debug_logger
+from .response_renderer import copy_last_response
 from .rich_console import Panel, console
 
 if TYPE_CHECKING:
+    from ..config_loader import AppConfig
     from .interactive_loop import CommandContext
+
+
+def _save_and_reload_config(config: "AppConfig") -> bool:
+    """Persist config to disk and refresh the cached copy.
+
+    Returns:
+        True if the save succeeded, False otherwise (warning is printed).
+    """
+    if not save_config(config):
+        console.print("[red]Warning: Failed to save config to disk[/red]")
+        return False
+    reload_config()
+    return True
 
 
 @dataclass
@@ -43,6 +62,8 @@ class Command:
     handler: Callable[..., Any]
     usage: str = ""
     aliases: list[str] = field(default_factory=list)
+    detail: str = ""  # Extended help text for /help <command>
+    examples: list[str] = field(default_factory=list)
 
 
 class CommandRegistry:
@@ -58,6 +79,8 @@ class CommandRegistry:
         description: str,
         usage: str = "",
         aliases: list[str] | None = None,
+        detail: str = "",
+        examples: list[str] | None = None,
     ) -> Callable[[Callable], Callable]:
         """Decorator to register a command handler.
 
@@ -66,6 +89,8 @@ class CommandRegistry:
             description: Short description for /help.
             usage: Usage string showing arguments.
             aliases: Alternative names for the command.
+            detail: Extended help text shown by /help <command>.
+            examples: Example usage strings for /help <command>.
 
         Returns:
             Decorator function.
@@ -77,6 +102,8 @@ class CommandRegistry:
                 handler=func,
                 usage=usage,
                 aliases=aliases or [],
+                detail=detail,
+                examples=examples or [],
             )
             self.commands[name] = cmd
 
@@ -180,9 +207,12 @@ class CommandRegistry:
 registry = CommandRegistry()
 
 
-@registry.register("help", "Show all available commands", usage="/help")
+@registry.register("help", "Show all available commands", usage="/help [command]")
 def cmd_help(args: list[str], context: "CommandContext") -> str:
-    """Display help table with all commands."""
+    """Display help table, or detailed help for a specific command."""
+    if args:
+        return _show_command_help(args[0].lower())
+
     table = Table(
         title="Available Commands",
         box=box.ROUNDED,
@@ -199,157 +229,264 @@ def cmd_help(args: list[str], context: "CommandContext") -> str:
     console.print()
     console.print(table)
     console.print()
+    console.print("[dim]Type /help <command> for detailed help on a specific command[/dim]")
+    console.print(
+        "[dim]![/dim][bold cyan]cmd[/bold cyan][dim] runs a shell command, "
+        "add [/dim][bold cyan]@@ query[/bold cyan][dim] to pipe output to the agent[/dim]"
+    )
+    console.print()
     return "help_displayed"
+
+
+def _show_command_help(name: str) -> str:
+    """Show detailed help for a specific command."""
+    cmd = registry.get_command(name)
+    if not cmd:
+        suggestions = registry.get_suggestions(name)
+        console.print(f"[red]Unknown command: {name}[/red]")
+        if suggestions:
+            console.print(f"[dim]Did you mean: /{suggestions[0]}?[/dim]")
+        return "help_error"
+
+    help_content = Text()
+    help_content.append(f"/{cmd.name}", style="bold cyan")
+    help_content.append(f"  {cmd.description}\n\n", style="green")
+
+    help_content.append("Usage: ", style="bold")
+    help_content.append(f"{cmd.usage or '/' + cmd.name}\n", style="cyan")
+
+    if cmd.aliases:
+        help_content.append("Aliases: ", style="bold")
+        help_content.append(", ".join(f"/{a}" for a in cmd.aliases), style="dim")
+        help_content.append("\n")
+
+    if cmd.detail:
+        help_content.append(f"\n{cmd.detail}\n")
+
+    if cmd.examples:
+        help_content.append("\nExamples:\n", style="bold")
+        for example in cmd.examples:
+            help_content.append(f"  {example}\n", style="cyan")
+
+    console.print()
+    console.print(Panel(help_content, border_style="cyan", padding=(0, 1)))
+    console.print()
+    return "help_displayed"
+
+
+def _build_runtime_values(
+    context: "CommandContext", config: "AppConfig",
+) -> dict[str, str]:
+    """Build a dict of setting key -> display string from runtime context and config."""
+    model = context.model or config.model.default or "ollama:"
+    base_url = context.base_url or config.model.base_url or "(auto)"
+    max_steps = context.max_steps if context.max_steps else config.agent.max_steps
+    max_retries = context.max_retries if context.max_retries else config.agent.max_retries
+    debug = context.debug if context.debug is not None else config.agent.debug
+    gen = config.model.generation
+
+    # Resolve semantic_model_path display: show the bundled default's directory
+    # name when no override is set, so users can see which embedding model is
+    # actually being used (e.g. minilm_onnx) instead of an opaque "(default)".
+    semantic_override = config.search.semantic_model_path
+    if semantic_override:
+        semantic_display = semantic_override
+    else:
+        semantic_display = f"{Path(get_semantic_model_path()).name} (default)"
+
+    return {
+        "model": str(model),
+        "base_url": str(base_url),
+        "max_steps": str(max_steps),
+        "max_retries": str(max_retries),
+        "debug": str(debug).lower(),
+        "tool_instructions": str(config.agent.tool_instructions).lower(),
+        "ask_tool_permission": str(config.agent.ask_tool_permission).lower(),
+        "dynamic_tool_filtering": str(config.agent.dynamic_tool_filtering).lower(),
+        "tool_filter_model": config.agent.tool_filter_model or "(not set)",
+        "temperature": str(gen.temperature),
+        "max_tokens": str(gen.max_tokens) if gen.max_tokens is not None else "(model default)",
+        "timeout": str(gen.timeout),
+        "api_key": "***" if gen.api_key else "(not set)",
+        "host": config.daemon.host,
+        "port": str(config.daemon.port),
+        "daemon_timeout": str(config.daemon.daemon_timeout),
+        "max_projects": str(config.daemon.max_projects),
+        "default_tokens": str(config.search.default_tokens),
+        "default_limit": str(config.search.default_limit),
+        "semantic_model_path": semantic_display,
+        "compaction_token_threshold": str(config.agent.compaction_token_threshold),
+    }
+
+
+# WHY "dynamic_tool_filtering": rewires the tool routing graph at startup, cannot hot-reload
+_RESTART_REQUIRED_SETTINGS: frozenset[str] = frozenset({"dynamic_tool_filtering"})
+
+# WHY these keys: they feed directly into the pydantic-ai ModelSettings / AgentSettings that
+# are baked into the Agent object at construction; the agent must be rebuilt to pick them up.
+_REBUILD_REQUIRED_SETTINGS: frozenset[str] = frozenset({
+    "tool_instructions", "temperature", "max_tokens",
+    "timeout", "api_key", "max_retries", "max_steps",
+    "tool_filter_model",
+})
+
+
+def _emit_config_action_feedback(key: str) -> str:
+    """Print post-save feedback and return the appropriate action string.
+
+    Args:
+        key: The setting key that was just changed.
+
+    Returns:
+        "config_set" normally, "config_changed" when agent rebuild is needed.
+    """
+    if key in _RESTART_REQUIRED_SETTINGS:
+        console.print("[yellow]Restart agent (/exit then run again) to apply[/yellow]")
+        console.print()
+        return "config_set"
+
+    if key in _REBUILD_REQUIRED_SETTINGS:
+        console.print("[dim]Applied immediately[/dim]")
+        console.print()
+        return "config_changed"
+
+    console.print()
+    return "config_set"
+
+
+def _cmd_config_set_value(
+    context: "CommandContext", config: "AppConfig", key: str, value_str: str,
+) -> str:
+    """Handle `/config set <key> <value>` — parse, validate, persist, and apply."""
+    success, parsed_value, error = parse_config_value(key, value_str)
+    if not success:
+        console.print(f"[red]{error}[/red]")
+        return "config_error"
+
+    is_valid, error = validate_config_value(key, parsed_value, check_paths=True)
+    if not is_valid:
+        console.print(f"[red]{error}[/red]")
+        return "config_error"
+
+    # "(auto)" is the display sentinel meaning "no override" — store as None
+    if key == "base_url" and value_str == "(auto)":
+        parsed_value = None
+
+    if hasattr(context, key):
+        setattr(context, key, parsed_value)
+
+    if key in SETTING_LOCATIONS:
+        assign_config_value(config, key, parsed_value)
+    else:
+        console.print(f"[yellow]Warning: {key} is read-only[/yellow]")
+        return "config_error"
+
+    _save_and_reload_config(config)
+
+    display_value = "***" if key == "api_key" and parsed_value else parsed_value
+    console.print()
+    console.print(f"[green]{key}[/green] = [cyan]{display_value}[/cyan]")
+    return _emit_config_action_feedback(key)
+
+
+def _cmd_config_toggle(
+    context: "CommandContext", config: "AppConfig", key: str,
+) -> str:
+    """Handle `/config set <key>` (no value) — toggle booleans, hint for others."""
+    if key not in SETTING_METADATA:
+        valid_keys = ", ".join(sorted(SETTING_METADATA.keys()))
+        console.print(f"[red]Unknown key: {key}. Valid keys: {valid_keys}[/red]")
+        return "config_error"
+
+    meta = SETTING_METADATA[key]
+    if meta.value_type != "bool":
+        current = read_config_value(config, key) if key in SETTING_LOCATIONS else "?"
+        console.print(f"[yellow]{key}[/yellow] expects a {meta.value_type} value")
+        console.print(f"[dim]Current: {current}[/dim]")
+        console.print(f"[dim]Usage: /config set {key} <value>[/dim]")
+        return "config_error"
+
+    new_value = not read_config_value(config, key)
+
+    if hasattr(context, key):
+        setattr(context, key, new_value)
+
+    assign_config_value(config, key, new_value)
+    _save_and_reload_config(config)
+
+    state = "[bold green]ON[/bold green]" if new_value else "[bold red]OFF[/bold red]"
+    console.print()
+    console.print(f"[green]{key}[/green] = {state}")
+    return _emit_config_action_feedback(key)
+
+
+def _show_config_table(context: "CommandContext", config: "AppConfig") -> str:
+    """Show the static config table view."""
+    console.print()
+    console.print("[bold cyan]Configuration[/bold cyan]")
+    console.print(f"[dim]File: {get_config_file()}[/dim]")
+    console.print()
+
+    runtime_values = _build_runtime_values(context, config)
+    settings = [
+        (meta.key, runtime_values[meta.key], meta.long_desc)
+        for meta in SETTING_METADATA.values()
+    ]
+
+    table = Table(box=box.ROUNDED, show_header=True, padding=(0, 1))
+    table.add_column("Setting", style="bold cyan", no_wrap=True)
+    table.add_column("Value", style="green", no_wrap=True)
+    table.add_column("Description", style="dim")
+
+    for key, value, desc in settings:
+        table.add_row(key, value, desc)
+
+    console.print(table)
+    console.print()
+    console.print("[dim]Usage: /config set <setting> <value>  |  /config reset[/dim]")
+    console.print()
+    return "config_shown"
 
 
 @registry.register(
     "config",
     "View or modify settings",
-    usage="/config [set <key> <value> | reset]",
+    usage="/config [set <key> [value] | reset]",
+    detail="View all settings, change individual values, or reset to defaults.\n"
+           "Boolean settings can be toggled without a value (just /config set <key>).\n"
+           "Tab completion is available for setting names and boolean values.",
+    examples=[
+        "/config                          Show all settings",
+        "/config set debug                Toggle debug on/off",
+        "/config set temperature 0.5      Set temperature",
+        "/config reset                    Reset all to defaults",
+    ],
 )
 def cmd_config(args: list[str], context: "CommandContext") -> str:
     """Handle config commands: show, set, reset."""
     config = load_config()
 
     if not args:
-        # Show current settings with descriptions
-        console.print()
-        console.print("[bold cyan]Configuration[/bold cyan]")
-        console.print(f"[dim]File: {get_config_file()}[/dim]")
-        console.print()
-
-        # Get values from context (runtime) or config (persisted)
-        model = context.model or config.model.default or "ollama:"
-        base_url = context.base_url or config.model.base_url or "(auto)"
-        max_steps = context.max_steps if context.max_steps else config.agent.max_steps
-        max_retries = context.max_retries if context.max_retries else config.agent.max_retries
-        debug = context.debug if context.debug is not None else config.agent.debug
-        tool_instructions = config.agent.tool_instructions
-        ask_tool_permission = config.agent.ask_tool_permission
-        dynamic_tool_filtering = config.agent.dynamic_tool_filtering
-        tool_filter_threshold = config.agent.tool_filter_threshold
-        # Model generation parameters
-        gen = config.model.generation
-        temperature = gen.temperature
-        max_tokens = gen.max_tokens
-        timeout = gen.timeout
-        api_key = gen.api_key
-
-        # Build settings list from centralized metadata
-        runtime_values = {
-            "model": str(model),
-            "base_url": str(base_url),
-            "max_steps": str(max_steps),
-            "max_retries": str(max_retries),
-            "debug": str(debug).lower(),
-            "tool_instructions": str(tool_instructions).lower(),
-            "ask_tool_permission": str(ask_tool_permission).lower(),
-            "dynamic_tool_filtering": str(dynamic_tool_filtering).lower(),
-            "tool_filter_threshold": str(tool_filter_threshold),
-            "temperature": str(temperature),
-            "max_tokens": str(max_tokens) if max_tokens is not None else "(model default)",
-            "timeout": str(timeout),
-            "api_key": "***" if api_key else "(not set)",
-            "host": config.daemon.host,
-            "port": str(config.daemon.port),
-            "daemon_timeout": str(config.daemon.daemon_timeout),
-            "max_projects": str(config.daemon.max_projects),
-            "default_tokens": str(config.search.default_tokens),
-            "default_limit": str(config.search.default_limit),
-            "semantic_model_path": config.search.semantic_model_path or "(default)",
-        }
-        settings = [
-            (meta.key, runtime_values[meta.key], meta.long_desc)
-            for meta in SETTING_METADATA.values()
-        ]
-
-        table = Table(box=box.ROUNDED, show_header=True, padding=(0, 1))
-        table.add_column("Setting", style="bold cyan", no_wrap=True)
-        table.add_column("Value", style="green", no_wrap=True)
-        table.add_column("Description", style="dim")
-
-        for key, value, desc in settings:
-            table.add_row(key, value, desc)
-
-        console.print(table)
-        console.print()
-        console.print("[dim]Usage: /config set <setting> <value>  |  /config reset[/dim]")
-        console.print()
-        return "config_shown"
+        # Open interactive config picker
+        context.config_runtime_values = _build_runtime_values(context, config)
+        return "open_config_picker"
 
     subcmd = args[0].lower()
 
+    if subcmd == "show":
+        return _show_config_table(context, config)
+
     if subcmd == "set" and len(args) >= 3:
-        key = args[1].lower()
-        value_str = " ".join(args[2:])
+        return _cmd_config_set_value(context, config, args[1].lower(), " ".join(args[2:]))
 
-        # Parse value using centralized function
-        success, parsed_value, error = parse_config_value(key, value_str)
-        if not success:
-            console.print(f"[red]{error}[/red]")
-            return "config_error"
+    if subcmd == "set" and len(args) == 2:
+        return _cmd_config_toggle(context, config, args[1].lower())
 
-        # Validate value using centralized function
-        is_valid, error = validate_config_value(key, parsed_value)
-        if not is_valid:
-            console.print(f"[red]{error}[/red]")
-            return "config_error"
-
-        # Handle special case for base_url "(auto)"
-        if key == "base_url" and value_str == "(auto)":
-            parsed_value = None
-
-        # Update context (for runtime settings that exist on context)
-        if hasattr(context, key):
-            setattr(context, key, parsed_value)
-
-        # Persist to config using centralized function
-        if key in SETTING_LOCATIONS:
-            assign_config_value(config, key, parsed_value)
-        else:
-            # Key exists in metadata but not in locations - display-only setting
-            console.print(f"[yellow]Warning: {key} is read-only[/yellow]")
-            return "config_error"
-
-        if not save_config(config):
-            console.print("[red]Warning: Failed to save config to disk[/red]")
-
-        # Update the global config cache so get_config() returns fresh values
-        reload_config()
-
-        display_value = "***" if key == "api_key" and parsed_value else parsed_value
-        console.print()
-        console.print(f"[green]{key}[/green] = [cyan]{display_value}[/cyan]")
-
-        # Settings that truly require session restart (can't be changed mid-session)
-        restart_required = ("dynamic_tool_filtering",)
-        if key in restart_required:
-            console.print("[yellow]Restart agent (/exit then run again) to apply[/yellow]")
-            console.print()
-            return "config_set"
-
-        # Settings that require agent rebuild (applied immediately)
-        rebuild_required = (
-            "tool_instructions", "tool_filter_threshold",
-            "temperature", "max_tokens", "timeout", "api_key",
-            "max_retries", "max_steps"
-        )
-
-        if key in rebuild_required:
-            console.print("[dim]Applied immediately[/dim]")
-            console.print()
-            return "config_changed"
-
-        console.print()
-        return "config_set"
-
-    elif subcmd == "reset":
-        # Reset to defaults
+    if subcmd == "reset":
         reset_config()
-        # Use reload_config to update the global cache
         new_config = reload_config()
 
-        # Update context directly
+        # Sync all context fields to freshly-reset config
         context.model = new_config.model.default
         context.base_url = new_config.model.base_url
         context.max_steps = new_config.agent.max_steps
@@ -357,16 +494,15 @@ def cmd_config(args: list[str], context: "CommandContext") -> str:
         context.debug = new_config.agent.debug
         context.ask_tool_permission = new_config.agent.ask_tool_permission
         context.dynamic_tool_filtering = new_config.agent.dynamic_tool_filtering
-        context.tool_filter_threshold = new_config.agent.tool_filter_threshold
+        context.tool_filter_model = new_config.agent.tool_filter_model
 
         console.print()
         console.print("[green]Configuration reset to defaults[/green]")
         console.print()
         return "config_reset"
 
-    else:
-        console.print("[red]Usage: /config [set <key> <value> | reset][/red]")
-        return "config_error"
+    console.print("[red]Usage: /config [set <key> <value> | reset][/red]")
+    return "config_error"
 
 
 @registry.register(
@@ -374,6 +510,14 @@ def cmd_config(args: list[str], context: "CommandContext") -> str:
     "Show or switch the current model",
     usage="/model [name]",
     aliases=["m"],
+    detail="Show the current model or switch to a different one.\n"
+           "Supports Ollama, llama-cpp-server, OpenAI API, and any OpenAI-compatible endpoint.",
+    examples=[
+        "/model                              Show current model",
+        "/model ollama:qwen2.5-coder:14b     Switch to Ollama model",
+        "/model llamacpp:model               Switch to llama-cpp model",
+        "/model openai:gpt-4o                Switch to OpenAI API",
+    ],
 )
 def cmd_model(args: list[str], context: "CommandContext") -> str:
     """Show current model or switch to a new one."""
@@ -411,6 +555,15 @@ def cmd_model(args: list[str], context: "CommandContext") -> str:
         console.print(f"[dim]Example: {new_model}qwen2.5-coder:14b[/dim]")
         return "model_invalid"
 
+    # Catches a double slash-command typo like `/model /model foo` where the
+    # parser picks `/model` as args[0]. Persisting that to config nukes the
+    # next startup (loaded as model_str, fails with a cryptic base_url error).
+    if new_model.startswith("/"):
+        console.print()
+        console.print(f"[red]Error: Model name cannot start with '/': '{new_model}'[/red]")
+        console.print("[dim]Looks like a slash-command typo. Example: /model ollama:qwen2.5-coder:14b[/dim]")
+        return "model_invalid"
+
     # Update model directly on context
     context.model = new_model
 
@@ -420,12 +573,89 @@ def cmd_model(args: list[str], context: "CommandContext") -> str:
     # Persist to config file
     config = load_config()
     config.model.default = new_model
-    if save_config(config):
+    if _save_and_reload_config(config):
         console.print(f"[dim]Model saved to {get_config_file()}[/dim]")
-    else:
-        console.print("[red]Warning: Failed to save model to config file![/red]")
 
     return "model_switch_requested"
+
+
+# Sentinel value: tool filter router syncs with main /model selection
+FILTER_MODEL_SYNC_SENTINEL = "model"
+
+
+@registry.register(
+    "filter-model",
+    "Show or set the tool filter routing model",
+    usage="/filter-model [model|off|<model-name>]",
+    aliases=["fm"],
+    detail="Set a dedicated model for LLM tool filtering.\n"
+           "Use 'model' to auto-sync with the main /model selection.\n"
+           "Use 'off' to clear (falls back to main model with warning).",
+    examples=[
+        "/filter-model                           Show current filter model",
+        "/filter-model model                     Sync with /model selection",
+        "/filter-model ollama:gpt-oss:20b        Use specific model",
+        "/filter-model off                       Clear filter model",
+    ],
+)
+def cmd_filter_model(args: list[str], context: "CommandContext") -> str:
+    """Show current filter model or switch to a new one."""
+    current = context.tool_filter_model
+
+    if not args:
+        console.print()
+        if current == FILTER_MODEL_SYNC_SENTINEL:
+            console.print(f"[bold]Filter model:[/bold] [cyan]{current}[/cyan] (syncs with /model)")
+        elif current:
+            console.print(f"[bold]Filter model:[/bold] [cyan]{current}[/cyan]")
+        else:
+            console.print("[bold]Filter model:[/bold] [yellow](not set)[/yellow]")
+        console.print()
+        console.print("[bold]Usage:[/bold]")
+        console.print("  [cyan]/filter-model model[/cyan]              Sync with /model")
+        console.print("  [cyan]/filter-model ollama:gpt-oss:20b[/cyan] Use specific model")
+        console.print("  [cyan]/filter-model off[/cyan]                Clear (use main model)")
+        console.print()
+        return "filter_model_shown"
+
+    value = args[0].strip()
+
+    if value == "off":
+        context.tool_filter_model = None
+        _persist_filter_model(None)
+        console.print()
+        console.print("[yellow]Filter model cleared — using main model as fallback[/yellow]")
+        console.print()
+        return "filter_model_switch_requested"
+
+    if value == FILTER_MODEL_SYNC_SENTINEL:
+        context.tool_filter_model = FILTER_MODEL_SYNC_SENTINEL
+        _persist_filter_model(FILTER_MODEL_SYNC_SENTINEL)
+        console.print()
+        console.print("[green]Filter model set to sync with /model[/green]")
+        console.print()
+        return "filter_model_switch_requested"
+
+    # Validate model name — reject empty model after prefix
+    if value in ("ollama:", "llamacpp:", "openai:"):
+        console.print()
+        console.print(f"[red]Error: Model name required after '{value}'[/red]")
+        console.print(f"[dim]Example: {value}gpt-oss:20b[/dim]")
+        return "filter_model_invalid"
+
+    context.tool_filter_model = value
+    _persist_filter_model(value)
+    console.print()
+    console.print(f"[green]Filter model set to [cyan]{value}[/cyan][/green]")
+    console.print()
+    return "filter_model_switch_requested"
+
+
+def _persist_filter_model(value: str | None) -> None:
+    """Save tool_filter_model to config file."""
+    config = load_config()
+    config.agent.tool_filter_model = value
+    _save_and_reload_config(config)
 
 
 @registry.register(
@@ -433,6 +663,9 @@ def cmd_model(args: list[str], context: "CommandContext") -> str:
     "Open interactive tool settings",
     usage="/tools",
     aliases=["t"],
+    detail="Opens a checkbox-based UI to enable/disable MCP tools.\n"
+           "Navigate with arrow keys, toggle with Space, apply with Enter.\n"
+           "Use 'a' to enable all, 'n' to disable all.",
 )
 def cmd_tools(args: list[str], context: "CommandContext") -> str:
     """Open interactive tool picker to enable/disable MCP tools.
@@ -462,6 +695,41 @@ def cmd_clear(args: list[str], context: "CommandContext") -> str:
     return "history_cleared"
 
 
+@registry.register(
+    "undo",
+    "Resume from any prior tool call (branches preserved)",
+    usage="/undo",
+    detail="Opens an interactive picker over every tool call in the session.\n"
+           "Select a tool call to fork a new branch from that point; select a\n"
+           "branch header to switch back to it. On confirm, you can type a\n"
+           "steering directive that becomes the next message to the agent.\n\n"
+           "Does NOT revert files on disk — use git for that.",
+)
+def cmd_undo(args: list[str], context: "CommandContext") -> str:
+    """Open the interactive undo / resume-from-tool-call picker."""
+    return "open_undo_picker"
+
+
+@registry.register(
+    "copy",
+    "Copy last agent response to clipboard",
+    usage="/copy",
+    aliases=["cp"],
+)
+def cmd_copy(args: list[str], context: "CommandContext") -> str:
+    """Copy the last agent response to the system clipboard."""
+    result = copy_last_response()
+    console.print()
+    if result == "copied":
+        console.print("[green]\U0001f4cb Copied to clipboard[/green]")
+    elif result == "no_response":
+        console.print("[yellow]No response to copy yet[/yellow]")
+    else:
+        console.print("[red]Failed to access clipboard[/red]")
+    console.print()
+    return result
+
+
 @registry.register("exit", "Exit the agent", usage="/exit", aliases=["quit", "q"])
 def cmd_exit(args: list[str], context: "CommandContext") -> str:
     """Exit the agent."""
@@ -473,6 +741,12 @@ def cmd_exit(args: list[str], context: "CommandContext") -> str:
     "Toggle debug mode (logs all prompts/tool calls)",
     usage="/debug [on|off]",
     aliases=["d"],
+    detail="Toggle debug logging on/off. When enabled, logs include:\n"
+           "- Complete system prompts\n"
+           "- All tool calls with timestamps\n"
+           "- Model responses and thinking traces\n"
+           "Logs are saved to ~/.coden-retriever/{project}/logs/",
+    examples=["/debug", "/debug on", "/debug off"],
 )
 def cmd_debug(args: list[str], context: "CommandContext") -> str:
     """Toggle or show debug mode status.
@@ -532,7 +806,7 @@ def cmd_debug(args: list[str], context: "CommandContext") -> str:
         new_logger.log_session_start(
             model=context.model or "unknown",
             base_url=context.base_url,
-            max_steps=context.max_steps or 10,
+            max_steps=context.max_steps or DEFAULT_MAX_STEPS,
         )
         new_logger._write_subsection("DEBUG ENABLED MID-SESSION")
 
@@ -561,6 +835,9 @@ def cmd_debug(args: list[str], context: "CommandContext") -> str:
     "Change working directory (interactive browser)",
     usage="/cd [path]",
     aliases=["dir", "chdir"],
+    detail="Change the working directory. Without arguments, opens an interactive\n"
+           "directory browser. With a path, navigates directly. Supports ~ and -.",
+    examples=["/cd", "/cd src/", "/cd ~", "/cd -"],
 )
 def cmd_cd(args: list[str], context: "CommandContext") -> str:
     """Change the working directory with interactive browser.
@@ -620,6 +897,10 @@ def cmd_cd(args: list[str], context: "CommandContext") -> str:
     "Enter adaptive study mode to learn the codebase",
     usage="/study [topic]",
     aliases=["learn", "quiz"],
+    detail="Enters an adaptive tutoring mode. The agent assesses your knowledge\n"
+           "level and guides you through the codebase with real code examples.\n"
+           "Use /exit-study to return to normal mode.",
+    examples=["/study", "/study architecture", "/study error handling"],
 )
 def cmd_study(args: list[str], context: "CommandContext") -> str:
     """Enter study mode where the agent helps you master the codebase.
@@ -681,6 +962,10 @@ def cmd_exit_study(args: list[str], context: "CommandContext") -> str:
     "cache",
     "Manage project caches",
     usage="/cache [list|clear|status]",
+    detail="Manage the code entity caches. Use 'list' to see all cached projects,\n"
+           "'clear' to remove current project cache, 'clear --all' to remove all,\n"
+           "or 'status' for detailed cache info.",
+    examples=["/cache", "/cache status", "/cache clear", "/cache clear --all"],
 )
 def cmd_cache(args: list[str], context: "CommandContext") -> str:
     """Manage caches. Sub-commands: list, clear, status."""

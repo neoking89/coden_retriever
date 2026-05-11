@@ -59,7 +59,7 @@ def detect_sensitive_values(
         if not exclude_tests or not e.is_test
     }
 
-    all_strings = extract_all_strings(filtered_entities)
+    all_strings = extract_all_strings(filtered_entities, root_dir=root_dir)
 
     # Build flat list for batch classification
     flat_items: list[dict[str, Any]] = []

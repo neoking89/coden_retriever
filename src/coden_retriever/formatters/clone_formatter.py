@@ -11,25 +11,28 @@ Provides consistent formatting for clone detection results with:
 import json
 from typing import Any
 
-from .cli_metrics import BaseCLIMetricFormatter, FALSE_POSITIVE_WARNING, SeverityTier
+from ..constants import (
+    CloneCategory,
+    DEFAULT_CLONE_RESULT_LIMIT,
+    DEFAULT_CLONE_SEMANTIC_THRESHOLD,
+    DEFAULT_SYNTACTIC_FUNC_THRESHOLD,
+    DEFAULT_SYNTACTIC_LINE_THRESHOLD,
+    FORMATTER_WIDTH,
+)
+from .cli_metrics import BaseCLIMetricFormatter, SeverityTier, extract_filename, format_result_limit_line, FALSE_POSITIVE_WARNING
 
 
 _CLONE_TABLE_WIDTH = 130
 _CLONE_FUNC_COL_WIDTH = 32
 
 
-def _extract_filename(file_path: str) -> str:
-    """Extract filename from a path, handling both Unix and Windows separators."""
-    return file_path.split("/")[-1].split("\\")[-1]
-
-
 def format_clone_parameters_header(
     mode: str = "combined",
-    similarity_threshold: float = 0.95,
-    line_threshold: float = 0.70,
-    func_threshold: float = 0.50,
+    similarity_threshold: float = DEFAULT_CLONE_SEMANTIC_THRESHOLD,
+    line_threshold: float = DEFAULT_SYNTACTIC_LINE_THRESHOLD,
+    func_threshold: float = DEFAULT_SYNTACTIC_FUNC_THRESHOLD,
     min_lines: int = 3,
-    limit: int | None = 50,
+    limit: int | None = DEFAULT_CLONE_RESULT_LIMIT,
     exclude_tests: bool = True,
 ) -> str:
     """Format parameter summary header for clone detection.
@@ -48,14 +51,14 @@ def format_clone_parameters_header(
     """
     mode_labels = {
         "combined": "Combined (Semantic + Syntactic)",
-        "semantic": "Semantic Only (Model2Vec Embeddings)",
+        "semantic": "Semantic Only (MiniLM ONNX Embeddings)",
         "syntactic": "Syntactic Only (Line-by-Line Jaccard)",
     }
 
     lines = []
-    lines.append("=" * 80)
+    lines.append("=" * FORMATTER_WIDTH)
     lines.append("CLONE DETECTION PARAMETERS")
-    lines.append("=" * 80)
+    lines.append("=" * FORMATTER_WIDTH)
     lines.append(f"Mode: {mode_labels.get(mode, mode)}")
 
     if mode in ("combined", "semantic"):
@@ -66,14 +69,9 @@ def format_clone_parameters_header(
 
     lines.append(f"Minimum Function Lines: {min_lines}")
     lines.append(f"Exclude Tests: {exclude_tests}")
-
-    if limit is None:
-        lines.append("[!] Result Limit: ALL (may be slow for large repos)")
-    else:
-        lines.append(f"[!] Result Limit: TOP {limit} -- more results may exist (use -n -1 for all)")
-
+    lines.append(format_result_limit_line(limit))
     lines.append(FALSE_POSITIVE_WARNING)
-    lines.append("=" * 80)
+    lines.append("=" * FORMATTER_WIDTH)
     return "\n".join(lines)
 
 
@@ -95,11 +93,11 @@ class CloneFormatter(BaseCLIMetricFormatter):
         similarity = item.get("similarity", 0)
 
         # Category-based tiers (extended categories from combined mode)
-        if category in ("EXACT", "NEAR-CLONE"):
+        if category in (CloneCategory.EXACT, CloneCategory.NEAR_CLONE):
             return SeverityTier.HIGH  # red
-        if category in ("SEMANTIC-STRUCTURAL", "STRUCTURAL"):
+        if category in (CloneCategory.SEMANTIC_STRUCTURAL, CloneCategory.STRUCTURAL):
             return SeverityTier.MODERATE  # orange
-        if category in ("SEMANTIC", "PARTIAL"):
+        if category in (CloneCategory.SEMANTIC, CloneCategory.PARTIAL):
             return SeverityTier.LOW  # yellow-green
 
         # Fallback: similarity-based tiers
@@ -214,8 +212,8 @@ class CloneFormatter(BaseCLIMetricFormatter):
             func2_link = self.make_hyperlink(name2, file2, line2, tier)
 
             # Add file:line suffix for context
-            file1_short = _extract_filename(file1)
-            file2_short = _extract_filename(file2)
+            file1_short = extract_filename(file1)
+            file2_short = extract_filename(file2)
             func1_full = f"{func1_link} ({file1_short}:{line1})"
             func2_full = f"{func2_link} ({file2_short}:{line2})"
 
@@ -261,9 +259,9 @@ class CloneFormatter(BaseCLIMetricFormatter):
 
         lines = [
             "",
-            "=" * 80,
+            "=" * FORMATTER_WIDTH,
             f"Clone Detection ({mode_labels.get(mode, mode)}) | {total:,} functions | {pairs_found:,} pairs found",
-            "-" * 80,
+            "-" * FORMATTER_WIDTH,
         ]
 
         # Show relevant thresholds
@@ -274,7 +272,7 @@ class CloneFormatter(BaseCLIMetricFormatter):
         if mode in ("combined", "syntactic") and func_threshold is not None:
             lines.append(f"Function Threshold: {func_threshold * 100:.0f}%")
 
-        lines.append("-" * 80)
+        lines.append("-" * FORMATTER_WIDTH)
         lines.append("Categories:")
 
         # Show category breakdown based on mode
@@ -296,12 +294,12 @@ class CloneFormatter(BaseCLIMetricFormatter):
             lines.append(f"  SEMANTIC (95-98%):      {semantic:>4}")
 
         if results_returned < pairs_found:
-            lines.append("-" * 80)
+            lines.append("-" * FORMATTER_WIDTH)
             lines.append(f"Showing {results_returned} of {pairs_found} pairs (use -n for more)")
 
         if summary.get("token_budget_exceeded"):
-            lines.append("-" * 80)
+            lines.append("-" * FORMATTER_WIDTH)
             lines.append("Note: Results truncated due to token budget")
 
-        lines.append("=" * 80)
+        lines.append("=" * FORMATTER_WIDTH)
         return "\n".join(lines)

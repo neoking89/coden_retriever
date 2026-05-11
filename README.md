@@ -40,6 +40,7 @@ pip install 'coden-retriever[dev]'
 | Dead code detection | Core | `coden /path -D` |
 | Tramp data detection | Core | `coden /path -T` |
 | Sensitive value detection | Core | `coden /path -S` |
+| Magic constant detection | Core | `coden /path -K` |
 | Semantic search | `[semantic]` | `coden /path -q "auth" --semantic` |
 | Clone detection (semantic/combined) | `[semantic]` | `coden /path -C` |
 | Echo comment detection | `[semantic]` | `coden /path -E` |
@@ -86,6 +87,15 @@ coden /path/to/repo -S --sensitive-threshold 0.5
 
 # Detect secrets in source files + text files (.env, .json, etc.)
 coden /path/to/repo -S --whitelist "*.env" "*.json"
+
+# Detect magic constants (repeated literal values that should be named)
+coden /path/to/repo -K
+coden /path/to/repo -K --min-constant-occurrences 5 --min-constant-files 3
+
+# Check whether debugging is available for one language or all adapters
+coden debug-availability
+coden debug-availability python
+coden debug-availability cpp --format json
 ```
 
 <img src="images/readme/coden_stats_reverzed.png" alt="Coden stats output showing directory tree and ranking metrics" width="700">
@@ -94,7 +104,7 @@ coden /path/to/repo -S --whitelist "*.env" "*.json"
 
 Codebases are not a flat collection of text files. It is extremely valueable to understand which files are key components and which ones are not. That is what this tool achieves: To help developers, as well as LLM's gain a strong mental model of the codebase.
 
-**Note:** The first run of `$ coden` on a new codebase is slower because it parses everything and buils a call graph. Subsequent runs are cached.
+**Note:** The first run of `$ coden` on a new codebase is slower because it parses everything and builds a call graph. Subsequent runs are cached.
 
 ## How It Works
 
@@ -105,6 +115,16 @@ We initially parse code with tree-sitter, build a call graph (functions, classes
 **Betweenness Centrality** finds the bridges--code that sits between different parts of your system. These are the integration points, the places where module A talks to module B. High betweenness means "this is where different parts of the system meet."
 
 We use these instead of simple text matching because structural dependencies matter. A file that is imported everywhere is more important than a file that happens to contain your search term five times.
+
+### Map Modes
+
+**Default (combined signal)** — Ranks code entities using Reciprocal Rank Fusion across BM25, semantic similarity (optional), PageRank, and betweenness. This is the all-purpose view showing both structural importance and keyword relevance.
+
+**Simple mode (`--map-mode simple`)** — Fast alternative that ranks entities purely by per-file git commit count (with line count as a fallback). Bypasses the daemon and uses a dedicated lite cache on disk so warm runs skip re-parsing:
+- Cold run (first parse): ~7 seconds
+- Warm run (cached): ~88ms (plus Python startup)
+
+Simple mode is disk-cached automatically; the lite cache coexists with the static cache so you can run both `coden src` and `coden src --map-mode simple` on the same project without cache conflicts. The lite cache is invalidated separately: file changes invalidate the parsed entities; git HEAD changes invalidate only the per-file commit counts while preserving parsed entities across commits.
 
 | What You Are Looking At | PageRank | Betweenness | Example |
 |------------------------|----------|-------------|---------|
@@ -118,25 +138,28 @@ Results are ranked using Reciprocal Rank Fusion across:
 - **PageRank** - Structural importance
 - **Betweenness** - Bridge detection
 
-### Keyword vs Semantic Search
+### Keyword vs Semantic Search vs Simple Ranking
 
-| Mode | When to Use |
-|------|-------------|
-| `--query "auth"` | You know the terminology |
-| `--query "auth" --semantic` | You are asking a natural language question |
+| Mode | When to Use | Requires Daemon |
+|------|-------------|-----------------|
+| `coden src` (default) | Balanced view: keywords + structure + semantics (optional) | Yes |
+| `--query "auth"` | Keyword search for terminology you know | Yes |
+| `--query "auth" --semantic` | Natural language questions (e.g., "how does auth work") | Yes |
+| `coden src --map-mode simple` | Quick overview ranked by historical edit frequency | No |
 
-Semantic search uses a Model2Vec model distilled from [Qodo-Embed-1-1.5B](https://huggingface.co/Qodo/Qodo-Embed-1-1.5B) that ships with the package.
+**Semantic search** uses an all-MiniLM-L6-v2 ONNX model (INT8 quantized) that ships with the package. Requires the `[semantic]` extra: `pip install 'coden-retriever[semantic]'`
 
-> **Note:** Semantic search requires the `[semantic]` extra: `pip install 'coden-retriever[semantic]'`
+**Simple mode** (`--map-mode simple`) is designed for speed: it ranks by per-file git commit count, bypasses the daemon entirely, and uses a warm disk cache (~88ms). Ideal for quick architectural overviews or repeated queries on a single codebase where the semantic/structural ranking is less important than turnaround time.
 
 ## Supported Languages
 
-**Support:** Python, Go, Rust, Java, C, C++, C#, Kotlin, Swift, Javascript/Typescript, PHP, Scala, Bash
+**Support:** Python, Go, Rust, Java, C, C++, C#, Kotlin, Javascript/Typescript, PHP, Scala, Bash
 
 ## CLI Reference
 
 ```bash
-coden /path/to/repo                          # Ranked map
+coden /path/to/repo                          # Ranked map (combined signal)
+coden /path/to/repo --map-mode simple        # Quick map ranked by git commits (warm cache ~88ms)
 coden /path/to/repo --query "auth"           # Keyword search
 coden /path/to/repo --query "auth" --semantic # Semantic search
 coden /path/to/repo --find "UserAuth"        # Find symbol
@@ -155,15 +178,20 @@ coden /path/to/repo -T --min-occurrences 5   # Tramp data with custom threshold
 coden /path/to/repo -S                       # Detect sensitive values (secrets, keys)
 coden /path/to/repo -S --sensitive-threshold 0.7  # Stricter detection
 coden /path/to/repo -S --whitelist "*.env" "*.json" # Scan text files too
+coden /path/to/repo -K                       # Detect magic constants (repeated literals)
+coden /path/to/repo -K --min-constant-occurrences 5  # Stricter threshold
 coden /path/to/repo --map --show-deps        # Show callers/callees
 coden /path/to/repo --format json            # Output as json/markdown/xml
 coden serve                                  # Start MCP server
 coden serve --transport http --port 8000     # MCP over HTTP
+coden debug-availability                     # Check debug prerequisites for all adapters
+coden debug-availability python              # Check one language
+coden debug-availability cpp --format json   # Alias lookup with JSON output
 coden -E --remove-comments --dry-run         # Preview echo comment removal
 coden -E --remove-comments --backup          # Remove echoes entirely (with backup)
 coden flag -C --dry-run                      # Preview clone flags
 coden flag -E --dry-run                      # Preview echo comment flagging
-coden flag -E --echo-threshold 0.85          # Flag echo comments (default threshold)
+coden flag -E --echo-threshold 0.80          # Flag echo comments (default threshold)
 coden flag -E --echo-threshold 0.95          # Stricter: only near-identical echoes
 coden flag -E --remove-comments --backup     # Alternative: remove via flag subcommand
 coden flag -E --include-tests                # Include test files in analysis
@@ -173,7 +201,7 @@ coden flag -S --dry-run                      # Preview sensitive value flags
 coden flag -S --whitelist "*.env" --dry-run  # Preview with text file scanning
 coden flag -S --replace --backup             # Replace secrets with ***REDACTED***
 coden flag -S --replace "HIDDEN" --backup    # Replace with custom placeholder
-coden flag -HPCETS --backup                  # Flag all issues (hotspots, propagation, clones, echoes, tramp data, sensitive values)
+coden flag -HPCETSK --backup                 # Flag all issues (hotspots, propagation, clones, echoes, tramp data, sensitive values, magic constants)
 coden flag clear                             # Remove all [CODEN] comments
 coden reset                                  # Reset everything (destructive!)
 ```
@@ -189,6 +217,7 @@ coden daemon status               # Check if running
 coden daemon stop                 # Stop it
 coden daemon restart              # Restart
 coden daemon clear-cache          # Clear daemon cache
+coden debug-availability python   # Check if a debugger stack is available locally
 ```
 
 ## Code Flagging
@@ -205,7 +234,8 @@ coden flag -T --dry-run              # Preview tramp data flags
 coden flag -S --dry-run              # Preview sensitive value flags
 coden flag -S --replace --backup     # Replace secrets with ***REDACTED***
 coden flag -D --remove-dead-code --backup  # Remove dead code entirely (DESTRUCTIVE)
-coden flag -HPCETS --backup          # Flag all analysis types
+coden flag -K --dry-run              # Preview magic constant flags
+coden flag -HPCETSK --backup         # Flag all analysis types
 coden flag clear                     # Remove all [CODEN] comments
 ```
 
@@ -223,10 +253,11 @@ coden flag clear                     # Remove all [CODEN] comments
 | **Hotspots** | `-H` | `--risk-threshold` | 50 | Min risk score (raw score, typically 50-200+) |
 | **Propagation Cost** | `-P` | `--propagation-threshold` | 0.25 | Min internal coupling for modules (0-1) |
 | **Code Clones** | `-C` | `--clone-threshold` | 0.95 | Min semantic similarity for clones (0-1) |
-| **Echo Comments** | `-E` | `--echo-threshold` | 0.85 | Min similarity for echo detection (0-1) |
+| **Echo Comments** | `-E` | `--echo-threshold` | 0.80 | Min similarity for echo detection (0-1) |
 | **Dead Code** | `-D` | `--dead-code-threshold` | 0.50 | Min confidence for dead code detection (0-1) |
 | **Tramp Data** | `-T` | `--min-occurrences` | 3 | Min functions a param group must appear in (1+) |
 | **Sensitive Values** | `-S` | `--sensitive-threshold` | 0.35 | Min confidence for secret detection (0-1) |
+| **Magic Constants** | `-K` | `--min-constant-occurrences` / `--min-constant-files` | 3 / 2 | Min times a literal must appear / min distinct files |
 
 **Usage notes:**
 - All threshold options work in both direct mode (`coden -H`) and flag mode (`coden flag -H`)
@@ -237,8 +268,9 @@ coden flag clear                     # Remove all [CODEN] comments
 - `-D`: Filters dead code with `confidence >= threshold` (0-1 scale)
 - `-T`: Filters tramp data with `function_count >= threshold` (1+ scale, integer)
 - `-S`: Filters sensitive values with `confidence >= threshold` (0-1 scale)
+- `-K`: Filters literals appearing `>= --min-constant-occurrences` times in `>= --min-constant-files` distinct files
 
-**Threshold ranges:** `-P`, `-C`, `-E`, `-D`, `-S` use 0-1 scale. Lower values are more recall (more results), higher values are more precision (fewer, higher-confidence results). `-H` uses raw risk scores (typically 50-200+).
+**Threshold ranges:** `-P`, `-C`, `-E`, `-D`, `-S` use 0-1 scale. Lower values are more recall (more results), higher values are more precision (fewer, higher-confidence results). `-H` uses raw risk scores (typically 50-200+). `-K` uses integer counts.
 
 ### Code Clone Detection
 
@@ -249,7 +281,7 @@ Clone detection finds duplicate or near-duplicate functions that are candidates 
 | Mode | Flag | Description | Best For |
 |------|------|-------------|----------|
 | **Combined** | (default) | Both semantic + syntactic | General use, balanced detection |
-| **Semantic** | `--clone-semantic` | Model2Vec embeddings | Behaviorally similar functions |
+| **Semantic** | `--clone-semantic` | MiniLM ONNX embeddings | Behaviorally similar functions |
 | **Syntactic** | `--clone-syntactic` | Line-by-line Jaccard | Exact copy-paste detection |
 
 #### Detection Modes Explained
@@ -258,7 +290,7 @@ Clone detection finds duplicate or near-duplicate functions that are candidates 
 - Semantic weight: 0.65 (adjustable via `--semantic-weight`)
 - Syntactic weight: 0.35 (adjustable via `--syntactic-weight`)
 
-**Semantic mode** detects functions with similar behavior, even if structurally different. Uses Model2Vec embeddings to find:
+**Semantic mode** detects functions with similar behavior, even if structurally different. Uses MiniLM ONNX embeddings to find:
 - Async/sync variants of the same function
 - Functions that do the same thing with different implementations
 - Renamed copies with modified variable names
@@ -316,7 +348,7 @@ def calculate_discount_tier(purchases: int) -> float:
 
 Echo detection uses:
 - **Tree-sitter AST parsing** to extract ALL comments from your codebase
-- **Semantic similarity analysis** (Model2Vec embeddings + cosine similarity) to compare comment text with code identifiers
+- **Semantic similarity analysis** (MiniLM ONNX embeddings + cosine similarity) to compare comment text with code identifiers
 - **Configurable threshold** to control strictness (0.95 = near-identical only, 0.75 = looser)
 
 #### Usage Examples
@@ -341,7 +373,7 @@ coden flag -E --echo-threshold 0.75 --dry-run
 coden flag -E --include-tests --dry-run
 
 # Combine with other analysis types
-coden flag -HPCETS --backup  # All analyses at once
+coden flag -HPCETSK --backup  # All analyses at once
 
 # Preview only top 10 issues (limit only works in dry-run mode)
 coden flag -H --dry-run -n 10
@@ -361,7 +393,8 @@ coden flag -H --dry-run -n 10
 
 **`--echo-threshold`**: Controls detection strictness (0.0-1.0 range):
 - `0.95` = Very strict, only near-identical echoes (e.g., `# get user` -> `get_user()`)
-- `0.85` = Default, balanced detection
+- `0.85` = Stricter, fewer false positives
+- `0.80` = Default, balanced detection
 - `0.75` = Looser, catches more potential echoes
 
 #### Output Format
@@ -533,14 +566,22 @@ coden flag -S --replace "HIDDEN" --backup
 
 ## Caching
 
-Indices are cached in `~/.coden-retriever/`.
+Indices are cached in `~/.coden-retriever/` with two cache flavors that coexist in the same directory:
+
+**Static cache** (default mode, `coden src`): Comprehensive call graph, BM25 index, embeddings, and graph metrics. Rebuilt when source files change.
+
+**Lite cache** (simple mode, `coden src --map-mode simple`): Parsed entities and per-file git commit counts. Much smaller and faster to load (~88ms warm). Rebuilt when source files change; commit counts refreshed when HEAD changes.
+
+Both caches use disjoint filenames so they don't interfere. For example, a project might have both:
+- `manifest.json`, `entities.pkl`, `graph.pkl`, etc. (static cache)
+- `lite_manifest.json`, `lite_entities.pkl`, `lite_change_count.pkl` (lite cache)
 
 ```bash
 coden cache list             # List cached projects
 coden cache status           # Cache info for current directory
 coden cache status /path     # Cache info for specific project
-coden cache clear            # Clear cache for current directory
-coden cache clear /path      # Clear cache for specific project
+coden cache clear            # Clear all caches (both flavors) for current directory
+coden cache clear /path      # Clear all caches for specific project
 coden cache clear --all      # Clear everything
 coden cache path             # Show cache directory
 ```
@@ -562,11 +603,18 @@ coden config set <key> <value>  # Set a value
 {
   "_version": 1,
   "model": {
-    "default": "ollama:",
+    "default": "ollama:gemma4:31b",
     "base_url": null,
+    "tool_filter_model": null,
     "provider_urls": {
       "ollama": "http://localhost:11434/v1",
       "llamacpp": "http://localhost:8080/v1"
+    },
+    "generation": {
+      "temperature": 0.7,
+      "max_tokens": null,
+      "timeout": 30.0,
+      "api_key": null
     }
   },
   "agent": {
@@ -578,12 +626,15 @@ coden config set <key> <value>  # Set a value
     "tool_instructions": false,
     "ask_tool_permission": true,
     "dynamic_tool_filtering": false,
+    "tool_filter_model": null,
     "tool_filter_threshold": 0.5
   },
+  "system_prompt": "You are an expert code intelligence assistant...",
   "daemon": {
     "host": "127.0.0.1",
     "port": 19847,
     "socket_timeout": 30.0,
+    "daemon_timeout": 30.0,
     "max_projects": 5
   },
   "search": {
@@ -598,12 +649,20 @@ coden config set <key> <value>  # Set a value
 
 ```bash
 # Model
-coden config set model.default ollama:qwen2.5-coder
+coden config set model.default ollama:gemma4:31b
 coden config set model.base_url http://localhost:11434/v1
+coden config set model.tool_filter_model openai:gpt-4o
+coden config set model.generation.temperature 0.5
+coden config set model.generation.max_tokens 4000
+coden config set model.generation.api_key sk-...
+
+# System Prompt
+coden config set system_prompt "Your custom system prompt here"
 
 # Agent
 coden config set agent.max_steps 20
 coden config set agent.debug true
+coden config set agent.tool_filter_model openai:gpt-4o
 
 # Daemon
 coden config set daemon.port 8080
@@ -612,6 +671,7 @@ coden config set daemon.max_projects 10
 # Search
 coden config set search.default_tokens 8000
 coden config set search.default_limit 50
+coden config set search.semantic_model_path /path/to/custom/onnx_model_dir
 ```
 
 ### Environment Variables
@@ -641,18 +701,19 @@ These override the config file:
 Activate coden in agent mode and use an LLM to chat about your codebase.
 
 ```bash
-coden -a                                           # Current directory
-coden /path/to/repo --agent --model ollama:qwen2.5-coder  # With Ollama
-coden /path/to/repo --agent --model llamacpp:      # With llama-cpp-server
+coden -a                                                    # Current directory
+coden /path/to/repo --agent --model ollama:gemma4:31b     # With Ollama
+coden /path/to/repo --agent --model openai:gpt-4o         # With OpenAI API
+coden /path/to/repo --agent --model llamacpp:             # With llama-cpp-server
 ```
 
 **Supported model formats:**
 
 | Format | Example | What it connects to |
 |--------|---------|---------------------|
-| `ollama:model` | `ollama:qwen2.5-coder:14b` | Ollama (localhost:11434) |
+| `ollama:model` | `ollama:gemma4:31b`, `ollama:qwen2.5-coder:14b` | Ollama (localhost:11434) |
 | `llamacpp:model` | `llamacpp:my-model` | llama-cpp-server (localhost:8080) |
-| `openai:model` | `openai:gpt-4o` | OpenAI API (needs OPENAI_API_KEY) |
+| `openai:model` | `openai:gpt-4o`, `openai:gpt-4-turbo` | OpenAI API (needs OPENAI_API_KEY) |
 | `model` + `--base-url` | `my-model --base-url http://...` | Any OpenAI-compatible endpoint |
 
 For vLLM, LM Studio, etc:
@@ -660,7 +721,7 @@ For vLLM, LM Studio, etc:
 coden -a --model my-model-name --base-url http://localhost:8000/v1
 ```
 
-Type `help` in agent mode to see available tools, or `menu`/`tools` for the interactive tool picker.
+Type `/help` in agent mode to see available commands, `/tools` to enable/disable MCP tools, or `/run` to execute an MCP tool directly and inspect its raw output.
 
 ### Slash Commands
 
@@ -668,13 +729,15 @@ Type `help` in agent mode to see available tools, or `menu`/`tools` for the inte
 |---------|---------|--------------|
 | `/help` | | Show commands |
 | `/model [name]` | `/m` | Show/switch model |
-| `/config` | | View/modify settings |
-| `/tools` | `/t` | Tool picker |
-| `/run` | `/r`, `/execute` | Tool wizard |
+| `/config` | | View/modify settings (interactive picker) |
+| `/tools` | `/t` | Enable/disable which MCP tools are exposed to the agent |
+| `/run` | `/r`, `/execute` | Execute an MCP tool directly (bypasses the LLM) and inspect its raw result |
 | `/study [topic]` | `/learn`, `/quiz` | Quiz mode |
 | `/exit-study` | `/stop-study` | Exit quiz |
+| `/undo` | | Resume from any prior tool call (branches preserved) |
+| `/copy` | `/cp` | Copy last agent response to clipboard |
 | `/debug [on\|off]` | `/d` | Toggle debug |
-| `/cd [path]` | `/dir`, `/chdir` | Change directory |
+| `/cd [path]` | `/dir`, `/chdir` | Change directory (interactive browser) |
 | `/clear` | `/c` | Clear history |
 | `/exit` | `/quit`, `/q` | Exit |
 | `/cache` | | Cache management |
@@ -683,10 +746,52 @@ Type `help` in agent mode to see available tools, or `menu`/`tools` for the inte
 
 In-agent config:
 ```
-/config                    # Show settings
+/config                    # Show settings (interactive picker with inline editing)
 /config set model ollama:codellama
 /config set max_steps 20
 /config reset
+```
+
+### Agent Features
+
+**Direct Tool Execution** — Run any MCP tool yourself and see the raw output, without the LLM in the loop:
+```
+/run                       # Opens the tool wizard:
+                           #   1. Pick a tool from the numbered menu
+                           #   2. Fill in parameters via interactive prompts
+                           #   3. Press ENTER to execute
+                           #   4. Raw result is printed to the console
+                           #   5. Result is also injected into conversation
+                           #      history, so you can follow up by asking
+                           #      the agent questions about it
+```
+Useful for testing a tool's behaviour, inspecting exactly what a tool returns, or running a one-off query without spending LLM tokens. The tool is invoked via the MCP server's `direct_call_tool` — no agent context is required.
+
+**Shell Command Execution** — Type `!<command>` to run shell commands:
+```bash
+!ls -la                    # Run shell command
+!npm test                  # Run npm test
+!git status                # Check git status
+!echo "test" @@ query      # Pipe output to agent (use @@ suffix)
+```
+
+**Undo & Branching** — Resume from any prior tool call while preserving branches:
+```
+/undo                      # Open interactive picker showing all tool calls
+                           # Select a tool call to fork a new branch from that point
+                           # Select a branch header to switch back to it
+                           # Type a steering directive on confirm
+```
+
+**Copy Response** — Copy the last agent response to clipboard:
+```
+/copy                      # Copy latest agent response
+```
+
+**Interactive /config Picker** — Edit settings in an intuitive inline editor:
+```
+/config                    # Shows all settings with inline editing
+                           # Use arrow keys to navigate, Enter to edit, Tab to autocomplete
 ```
 
 ## MCP Server
@@ -722,6 +827,7 @@ Reload VS Code (Ctrl+Shift+P -> "Developer: Reload Window").
 - **detect_dead_code** - Find unused functions with no callers. CLI: `-D`
 - **detect_tramp_data** - Identify parameter groups shared across many functions. CLI: `-T`
 - **detect_sensitive_values** - Find hardcoded secrets, API keys, and credentials. CLI: `-S`
+- **detect_magic_constants** - Find repeated literal values (magic numbers/strings) that should be named constants. CLI: `-K`
 
 **Graph Analysis**
 - **change_impact_radius** - Blast radius analysis ("if I change this, what breaks?").
@@ -768,10 +874,12 @@ export CODEN_RETRIEVER_ENABLE_DYNAMIC_TOOLS=1
 
 ## Docker
 
+All Docker assets (Dockerfile, compose file, `.dockerignore`, and the `coden-docker` wrapper) live under the `docker/` folder. Run the commands below from the repo root.
+
 ### Build
 
 ```bash
-docker build -t coden-retriever:latest .
+docker build -t coden-retriever:latest -f docker/Dockerfile .
 ```
 
 ### Usage
@@ -780,21 +888,21 @@ The `coden-docker` wrapper uses a persistent container:
 
 ```bash
 cd /path/to/your/project
-./coden-docker start .                  # Start container
-./coden-docker .                        # Repository map
-./coden-docker . --query "auth"         # Search
-./coden-docker . --find "MyClass"       # Find symbol
-./coden-docker -a                       # Agent mode
-./coden-docker stop                     # Stop
+./docker/coden-docker start .                  # Start container
+./docker/coden-docker .                        # Repository map
+./docker/coden-docker . --query "auth"         # Search
+./docker/coden-docker . --find "MyClass"       # Find symbol
+./docker/coden-docker -a                       # Agent mode
+./docker/coden-docker stop                     # Stop
 ```
 
 First run builds the index. After that, the daemon keeps it in memory.
 
 ```bash
-./coden-docker start [path]   # Start with workspace
-./coden-docker stop           # Stop container
-./coden-docker restart [path] # Restart with new workspace
-./coden-docker status         # Container status
+./docker/coden-docker start [path]   # Start with workspace
+./docker/coden-docker stop           # Stop container
+./docker/coden-docker restart [path] # Restart with new workspace
+./docker/coden-docker status         # Container status
 ```
 
 ### MCP Server in Docker
@@ -808,9 +916,9 @@ Available at `http://localhost:8000/mcp`, health check at `http://localhost:8000
 ### Docker Compose
 
 ```bash
-docker compose up -d mcp-server
-docker compose logs -f mcp-server
-docker compose down
+docker compose -f docker/docker-compose.yml up -d mcp-server
+docker compose -f docker/docker-compose.yml logs -f mcp-server
+docker compose -f docker/docker-compose.yml down
 ```
 
 ### Docker Environment Variables
@@ -837,9 +945,28 @@ The container connects to host Ollama via `host.docker.internal`:
 ollama serve
 
 # In Docker
-./coden-docker -a
+./docker/coden-docker -a
 # Then: /model ollama:qwen2.5-coder
 ```
+
+## Debug Availability
+
+The `coden debug-availability` command checks whether debugging prerequisites are met for each supported language.
+
+```bash
+coden debug-availability                     # Check all adapters
+coden debug-availability python              # Check one language
+coden debug-availability cpp --format json   # JSON output
+```
+
+The text output uses icons and colors to make status easy to scan:
+
+- **`✓ language: available`** — All prerequisites met (shown in green)
+- **`✗ language: unavailable — reason`** — Missing prerequisites with inline explanation (shown in red)
+- Each dependency line shows whether it is installed (`✓`) or missing (`✗`)
+- Install hints are shown in cyan when a dependency is missing
+
+Use `--format json` for machine-readable output.
 
 ## Troubleshooting
 
@@ -864,3 +991,12 @@ This performs all of the following in one step:
 - Resets configuration to defaults
 
 > **Warning:** This is a destructive operation. Your custom configuration settings will be lost and all cached indices will be deleted.
+
+### Ollama context window too small
+
+Ollama defaults to a 4096-token context, which is too small for agent mode — the system prompt plus tool schemas alone exceed it, and you'll see truncated or nonsensical responses. Raise the default by setting `OLLAMA_CONTEXT_LENGTH=64000` before starting Ollama:
+
+- **Windows:** `setx OLLAMA_CONTEXT_LENGTH 64000`, then restart the Ollama tray app.
+- **macOS / Linux:** `export OLLAMA_CONTEXT_LENGTH=64000` before `ollama serve`.
+
+Verify with `ollama ps` — the `CONTEXT` column should show `64000` once a model is loaded. Some models pin `num_ctx` in their Modelfile and override this; in that case create a custom Modelfile with `PARAMETER num_ctx 64000`.

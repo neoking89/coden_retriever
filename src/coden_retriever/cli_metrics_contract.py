@@ -130,38 +130,6 @@ def print_metric_output(formatted_output: str, stats_output: str | None, reverse
         print(formatted_output)
 
 
-def validate_cli_token_limit(token_limit: int | None, context: str = "") -> None:
-    """Validate that token_limit is None for CLI mode.
-
-    Optional validation helper to catch bugs during development.
-
-    Args:
-        token_limit: The token_limit value being used
-        context: Context string for error message (e.g., "hotspots params")
-
-    Raises:
-        ValueError: If token_limit is not None in CLI mode
-
-    Example:
-        ```python
-        params = HotspotsParams(
-            token_limit=args.tokens,  # Should be None for CLI
-        )
-        validate_cli_token_limit(params.token_limit, "hotspots")
-        ```
-
-    Note:
-        This is optional - only use during development/debugging.
-        Remove validation calls in production for performance.
-    """
-    if token_limit is not None:
-        raise ValueError(
-            f"CLI mode must use token_limit=None, got {token_limit} "
-            f"(context: {context}). Token budget should only limit MCP mode, "
-            f"not CLI mode. CLI users control output via -n/--limit flag."
-        )
-
-
 # Checklist for adding new metrics - keep this as a reference
 
 CHECKLIST = """

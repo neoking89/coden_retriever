@@ -5,10 +5,9 @@ Parses source files using Tree-sitter and extracts code entities.
 """
 import logging
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
-from ..language import LANGUAGE_MAP, LANGUAGE_QUERIES, LanguageLoader
+from ..language import LANGUAGE_QUERIES, LanguageLoader, language_for_path
 from ..models import CodeEntity
 
 logger = logging.getLogger(__name__)
@@ -19,6 +18,16 @@ MAX_DOCSTRING_LENGTH = 500
 
 # Maximum AST depth when searching for body nodes in malformed ASTs
 MAX_BODY_SEARCH_DEPTH = 5
+
+# Captured identifiers for C/C++ functions are nested inside declarator wrappers:
+#   (identifier) → (function_declarator) → (function_definition)
+#   (identifier) → (qualified_identifier) → (function_declarator) → (function_definition)
+# A single `node.parent` lands on the wrapper, so `_extract_entity` must walk
+# through these to reach the real definition node that owns the body field.
+DECLARATOR_WRAPPER_TYPES: frozenset[str] = frozenset({
+    "function_declarator",   # C/C++
+    "qualified_identifier",  # C++ namespaced names
+})
 
 # Stub statement types (language-agnostic AST patterns)
 # These node types represent explicit stub/placeholder constructs
@@ -90,7 +99,100 @@ COMPLEXITY_NODES: dict[str, set[str]] = {
         "test_command",  # [ ] and [[ ]]
         "binary_expression",  # && and ||
     },
+    "c_sharp": {
+        "if_statement", "switch_statement", "switch_expression_arm",
+        "when_clause",  # pattern guards
+        "for_statement", "for_each_statement", "while_statement",
+        "do_statement", "catch_clause",
+        "conditional_expression",  # ternary ?:
+        # tree-sitter-c-sharp parses && / || / ?? all as binary_expression
+        # with the operator carried as a child token (no dedicated node)
+        "binary_expression",
+    },
+    "kotlin": {
+        "if_expression", "when_entry",
+        "for_statement", "while_statement", "do_while_statement",
+        "catch_block",
+        "elvis_expression",  # ?:
+        # tree-sitter-kotlin uses dedicated nodes for short-circuit logic
+        # rather than a generic binary_expression
+        "conjunction_expression",  # &&
+        "disjunction_expression",  # ||
+    },
+    "php": {
+        "if_statement", "else_if_clause",
+        "switch_statement", "case_statement",
+        "match_conditional_expression",
+        "for_statement", "foreach_statement", "while_statement",
+        "do_statement", "catch_clause",
+        "conditional_expression",  # ternary ?:
+        "binary_expression",  # && and ||
+    },
+    "scala": {
+        # Scala parses && / || as infix_expression with text-valued operator
+        # children; including infix_expression here would massively over-count
+        # (every method call without a dot is an infix), so short-circuit
+        # operators are intentionally not counted.
+        "if_expression", "for_expression",
+        "while_expression", "do_while_expression",
+        "catch_clause",
+        "case_clause",  # match arms; also covers pattern guards
+    },
 }
+
+
+# JS/TS `function_expression` rebinds `this`, so a call to `this.x()` inside
+# `function() { ... }` does NOT have the surrounding class as its receiver.
+# `arrow_function` and `method_definition` preserve `this` and must be walked
+# through transparently. Other languages bind `self`/`cls` as explicit
+# parameters, not via lexical capture, so nested-function rebinding does not
+# apply to them.
+THIS_REBINDING_NODE_TYPES: dict[str, frozenset[str]] = {
+    # tree-sitter-javascript names anonymous `function() {}` expressions
+    # `function` (not `function_expression`); declared `function foo() {}`
+    # is `function_declaration`. Both rebind `this`. `arrow_function` and
+    # `method_definition` preserve `this` and must walk through.
+    "javascript": frozenset({
+        "function",
+        "function_declaration",
+        "generator_function",
+        "generator_function_declaration",
+    }),
+    "typescript": frozenset({
+        "function",
+        "function_declaration",
+        "generator_function",
+        "generator_function_declaration",
+    }),
+}
+
+# AST node types that introduce a class scope across the languages we parse.
+CLASS_DEFINITION_NODE_TYPES: frozenset[str] = frozenset({
+    "class_definition",   # Python
+    "class_declaration",  # JS/TS, Java, C#, Kotlin
+    "class_specifier",    # C++
+})
+
+
+def _find_enclosing_class_name(node: Any, lang_name: str) -> str | None:
+    """Return the name of the class enclosing `node`, or None.
+
+    Walks up `node.parent` until it hits a class definition (returning its
+    name) or — for languages where nested functions rebind `this` — a
+    rebinding boundary (returning None).
+    """
+    rebinding = THIS_REBINDING_NODE_TYPES.get(lang_name, frozenset())
+    current = node.parent
+    while current:
+        if current.type in rebinding:
+            return None
+        if current.type in CLASS_DEFINITION_NODE_TYPES:
+            for child in current.children:
+                if child.type in ("identifier", "type_identifier", "name"):
+                    return child.text.decode("utf-8", errors="replace") if child.text else None
+            return None
+        current = current.parent
+    return None
 
 
 def _extract_python_method_call(node: Any) -> tuple[str | None, str | None]:
@@ -119,48 +221,51 @@ def _extract_python_method_call(node: Any) -> tuple[str | None, str | None]:
     return receiver, method
 
 
-def _extract_js_ts_method_call(node: Any) -> tuple[str | None, str | None]:
-    """Extract receiver and method from JS/TS member_expression."""
+# Per-language shape for member-access extraction:
+#   method_node_type   — child that holds the method name
+#   nested_parent_type — recurse into this parent type to recover the
+#                        immediate receiver of a chained access (a.b.c → 'b').
+#                        None means single-level only.
+_MEMBER_CALL_SHAPES: dict[str, tuple[str, str | None]] = {
+    "javascript": ("property_identifier", "member_expression"),
+    "typescript": ("property_identifier", "member_expression"),
+    "go": ("field_identifier", None),
+    "rust": ("field_identifier", None),
+    "cpp": ("field_identifier", None),
+}
+
+
+def _extract_member_method_call(
+    node: Any,
+    method_type: str,
+    nested_parent_type: str | None,
+) -> tuple[str | None, str | None]:
+    """Extract receiver and method from a member-access node.
+
+    Covers JS/TS member_expression, Go selector_expression, and Rust/C++
+    field_expression — they share the shape (receiver, <method_type>) where
+    the receiver is either an identifier or a nested member access.
+    """
     method = None
     receiver = None
     for child in node.children:
-        if hasattr(child, 'type'):
-            if child.type == "property_identifier" and child.text:
-                method = child.text.decode("utf-8", errors="replace")
-            elif child.type == "identifier" and child.text:
-                receiver = child.text.decode("utf-8", errors="replace")
-            elif child.type == "member_expression":
-                for subchild in child.children:
-                    if hasattr(subchild, 'type') and subchild.type == "property_identifier":
-                        if subchild.text:
-                            receiver = subchild.text.decode("utf-8", errors="replace")
-                        break
-    return receiver, method
-
-
-def _extract_go_method_call(node: Any) -> tuple[str | None, str | None]:
-    """Extract receiver and method from Go selector_expression."""
-    method = None
-    receiver = None
-    for child in node.children:
-        if hasattr(child, 'type'):
-            if child.type == "field_identifier" and child.text:
-                method = child.text.decode("utf-8", errors="replace")
-            elif child.type == "identifier" and child.text:
-                receiver = child.text.decode("utf-8", errors="replace")
-    return receiver, method
-
-
-def _extract_rust_cpp_method_call(node: Any) -> tuple[str | None, str | None]:
-    """Extract receiver and method from Rust/C++ field_expression."""
-    method = None
-    receiver = None
-    for child in node.children:
-        if hasattr(child, 'type'):
-            if child.type == "field_identifier" and child.text:
-                method = child.text.decode("utf-8", errors="replace")
-            elif child.type == "identifier" and child.text:
-                receiver = child.text.decode("utf-8", errors="replace")
+        if not hasattr(child, "type"):
+            continue
+        if child.type == method_type and child.text:
+            method = child.text.decode("utf-8", errors="replace")
+        elif child.type == "identifier" and child.text:
+            receiver = child.text.decode("utf-8", errors="replace")
+        elif child.type in ("this", "super") and child.text:
+            # tree-sitter-javascript / tree-sitter-cpp emit `this`/`super` as
+            # dedicated node types rather than identifiers; surface them so
+            # downstream receiver resolution can swap in the enclosing class.
+            receiver = child.text.decode("utf-8", errors="replace")
+        elif nested_parent_type and child.type == nested_parent_type:
+            for subchild in child.children:
+                if hasattr(subchild, "type") and subchild.type == method_type:
+                    if subchild.text:
+                        receiver = subchild.text.decode("utf-8", errors="replace")
+                    break
     return receiver, method
 
 
@@ -211,7 +316,7 @@ IDENTIFIER_NODE_TYPES: frozenset[str] = frozenset({
     "property_identifier",  # JS/TS for object properties
     "field_identifier",     # Go, Rust for struct fields
     "type_identifier",      # Many languages for type names
-    "simple_identifier",    # Kotlin, Swift
+    "simple_identifier",    # Kotlin
     "name",                 # PHP
     "shorthand_property_identifier",  # JS destructuring
     "variable_name",        # Bash: $VAR references and assignments
@@ -292,40 +397,57 @@ class RepoParser:
         self,
         file_path: str,
         source_code: str
-    ) -> tuple[list[CodeEntity], list[tuple[int, str, str, str | None]]]:
-        """Parse a source file and extract entities and references.
+    ) -> tuple[list[CodeEntity], list[tuple[int, str, str, str | None]], set[str]]:
+        """Parse a source file and extract entities, references, and identifier usages.
 
         Returns:
-            Tuple of (entities, references) where references are
-            (line, target_name, ref_type, receiver) tuples.
-            receiver is None for simple function calls, or the object name
-            for method calls (e.g., 'cache' in 'cache.get()').
+            Tuple of (entities, references, used_names):
+            - references are (line, target_name, ref_type, receiver) tuples.
+              receiver is None for simple function calls, or the object name
+              for method calls (e.g., 'cache' in 'cache.get()').
+            - used_names is the set of identifiers appearing in non-definition
+              contexts (Vulture-style). Powers callback-dispatch suppression
+              for dead-code detection.
         """
-        ext = Path(file_path).suffix.lower()
-        lang_name = LANGUAGE_MAP.get(ext)
+        lang_name = language_for_path(file_path)
 
         if not lang_name:
-            return [], []
+            return [], [], set()
 
         parser = self._get_parser(lang_name)
         if not parser:
-            return [], []
+            return [], [], set()
 
         try:
             source_bytes = source_code.encode("utf-8")
             tree = parser.parse(source_bytes)
+            # tree-sitter-javascript can't parse type-annotated JS dialects
+            # (Flow, TypeScript-flavored JSDoc, Hermes typed JS). The resulting
+            # ERROR cascade silently drops later function declarations from
+            # captures. tree-sitter-typescript is a superset that parses these
+            # cleanly, so retry with it when JS errors and TS doesn't.
+            if lang_name == "javascript" and tree.root_node.has_error:
+                ts_parser = self._get_parser("typescript")
+                if ts_parser is not None:
+                    ts_tree = ts_parser.parse(source_bytes)
+                    if not ts_tree.root_node.has_error:
+                        lang_name = "typescript"
+                        tree = ts_tree
             query = self._queries[lang_name]
             captures_list = self._build_captures_list(query, tree.root_node)
         except Exception as e:
             logger.debug(f"Parse error in {file_path}: {e}")
-            return [], []
+            return [], [], set()
+
+        used_names = self._collect_identifier_usages(tree.root_node, file_path)
 
         if not captures_list:
-            return [], []
+            return [], [], used_names
 
-        return self._extract_entities_and_references(
+        entities, references = self._extract_entities_and_references(
             captures_list, file_path, lang_name, source_bytes
         )
+        return entities, references, used_names
 
     def _build_captures_list(
         self,
@@ -447,6 +569,9 @@ class RepoParser:
             receiver, method = self._extract_method_call_parts(node, ctx.lang_name)
             if method:
                 ctx.references.append((line, method, "call", receiver))
+        elif ref_type == "type":
+            for ident_line, ident_name in self._iter_type_identifiers(node):
+                ctx.references.append((ident_line, ident_name, "type", None))
         else:
             ctx.references.append((line, text, ref_type, None))
 
@@ -456,42 +581,25 @@ class RepoParser:
             if import_target:
                 ctx.references.append((line, import_target, "import", None))
 
-    def extract_identifier_usages(
-        self,
-        file_path: str,
-        source_code: str
-    ) -> set[str]:
-        """Extract all identifier names that are USED (referenced) in a file.
+    @staticmethod
+    def _iter_type_identifiers(node: Any) -> list[tuple[int, str]]:
+        """Yield (line, name) for every identifier inside a type-expression subtree.
 
-        This implements Vulture-style name tracking: any identifier that appears
-        in a non-definition context is considered "used". This catches patterns
-        that call-graph analysis misses:
-        - Dictionary values: {"key": func}
-        - Callbacks: sort(key=func)
-        - Assignments: handler = func
-        - List literals: [func1, func2]
-
-        Returns:
-            Set of identifier names that are referenced (not just defined).
+        Captures parametrized types like `list[CodeEntity]` and `dict[str, Foo]`
+        as one tuple per identifier. Primitives drop out at graph layer (no entity
+        match in `_name_to_nodes`); this keeps the walker language-agnostic.
         """
-        ext = Path(file_path).suffix.lower()
-        lang_name = LANGUAGE_MAP.get(ext)
-
-        if not lang_name:
-            return set()
-
-        parser = self._get_parser(lang_name)
-        if not parser:
-            return set()
-
-        try:
-            source_bytes = source_code.encode("utf-8")
-            tree = parser.parse(source_bytes)
-        except Exception as e:
-            logger.debug(f"Parse error in {file_path}: {e}")
-            return set()
-
-        return self._collect_identifier_usages(tree.root_node, file_path)
+        out: list[tuple[int, str]] = []
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if current.type in IDENTIFIER_NODE_TYPES:
+                name = current.text.decode("utf-8", errors="replace")
+                if name and name not in _BUILTIN_NAMES:
+                    out.append((current.start_point.row + 1, name))
+                continue
+            stack.extend(current.children)
+        return out
 
     @staticmethod
     def _is_definition_context(node: Any) -> bool:
@@ -525,6 +633,16 @@ class RepoParser:
         if parent.type == "variable_declarator":
             name_node = parent.child_by_field_name("name")
             if name_node and node.id == name_node.id:
+                return True
+
+        # C/C++: function definitions and prototypes parent the function name
+        # under `function_declarator` (declarator field), not directly under
+        # function_definition. Function-pointer typedefs and struct fields use
+        # the same node but with a `parenthesized_declarator` in that field, so
+        # the identity check on the field child correctly excludes them.
+        if parent.type == "function_declarator":
+            declarator = parent.child_by_field_name("declarator")
+            if declarator and node.id == declarator.id:
                 return True
 
         if parent.type in ("for_in_clause", "for_in_statement"):
@@ -574,17 +692,20 @@ class RepoParser:
         try:
             if lang_name == "python":
                 receiver, method = _extract_python_method_call(node)
-            elif lang_name in ("javascript", "typescript"):
-                receiver, method = _extract_js_ts_method_call(node)
-            elif lang_name == "go":
-                receiver, method = _extract_go_method_call(node)
-            elif lang_name in ("rust", "cpp"):
-                receiver, method = _extract_rust_cpp_method_call(node)
+            elif lang_name in _MEMBER_CALL_SHAPES:
+                method_type, nested_parent_type = _MEMBER_CALL_SHAPES[lang_name]
+                receiver, method = _extract_member_method_call(
+                    node, method_type, nested_parent_type
+                )
             else:
                 receiver, method = _extract_fallback_method_call(node)
 
-            # Skip self/this/super - can't resolve without type analysis
-            if receiver in ('self', 'this', 'super', 'cls'):
+            # Resolve self/this/cls to the enclosing class so qualified
+            # lookup (ClassName.method) hits in the call-graph builder.
+            # `super` would need extends-clause traversal — not in scope.
+            if receiver in ('self', 'this', 'cls'):
+                receiver = _find_enclosing_class_name(node, lang_name)
+            elif receiver == 'super':
                 receiver = None
 
             return receiver, method
@@ -786,6 +907,19 @@ class RepoParser:
         if not def_node:
             return None
 
+        # Walk through declarator wrappers (e.g. C/C++ function_declarator) to
+        # the real def node that owns the body field.  Without this, def_node
+        # would be the signature-only declarator and source_code/complexity/
+        # body_range would all reflect the signature alone, not the function.
+        hops = 0
+        while (
+            def_node.type in DECLARATOR_WRAPPER_TYPES
+            and def_node.parent is not None
+            and hops < MAX_BODY_SEARCH_DEPTH
+        ):
+            def_node = def_node.parent
+            hops += 1
+
         start_line = def_node.start_point.row + 1
         end_line = def_node.end_point.row + 1
 
@@ -818,16 +952,7 @@ class RepoParser:
         docstring = self._extract_docstring(def_node, ctx.lang_name, ctx.source_bytes)
         entity_type = capture_name.split(".")[1]
 
-        parent_class = None
-        current = def_node.parent
-        while current:
-            if current.type in ("class_definition", "class_declaration", "class_specifier"):
-                for child in current.children:
-                    if child.type in ("identifier", "type_identifier", "name"):
-                        parent_class = child.text.decode("utf-8", errors="replace") if child.text else None
-                        break
-                break
-            current = current.parent
+        parent_class = _find_enclosing_class_name(def_node, ctx.lang_name)
 
         # Calculate cyclomatic complexity for functions/methods only
         complexity = None

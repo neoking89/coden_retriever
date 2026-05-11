@@ -24,6 +24,25 @@ from prompt_toolkit.layout import (
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Frame
 
+from .picker_styles import (
+    CLASS_HEADER,
+    CLASS_SELECTED,
+    CLASS_SEPARATOR,
+    KEY_CTRL_C,
+    KEY_DOWN,
+    KEY_ENTER,
+    KEY_ESCAPE,
+    KEY_QUIT,
+    KEY_UP,
+    KEY_VIM_DOWN,
+    KEY_VIM_UP,
+    PERMISSION_SEPARATOR_WIDTH,
+    SELECTED_PREFIX,
+    STYLE_SELECTED,
+    STYLE_SEPARATOR,
+    STYLE_TOOLBAR,
+    UNSELECTED_PREFIX,
+)
 from .rich_console import console
 
 logger = logging.getLogger(__name__)
@@ -106,19 +125,19 @@ def run_tool_permission_picker(request: ToolPermissionRequest) -> Optional[Permi
     # Create key bindings
     kb = KeyBindings()
 
-    @kb.add('up')
-    @kb.add('k')
+    @kb.add(KEY_UP)
+    @kb.add(KEY_VIM_UP)
     def move_up(event):
         if picker.selected_index > 0:
             picker.selected_index -= 1
 
-    @kb.add('down')
-    @kb.add('j')
+    @kb.add(KEY_DOWN)
+    @kb.add(KEY_VIM_DOWN)
     def move_down(event):
         if picker.selected_index < len(picker.choices) - 1:
             picker.selected_index += 1
 
-    @kb.add('enter')
+    @kb.add(KEY_ENTER)
     @kb.add(' ')
     def select_choice(event):
         picker.result = picker.get_selected_choice()
@@ -140,13 +159,13 @@ def run_tool_permission_picker(request: ToolPermissionRequest) -> Optional[Permi
         picker.result = PermissionChoice.ALWAYS_ALLOW
         event.app.exit()
 
-    @kb.add('escape')
-    @kb.add('q')
+    @kb.add(KEY_ESCAPE)
+    @kb.add(KEY_QUIT)
     def cancel(event):
         picker.cancelled = True
         event.app.exit()
 
-    @kb.add('c-c')
+    @kb.add(KEY_CTRL_C)
     def ctrl_c(event):
         picker.cancelled = True
         event.app.exit()
@@ -156,8 +175,8 @@ def run_tool_permission_picker(request: ToolPermissionRequest) -> Optional[Permi
         lines = []
 
         # Header with tool information
-        lines.append(('class:header', ' Tool Execution Request\n'))
-        lines.append(('class:separator', ' ' + '-' * 50 + '\n\n'))
+        lines.append((CLASS_HEADER, ' Tool Execution Request\n'))
+        lines.append((CLASS_SEPARATOR, ' ' + '-' * PERMISSION_SEPARATOR_WIDTH + '\n\n'))
 
         # Tool name
         lines.append(('class:label', ' Tool: '))
@@ -169,7 +188,7 @@ def run_tool_permission_picker(request: ToolPermissionRequest) -> Optional[Permi
         lines.append(('class:args', f'{args_str}\n\n'))
 
         # Separator before choices
-        lines.append(('class:separator', ' ' + '-' * 50 + '\n\n'))
+        lines.append((CLASS_SEPARATOR, ' ' + '-' * PERMISSION_SEPARATOR_WIDTH + '\n\n'))
 
         # Choice options with arrow indicator
         lines.append(('class:label', ' Select action:\n\n'))
@@ -178,10 +197,10 @@ def run_tool_permission_picker(request: ToolPermissionRequest) -> Optional[Permi
             is_selected = i == picker.selected_index
 
             if is_selected:
-                prefix = ' > '
-                style = 'class:selected'
+                prefix = SELECTED_PREFIX
+                style = CLASS_SELECTED
             else:
-                prefix = '   '
+                prefix = UNSELECTED_PREFIX
                 style = 'class:choice'
 
             if choice == PermissionChoice.ALLOW:
@@ -239,17 +258,17 @@ def run_tool_permission_picker(request: ToolPermissionRequest) -> Optional[Permi
     # Styles
     style = Style.from_dict({
         'header': 'bold #ffaa00',
-        'separator': '#666666',
+        'separator': STYLE_SEPARATOR,
         'label': 'bold #00aaff',
         'tool-name': 'bold #ff6600',
         'args': '#cccccc',
         'choice': '#ffffff',
-        'selected': 'bold reverse #00ff00',
+        'selected': STYLE_SELECTED,
         'allow': 'bold #00ff00',
-        'always-allow': 'bold #00aaff',  # Cyan for "Always Allow"
+        'always-allow': 'bold #00aaff',
         'deny': 'bold #ff4444',
         'dim': '#888888',
-        'toolbar': 'bg:#333333 #ffffff',
+        'toolbar': STYLE_TOOLBAR,
         'frame.border': '#ffaa00',
     })
 

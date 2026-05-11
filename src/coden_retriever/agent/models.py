@@ -40,7 +40,7 @@ class AgentDeps:
     """
     root_directory: str
     mode: AgentMode = AgentMode.CODING
-    include_tool_instructions: bool = True
+    include_tool_instructions: bool = False
     debug: bool = False
     study_topic: Optional[str] = None
 

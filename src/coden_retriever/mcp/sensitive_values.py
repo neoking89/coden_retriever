@@ -17,6 +17,7 @@ from ..constants import (
     SENSITIVE_VALUE_DEFAULT_THRESHOLD,
     SENSITIVE_VALUE_MAX_RESULTS,
 )
+from .validation import validate_root_directory
 
 # Pre-import classifier (and its sklearn dependency) at module level.
 # On Windows, first importing sklearn DLLs inside asyncio.to_thread
@@ -38,7 +39,7 @@ def _load_and_detect(
     from ..cache import CacheManager
     from ..sensitive_values.detector import detect_sensitive_values
 
-    cache = CacheManager(Path(root_directory), enable_semantic=False)
+    cache = CacheManager(Path(root_directory))
     indices = cache.load_or_rebuild()
 
     return detect_sensitive_values(
@@ -71,8 +72,8 @@ async def detect_sensitive_values_tool(
     ] = None,
 ) -> dict[str, Any]:
     """Detect hardcoded sensitive values (secrets, credentials, API keys) in source code."""
-    if not root_directory:
-        return {"error": "root_directory is required"}
+    if err := validate_root_directory(root_directory):
+        return err
 
     return await asyncio.to_thread(
         _load_and_detect,

@@ -105,36 +105,6 @@ def parse_numstat(output: str) -> list[dict[str, Any]]:
     return results
 
 
-def parse_log_name_only(output: str) -> dict[str, int]:
-    """Parse `git log --name-only` output into file commit counts.
-
-    Input format:
-        <commit info>
-
-        file1.py
-        file2.py
-
-        <commit info>
-
-        file1.py
-
-    Args:
-        output: Raw output from git log --format=format: --name-only.
-
-    Returns:
-        Dict mapping file path to number of commits affecting it.
-    """
-    file_counts: dict[str, int] = {}
-
-    for line in output.splitlines():
-        line = line.strip()
-        if line and not line.startswith("commit "):
-            # This is a filename
-            file_counts[line] = file_counts.get(line, 0) + 1
-
-    return file_counts
-
-
 def parse_log_oneline(output: str) -> list[dict[str, Any]]:
     """Parse `git log --format` output into commit details.
 

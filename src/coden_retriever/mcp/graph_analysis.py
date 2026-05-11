@@ -14,22 +14,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
 from pydantic import Field
 
 from ..cache import CacheManager
+from ..constants import MAX_TOKEN_LIMIT, MIN_TOKEN_LIMIT
+from ._defaults import RESOLVED_DEFAULT_TOKEN_BUDGET
 from ..daemon.client import try_daemon_graph_analysis as _daemon_graph_analysis
 from ..daemon.protocol import GraphAnalysisParams
-from ..token_estimator import count_tokens
+from .validation import validate_root_directory
 from ..graph_utils import (
     AUTO_MIN_IMPORTANCE,
-    _TOKEN_OVERHEAD_CHANGE_IMPACT,
     _TOKEN_OVERHEAD_BOTTLENECKS,
-    _TOKEN_PER_CALLER,
     _TOKEN_PER_BOTTLENECK,
+    BfsContext,
+    apply_token_budget_filter,
     build_caller_info,
     compute_coupling_hotspots,
     detect_high_connectivity,
@@ -37,28 +38,13 @@ from ..graph_utils import (
     find_symbol_nodes,
     get_connected_modules,
     get_entity_display_name,
+    trace_impact_bfs,
 )
 
 if TYPE_CHECKING:
     from ..cache.models import CachedIndices
 
 logger = logging.getLogger(__name__)
-
-
-def _validate_root_directory(root_directory: str) -> dict[str, Any] | None:
-    """Validate that root_directory exists and is a directory.
-
-    Args:
-        root_directory: Path to validate.
-
-    Returns:
-        Error dict if invalid, None if valid.
-    """
-    if not root_directory:
-        return {"error": "root_directory is required"}
-    if not os.path.isdir(root_directory):
-        return {"error": f"Root directory not found: {root_directory}"}
-    return None
 
 
 async def _load_cached_indices(root_directory: str) -> "CachedIndices":
@@ -77,11 +63,10 @@ async def _load_cached_indices(root_directory: str) -> "CachedIndices":
         Exception: If cache loading fails.
     """
     def _load_sync() -> "CachedIndices":
-        cache = CacheManager(Path(root_directory), enable_semantic=False)
+        cache = CacheManager(Path(root_directory))
         return cache.load_or_rebuild()
 
     return await asyncio.to_thread(_load_sync)
-
 
 
 async def change_impact_radius(
@@ -103,8 +88,8 @@ async def change_impact_radius(
     ] = 0.0,
     token_limit: Annotated[
         int,
-        Field(description="Soft limit on the return size in tokens", ge=100, le=100000),
-    ] = 4000,
+        Field(description="Soft limit on the return size in tokens", ge=MIN_TOKEN_LIMIT, le=MAX_TOKEN_LIMIT),
+    ] = RESOLVED_DEFAULT_TOKEN_BUDGET,
 ) -> dict[str, Any]:
     """Analyze the blast radius of changing a function - trace all upstream callers.
 
@@ -130,7 +115,7 @@ async def change_impact_radius(
     - callers_by_depth: Detailed caller information grouped by distance
     """
     # Validate root directory exists
-    validation_error = _validate_root_directory(root_directory)
+    validation_error = validate_root_directory(root_directory)
     if validation_error:
         return validation_error
 
@@ -160,8 +145,8 @@ async def change_impact_radius(
 
     graph = indices.graph
     entities = indices.entities
-    pagerank = indices.pagerank
-    name_to_nodes = indices.name_to_nodes
+    pagerank = indices.centrality.pagerank
+    name_to_nodes = indices.lookups.name_to_nodes
 
     # Use shared helper for symbol lookup
     matching_nodes = find_symbol_nodes(symbol_name, name_to_nodes)
@@ -194,88 +179,36 @@ async def change_impact_radius(
         if min_importance < AUTO_MIN_IMPORTANCE:
             min_importance = AUTO_MIN_IMPORTANCE
 
-    # Token budget tracking
-    used_tokens = _TOKEN_OVERHEAD_CHANGE_IMPACT
-    token_budget_exceeded = False
+    ctx = BfsContext(
+        graph=graph,
+        entities=entities,
+        pagerank=pagerank,
+        min_importance=min_importance,
+    )
+    acc = trace_impact_bfs(target_node, ctx, max_depth, token_limit)
 
-    # BFS to find all upstream callers
-    callers_by_depth: dict[int, list[dict]] = {}
-    visited = {target_node}
-    current_level = {target_node}
-    all_affected_files = set()
-    root_callers = []  # Callers with fan_in=0 (true entry points)
-
-    for depth in range(1, max_depth + 1):
-        next_level = set()
-        depth_callers = []
-
-        for node in current_level:
-            if node in graph:
-                for caller_node in graph.predecessors(node):
-                    if caller_node not in visited:
-                        visited.add(caller_node)
-                        next_level.add(caller_node)
-
-                        caller_entity = entities.get(caller_node)
-                        if caller_entity:
-                            importance = pagerank.get(caller_node, 0.0)
-
-                            if importance < min_importance:
-                                continue
-
-                            # Use shared helper for building caller info
-                            caller_info = build_caller_info(caller_entity, importance)
-                            depth_callers.append(caller_info)
-                            all_affected_files.add(caller_entity.file_path)
-
-                            # Root callers have no incoming edges
-                            if graph.in_degree(caller_node) == 0:
-                                root_callers.append(caller_info)
-
-        if depth_callers:
-            depth_callers.sort(key=lambda x: x["importance"], reverse=True)
-
-            # Apply token budget: keep callers until we exceed the limit
-            filtered_callers = []
-            for caller in depth_callers:
-                # Estimate tokens for this caller entry
-                caller_text = f"{caller['name']} {caller['file']} {caller['type']}"
-                caller_tokens = count_tokens(caller_text, is_code=False) + _TOKEN_PER_CALLER
-                if used_tokens + caller_tokens > token_limit:
-                    token_budget_exceeded = True
-                    break
-                used_tokens += caller_tokens
-                filtered_callers.append(caller)
-
-            callers_by_depth[depth] = filtered_callers
-
-        if not next_level or token_budget_exceeded:
-            break
-        current_level = next_level
-
-    # Calculate affected modules using helper function
     root_path = Path(root_directory)
     affected_modules: set[str] = set()
-    for file_path in all_affected_files:
+    for file_path in acc.affected_files:
         module = extract_module_from_path(file_path, root_path)
         if module:
             affected_modules.add(module)
 
-    total_callers = sum(len(callers) for callers in callers_by_depth.values())
-    direct_count = len(callers_by_depth.get(1, []))
+    total_callers = sum(len(callers) for callers in acc.callers_by_depth.values())
+    direct_count = len(acc.callers_by_depth.get(1, []))
 
     result = {
         "symbol": build_caller_info(target_entity, pagerank.get(target_node, 0.0)),
         "impact_summary": {
             "direct_callers": direct_count,
             "total_affected": total_callers,
-            "affected_files": len(all_affected_files),
+            "affected_files": len(acc.affected_files),
             "affected_modules": sorted(affected_modules),  # Sort for deterministic output
-            "max_depth_reached": max(callers_by_depth.keys()) if callers_by_depth else 0,
-            "token_budget_exceeded": token_budget_exceeded,
+            "max_depth_reached": max(acc.callers_by_depth.keys()) if acc.callers_by_depth else 0,
+            "token_budget_exceeded": acc.token_budget_exceeded,
         },
-        "root_callers": root_callers[:10],
-        "callers_by_depth": callers_by_depth,
+        "root_callers": acc.root_callers[:10],
+        "callers_by_depth": acc.callers_by_depth,
     }
 
     # Include warning for high-connectivity targets
@@ -308,8 +241,8 @@ async def coupling_hotspots(
     ] = False,
     token_limit: Annotated[
         int,
-        Field(description="Soft limit on the return size in tokens", ge=100, le=100000),
-    ] = 4000,
+        Field(description="Soft limit on the return size in tokens", ge=MIN_TOKEN_LIMIT, le=MAX_TOKEN_LIMIT),
+    ] = RESOLVED_DEFAULT_TOKEN_BUDGET,
 ) -> dict[str, Any]:
     """Find functions with high coupling - many callers AND many dependencies.
 
@@ -333,7 +266,7 @@ async def coupling_hotspots(
     - summary: Statistics about coupling distribution
     """
     # Validate root directory exists
-    validation_error = _validate_root_directory(root_directory)
+    validation_error = validate_root_directory(root_directory)
     if validation_error:
         return validation_error
 
@@ -360,7 +293,7 @@ async def coupling_hotspots(
     return compute_coupling_hotspots(
         graph=indices.graph,
         entities=indices.entities,
-        pagerank=indices.pagerank,
+        pagerank=indices.centrality.pagerank,
         limit=limit,
         min_coupling_score=min_coupling_score,
         exclude_tests=exclude_tests,
@@ -388,8 +321,8 @@ async def architectural_bottlenecks(
     ] = True,
     token_limit: Annotated[
         int,
-        Field(description="Soft limit on the return size in tokens", ge=100, le=100000),
-    ] = 4000,
+        Field(description="Soft limit on the return size in tokens", ge=MIN_TOKEN_LIMIT, le=MAX_TOKEN_LIMIT),
+    ] = RESOLVED_DEFAULT_TOKEN_BUDGET,
 ) -> dict[str, Any]:
     """Find architectural bottlenecks - functions on many paths between other functions.
 
@@ -412,7 +345,7 @@ async def architectural_bottlenecks(
     - Each includes: name, betweenness score, fan_in, fan_out, connected_modules
     """
     # Validate root directory exists
-    validation_error = _validate_root_directory(root_directory)
+    validation_error = validate_root_directory(root_directory)
     if validation_error:
         return validation_error
 
@@ -437,8 +370,8 @@ async def architectural_bottlenecks(
 
     graph = indices.graph
     entities = indices.entities
-    betweenness = indices.betweenness
-    pagerank = indices.pagerank
+    betweenness = indices.centrality.betweenness
+    pagerank = indices.centrality.pagerank
 
     root_path = Path(root_directory)
     bottlenecks = []
@@ -478,22 +411,13 @@ async def architectural_bottlenecks(
     bottlenecks.sort(key=lambda x: x["betweenness"], reverse=True)
     bottlenecks = bottlenecks[:limit]
 
-    # Apply token budget filtering
-    used_tokens = _TOKEN_OVERHEAD_BOTTLENECKS
-    token_budget_exceeded = False
-
-    filtered_bottlenecks = []
-    for bottleneck in bottlenecks:
-        # Include connected_modules in token estimate
-        modules_text = " ".join(bottleneck["connected_modules"])
-        bottleneck_text = f"{bottleneck['name']} {bottleneck['file']} {bottleneck['type']} {modules_text}"
-        bottleneck_tokens = count_tokens(bottleneck_text, is_code=False) + _TOKEN_PER_BOTTLENECK
-        if used_tokens + bottleneck_tokens > token_limit:
-            token_budget_exceeded = True
-            break
-        used_tokens += bottleneck_tokens
-        filtered_bottlenecks.append(bottleneck)
-    bottlenecks = filtered_bottlenecks
+    bottlenecks, _, token_budget_exceeded = apply_token_budget_filter(
+        bottlenecks,
+        token_limit,
+        _TOKEN_OVERHEAD_BOTTLENECKS,
+        _TOKEN_PER_BOTTLENECK,
+        ["name", "file", "type", "connected_modules"],
+    )
 
     all_bt = list(betweenness.values())
     if all_bt:

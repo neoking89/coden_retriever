@@ -6,6 +6,7 @@ for sub-200ms response times. Includes automatic file watching for
 real-time index updates.
 """
 
+from .address import DaemonAddress
 from .server import DaemonServer
 from .client import (
     DaemonClient,
@@ -18,6 +19,7 @@ from .client import (
 from .protocol import Request, Response, SearchParams
 
 __all__ = [
+    "DaemonAddress",
     "DaemonServer",
     "DaemonClient",
     "Request",

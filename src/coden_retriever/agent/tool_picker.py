@@ -4,6 +4,7 @@ Provides a keyboard-navigable checkbox list using prompt_toolkit.
 Users can toggle tools on/off with Space and apply changes with Enter.
 """
 
+import asyncio
 from dataclasses import dataclass
 from typing import Optional
 
@@ -19,6 +20,26 @@ from prompt_toolkit.layout import (
 from prompt_toolkit.styles import Style
 from prompt_toolkit.widgets import Frame
 
+from .picker_styles import (
+    CLASS_DIM,
+    CLASS_HEADER,
+    CLASS_SELECTED,
+    CLASS_SEPARATOR,
+    KEY_CTRL_C,
+    KEY_DOWN,
+    KEY_ENTER,
+    KEY_ESCAPE,
+    KEY_QUIT,
+    KEY_UP,
+    KEY_VIM_DOWN,
+    KEY_VIM_UP,
+    PICKER_SEPARATOR_WIDTH,
+    SELECTED_PREFIX,
+    STYLE_SELECTED,
+    STYLE_SEPARATOR,
+    STYLE_TOOLBAR,
+    UNSELECTED_PREFIX,
+)
 from .rich_console import console
 from .ui_utils import calculate_viewport, format_scroll_indicator
 from ..mcp.constants import get_tool_categories
@@ -127,14 +148,14 @@ def run_tool_picker(
     # Create key bindings
     kb = KeyBindings()
 
-    @kb.add('up')
-    @kb.add('k')
+    @kb.add(KEY_UP)
+    @kb.add(KEY_VIM_UP)
     def move_up(event):
         if picker.selected_index > 0:
             picker.selected_index -= 1
 
-    @kb.add('down')
-    @kb.add('j')
+    @kb.add(KEY_DOWN)
+    @kb.add(KEY_VIM_DOWN)
     def move_down(event):
         if picker.selected_index < len(picker.tools) - 1:
             picker.selected_index += 1
@@ -144,7 +165,7 @@ def run_tool_picker(
     def toggle_tool(event):
         picker.toggle_current()
 
-    @kb.add('enter')
+    @kb.add(KEY_ENTER)
     def apply_changes(event):
         picker.applied = True
         event.app.exit()
@@ -159,13 +180,13 @@ def run_tool_picker(
         for tool in picker.tools:
             tool.enabled = False
 
-    @kb.add('escape')
-    @kb.add('q')
+    @kb.add(KEY_ESCAPE)
+    @kb.add(KEY_QUIT)
     def cancel(event):
         picker.cancelled = True
         event.app.exit()
 
-    @kb.add('c-c')
+    @kb.add(KEY_CTRL_C)
     def ctrl_c(event):
         picker.cancelled = True
         event.app.exit()
@@ -177,8 +198,8 @@ def run_tool_picker(
         # Header
         enabled_count = sum(1 for t in picker.tools if t.enabled)
         total_count = len(picker.tools)
-        lines.append(('class:header', f' Tools: {enabled_count}/{total_count} enabled\n'))
-        lines.append(('class:separator', ' ' + '-' * 62 + '\n'))
+        lines.append((CLASS_HEADER, f' Tools: {enabled_count}/{total_count} enabled\n'))
+        lines.append((CLASS_SEPARATOR, ' ' + '-' * PICKER_SEPARATOR_WIDTH + '\n'))
 
         # Calculate visible range (scrolling)
         max_visible = 12
@@ -198,10 +219,10 @@ def run_tool_picker(
             checkbox_style = 'class:checkbox-on' if tool.enabled else 'class:checkbox-off'
 
             if is_selected:
-                prefix = ' > '
-                name_style = 'class:selected'
+                prefix = SELECTED_PREFIX
+                name_style = CLASS_SELECTED
             else:
-                prefix = '   '
+                prefix = UNSELECTED_PREFIX
                 name_style = 'class:tool-name'
 
             # Format: " > [X] tool_name - description"
@@ -213,9 +234,9 @@ def run_tool_picker(
         # Scroll indicator
         if len(picker.tools) > max_visible:
             scroll_info = format_scroll_indicator(picker.selected_index, len(picker.tools))
-            lines.append(('class:dim', scroll_info + '\n'))
+            lines.append((CLASS_DIM, scroll_info + '\n'))
 
-        lines.append(('class:separator', '\n ' + '-' * 62 + '\n'))
+        lines.append((CLASS_SEPARATOR, '\n ' + '-' * PICKER_SEPARATOR_WIDTH + '\n'))
 
         return FormattedText(lines)
 
@@ -252,15 +273,15 @@ def run_tool_picker(
     # Styles
     style = Style.from_dict({
         'header': 'bold #00aa00',
-        'separator': '#666666',
+        'separator': STYLE_SEPARATOR,
         'category': 'bold #ffaa00',
         'tool-name': '#00aaff',
-        'selected': 'bold reverse #00ff00',
+        'selected': STYLE_SELECTED,
         'checkbox-on': 'bold #00ff00',
-        'checkbox-off': '#666666',
+        'checkbox-off': STYLE_SEPARATOR,
         'description': '#888888',
-        'dim': '#666666',
-        'toolbar': 'bg:#333333 #ffffff',
+        'dim': STYLE_SEPARATOR,
+        'toolbar': STYLE_TOOLBAR,
         'frame.border': '#00aa00',
     })
 
@@ -304,8 +325,7 @@ async def run_tool_picker_async(
     Returns:
         New set of disabled tools, or None if cancelled.
     """
-    import asyncio
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None,
         run_tool_picker,

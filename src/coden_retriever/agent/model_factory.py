@@ -160,6 +160,16 @@ class ModelFactory:
         Args:
             api_key: API key from config cache (for immediate updates).
         """
+        # A leading `/` almost always means a persisted config was corrupted by
+        # a slash-command typo (e.g. `/model /model foo`). Surface that clearly
+        # instead of letting the user hit the generic base_url error.
+        if self.model_str.startswith("/"):
+            raise ValueError(
+                f"Invalid model name '{self.model_str}': starts with '/'. "
+                "Your persisted config likely stored a slash-command typo. "
+                "Fix it via `/model <name>` (e.g. ollama:qwen2.5-coder:14b) "
+                "or edit the 'model.default' field in your settings.json."
+            )
         if not self.base_url:
             raise ValueError(
                 f"base_url is required for custom model '{self.model_str}'. "

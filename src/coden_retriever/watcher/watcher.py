@@ -275,17 +275,6 @@ class FileWatcher:
         with self._lock:
             return self._running
 
-    def flush(self) -> BatchedChanges | None:
-        """
-        Flush any pending changes synchronously.
-
-        Useful for testing or when you need immediate processing.
-        """
-        with self._lock:
-            if self._debouncer:
-                return self._debouncer.flush_sync()
-            return None
-
     def __enter__(self) -> "FileWatcher":
         """Context manager entry."""
         self.start()

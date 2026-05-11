@@ -9,15 +9,15 @@ from typing import TYPE_CHECKING, Annotated, Any
 
 from pydantic import Field
 
+from ..constants import DEFAULT_DEAD_CODE_CONFIDENCE_THRESHOLD, DEFAULT_DEAD_CODE_RESULT_LIMIT
+from .validation import validate_root_directory
+
 if TYPE_CHECKING:
     from fastmcp import FastMCP
 
 
 logger = logging.getLogger(__name__)
 
-# Limits for MCP context windows
-DEFAULT_RESULT_LIMIT = 50   # Prevent overwhelming results
-DEFAULT_CONFIDENCE = 0.5    # Balance between precision and recall
 DEFAULT_MIN_LINES = 3       # Skip trivial one-liners
 
 # Validation bounds for MCP parameters
@@ -36,7 +36,7 @@ def _load_and_detect(
     from ..cache import CacheManager
     from ..dead_code.detector import detect_unused_functions
 
-    cache = CacheManager(Path(root_directory), enable_semantic=False)
+    cache = CacheManager(Path(root_directory))
     indices = cache.load_or_rebuild()
 
     return detect_unused_functions(
@@ -47,6 +47,7 @@ def _load_and_detect(
         include_private=include_private,
         min_lines=min_lines,
         limit=limit,
+        used_names=indices.used_names,
     )
 
 
@@ -54,10 +55,10 @@ async def detect_dead_code(
     root_directory: Annotated[str, Field(description="Project root directory")],
     confidence_threshold: Annotated[
         float, Field(description="Minimum confidence (0.0-1.0)", ge=0.0, le=1.0)
-    ] = DEFAULT_CONFIDENCE,
+    ] = DEFAULT_DEAD_CODE_CONFIDENCE_THRESHOLD,
     limit: Annotated[
         int, Field(description="Max results", ge=1, le=MAX_RESULTS)
-    ] = DEFAULT_RESULT_LIMIT,
+    ] = DEFAULT_DEAD_CODE_RESULT_LIMIT,
     exclude_tests: Annotated[
         bool, Field(description="Exclude test functions")
     ] = True,
@@ -69,8 +70,8 @@ async def detect_dead_code(
     ] = DEFAULT_MIN_LINES,
 ) -> dict[str, Any]:
     """Detect potentially dead (unused) code in the codebase."""
-    if not root_directory:
-        return {"error": "root_directory is required"}
+    if err := validate_root_directory(root_directory):
+        return err
 
     return await asyncio.to_thread(
         _load_and_detect,

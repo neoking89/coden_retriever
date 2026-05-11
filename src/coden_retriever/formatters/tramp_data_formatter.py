@@ -8,15 +8,20 @@ Provides consistent formatting for tramp data detection results with:
 - Summary statistics
 """
 
-import json
 from typing import Any
 
 from ..constants import (
+    FORMATTER_WIDTH,
     TRAMP_DATA_MAX_FUNCTIONS_DISPLAY,
     TRAMP_DATA_TIER_HIGH,
     TRAMP_DATA_TIER_MODERATE,
 )
-from .cli_metrics import BaseCLIMetricFormatter, FALSE_POSITIVE_WARNING, SeverityTier
+from .cli_metrics import (
+    BaseCLIMetricFormatter,
+    SeverityTier,
+    extract_filename,
+    format_parameter_header,
+)
 
 
 # 110 chars matches the hotspots table width for visual consistency across commands
@@ -27,11 +32,6 @@ _GROUP_COL_WIDTH = 35
 
 # 4 params fit within _GROUP_COL_WIDTH (35 chars) for typical short names
 _MAX_DISPLAY_PARAMS = 4
-
-
-def _extract_filename(file_path: str) -> str:
-    """Extract filename from a path, handling both Unix and Windows separators."""
-    return file_path.split("/")[-1].split("\\")[-1]
 
 
 def _format_group_label(group: list[str]) -> str:
@@ -54,22 +54,15 @@ def format_tramp_data_parameters_header(
     min_group_size: int = 2,
 ) -> str:
     """Format parameter summary header for tramp data detection."""
-    lines = []
-    lines.append("=" * 80)
-    lines.append("TRAMP DATA DETECTION PARAMETERS")
-    lines.append("=" * 80)
-    lines.append(f"Min Occurrences: >= {min_occurrences} functions")
-    lines.append(f"Min Group Size: >= {min_group_size} params")
-    lines.append(f"Exclude Tests: {exclude_tests}")
-
-    if limit is None:
-        lines.append("[!] Result Limit: ALL (may be slow for large repos)")
-    else:
-        lines.append(f"[!] Result Limit: TOP {limit} -- more results may exist (use -n -1 for all)")
-
-    lines.append(FALSE_POSITIVE_WARNING)
-    lines.append("=" * 80)
-    return "\n".join(lines)
+    return format_parameter_header(
+        "TRAMP DATA DETECTION PARAMETERS",
+        [
+            f"Min Occurrences: >= {min_occurrences} functions",
+            f"Min Group Size: >= {min_group_size} params",
+            f"Exclude Tests: {exclude_tests}",
+        ],
+        limit,
+    )
 
 
 class TrampDataFormatter(BaseCLIMetricFormatter):
@@ -94,31 +87,14 @@ class TrampDataFormatter(BaseCLIMetricFormatter):
             return SeverityTier.MODERATE
         return SeverityTier.LOW
 
-    def format_items(
-        self,
-        items: list[dict[str, Any]],
-        output_format: str,
-        reverse: bool,
-    ) -> str:
-        """Format tramp data results as pipe-separated table for CLI output."""
-        if output_format == "json":
-            return json.dumps(items, indent=2)
+    def _empty_message(self) -> str:
+        return "No tramp data groups detected at the specified threshold."
 
-        if not items:
-            return "No tramp data groups detected at the specified threshold."
+    def _table_width(self) -> int:
+        return _TABLE_WIDTH
 
-        display_items = items if reverse else list(reversed(items))
-
-        lines = [self._build_header(), "-" * _TABLE_WIDTH]
-
-        for i, item in enumerate(display_items, 1):
-            rank = i if reverse else len(display_items) - i + 1
-            lines.append(self._format_row(item, rank))
-
-        lines.append("-" * _TABLE_WIDTH)
-        lines.append(f"Total: {len(items)} tramp data groups")
-
-        return "\n".join(lines)
+    def _total_label(self, count: int) -> str:
+        return f"Total: {count} tramp data groups"
 
     def _build_header(self) -> str:
         """Build table header row matching hotspots style."""
@@ -159,7 +135,7 @@ class TrampDataFormatter(BaseCLIMetricFormatter):
             name = func.get("name", "?")
             file_path = func.get("file", "")
             line = func.get("line", 0)
-            file_short = _extract_filename(file_path)
+            file_short = extract_filename(file_path)
             link = self.make_hyperlink(name, file_path, line, tier)
             parts.append(f"{link}({file_short}:{line})")
 
@@ -184,19 +160,19 @@ class TrampDataFormatter(BaseCLIMetricFormatter):
 
         lines = [
             "",
-            "=" * 80,
+            "=" * FORMATTER_WIDTH,
             f"Tramp Data Analysis | {total_analyzed:,} functions"
             f" | {total_params:,} unique params"
             f" | {groups_found:,} tramp groups",
-            "-" * 80,
+            "-" * FORMATTER_WIDTH,
             "Frequency Distribution:",
             f"  HIGH (20+):     {high_count:>4}  (passed everywhere -- refactoring signal)",
             f"  MODERATE (10+): {moderate_count:>4}  (crosses many boundaries)",
             f"  LOW (5+):       {low_count:>4}  (mild tramp data pattern)",
-            "-" * 80,
+            "-" * FORMATTER_WIDTH,
             "Tip: Consider encapsulating high-frequency param groups"
             " into config/context objects.",
-            "=" * 80,
+            "=" * FORMATTER_WIDTH,
         ]
 
         return "\n".join(lines)

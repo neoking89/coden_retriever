@@ -101,7 +101,7 @@ def handle_sensitive_values_command(
         whitelist=whitelist,
     )
 
-    daemon_result = try_daemon_sensitive_values(params, host=config.daemon.host, port=config.daemon.port)
+    daemon_result = try_daemon_sensitive_values(params, address=config.daemon.address)
     if daemon_result is not None:
         return _process_sensitive_value_result(daemon_result, formatter, args, start_time, "Daemon")
 

@@ -3,27 +3,53 @@
 Main orchestrator for code search, combining multiple ranking signals.
 """
 import logging
-import os
-import sys
 import time
+from abc import ABC, abstractmethod
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..config import Config
+from ..cache.layout import LITE_LAYOUT, STATIC_LAYOUT, CacheLayout
+from ..config import Config, MapMode
+from ..config_loader import get_semantic_model_path
+from ..constants import (
+    MILLISECONDS_PER_SECOND,
+    SEMANTIC_INDEX_PROGRESS_LABEL,
+    SIMPLE_MAP_LINE_TIEBREAK_DIVISOR,
+)
+from ..git.process_metrics import (
+    harvest_change_count,
+    harvest_line_blame_commits,
+    history_is_locally_available,
+    to_repo_relative_posix,
+)
+from ..semantic_config import SemanticConfig
 
 if TYPE_CHECKING:
     import networkx as nx
-    from ..cache import CachedIndices
+    from ..cache import CachedIndices, LiteCachedIndices
+    from ..cache.manager import CacheManager
     from .graph_analyzer import GraphAnalyzer
     from .semantic import SemanticIndex
 
 from ..formatters.directory_tree_formatter import DirectoryTreeFormatter
 from ..formatters.terminal_style import get_terminal_style
-from ..language import LANGUAGE_MAP
-from ..models import CodeEntity, DependencyContext, IndexStats, PathTraceResult, SearchResult
+from ..graph_utils import calculate_dispatcher_score
+from ..models import (
+    CentralityCache,
+    CodeEntity,
+    DependencyContext,
+    IndexStats,
+    PathTraceResult,
+    RankingSignals,
+    SearchResult,
+)
 from ..parsers import RepoParser
+from ..utils.progress import encoding_progress
+from ..utils.source_walker import iter_source_files
 from .bm25 import BM25Index
+from .signals import SIGNALS, Mode, Signal, signals_for_mode, sqrt_sum
 
 logger = logging.getLogger(__name__)
 
@@ -40,89 +66,83 @@ class SearchEngine:
     Optimized for LLM context generation.
     """
 
+    @staticmethod
+    def _init_default_state(engine: "SearchEngine") -> None:
+        """Set every internally-managed attribute to its default.
+
+        Called by every constructor — `__init__` plus the three classmethod
+        builders — so the default-attribute list lives in one place.
+        Constructors override specific fields after this call (e.g. swap in
+        a cached graph, populate entities from a parse pass).
+
+        The four caller-supplied attrs (`root`, `verbose`, `enable_semantic`,
+        `model_path`) stay caller-managed because their values vary per
+        constructor.
+        """
+        engine._graph = _create_digraph()
+        engine._entities = {}
+        engine._bm25 = BM25Index()
+        engine._parser = RepoParser()
+        engine._semantic_index = None
+        engine._name_to_nodes = defaultdict(list)
+        engine._file_scopes = defaultdict(list)
+        engine._file_to_entities = defaultdict(list)
+        engine._stats = IndexStats()
+        engine._indexed = False
+        engine._centrality = CentralityCache()
+        engine._graph_analyzer = None
+        engine._entry_scores = None
+        # Set only by from_lite_cache: pre-harvested change_count to consume
+        # in _simple_map_search instead of re-running git log every call.
+        engine._lite_change_count = None
+
     def __init__(
         self,
         root: str,
         verbose: bool = False,
-        enable_semantic: bool = False,
-        model_path: str | None = None
+        semantic: SemanticConfig = SemanticConfig(),
     ):
         self.root = Path(root).resolve()
         self.verbose = verbose
-        self.enable_semantic = enable_semantic
-        self.model_path = model_path
+        self.enable_semantic = semantic.enabled
+        self.model_path = semantic.model_path
+        self._init_default_state(self)
 
-        self._graph = _create_digraph()
-        self._entities: dict[str, CodeEntity] = {}
-        self._bm25 = BM25Index()
-        self._parser = RepoParser()
-
-        # Lazy load semantic index only if enabled (saves memory/startup time)
-        self._semantic_index: "SemanticIndex | None" = None
+        # Lazy load semantic index only if enabled (saves memory/startup time).
+        # Runs after _init_default_state so it can flip _semantic_index from None.
         if self.enable_semantic:
             self._init_semantic_index()
 
-        self._name_to_nodes: dict[str, list[str]] = defaultdict(list)
-        self._file_scopes: dict[str, list[tuple[int, int, str]]] = defaultdict(list)
-        self._file_to_entities: dict[str, list[str]] = defaultdict(list)
-
-        self._stats = IndexStats()
-        self._indexed = False
-
-        self._pagerank_cache: dict[str, float] | None = None
-        self._betweenness_cache: dict[str, float] | None = None
-        self._graph_analyzer: "GraphAnalyzer | None" = None
-
     @classmethod
     def from_cached_indices(cls, cached: "CachedIndices", verbose: bool = False) -> "SearchEngine":
-        """Create a SearchEngine from cached indices.
-
-        Args:
-            cached: CachedIndices containing all pre-computed data.
-            verbose: Enable verbose logging.
-
-        Returns:
-            SearchEngine instance ready for searching.
-        """
+        """Create a SearchEngine from cached indices."""
         engine = cls.__new__(cls)
         engine.root = cached.source_dir
         engine.verbose = verbose
         engine.enable_semantic = cached.has_semantic
-        engine.model_path = None
+        engine.model_path = cached.model_path
+        cls._init_default_state(engine)
 
-        # Set cached data directly
         engine._graph = cached.graph
         engine._entities = cached.entities
         engine._bm25 = cached.bm25_index
-        engine._parser = RepoParser()
 
-        # Set semantic index if available
-        engine._semantic_index = None
         if cached.has_semantic and cached.embeddings is not None:
             try:
                 from .semantic import SemanticIndex
-                # Create a semantic index with pre-computed embeddings
-                model_path = Config.get_semantic_model_path(None)
-                if model_path:
-                    engine._semantic_index = SemanticIndex(model_path)
-                    # Load the model (needed for query encoding)
-                    engine._semantic_index._load_model()
-                    # Set cached embeddings and node IDs
-                    engine._semantic_index._embeddings = cached.embeddings
-                    engine._semantic_index._node_ids = cached.node_ids
+                # Restore semantic index from cached embeddings.
+                # The ONNX model loads lazily on first query via onnx_encode().
+                engine._semantic_index = SemanticIndex(cached.model_path)
+                engine._semantic_index._embeddings = cached.embeddings
+                engine._semantic_index._node_ids = cached.node_ids
             except ImportError:
                 engine.enable_semantic = False
 
-        # Set lookup structures
-        engine._name_to_nodes = defaultdict(list, cached.name_to_nodes)
-        engine._file_scopes = defaultdict(list, cached.file_scopes)
-        engine._file_to_entities = defaultdict(list, cached.file_to_entities)
+        engine._name_to_nodes = defaultdict(list, cached.lookups.name_to_nodes)
+        engine._file_scopes = defaultdict(list, cached.lookups.file_scopes)
+        engine._file_to_entities = defaultdict(list, cached.lookups.file_to_entities)
+        engine._centrality = cached.centrality
 
-        # Set centrality caches
-        engine._pagerank_cache = cached.pagerank
-        engine._betweenness_cache = cached.betweenness
-
-        # Create graph analyzer with cached data
         from .graph_analyzer import GraphAnalyzer
         engine._graph_analyzer = GraphAnalyzer(
             entities=engine._entities,
@@ -130,20 +150,14 @@ class SearchEngine:
             file_scopes=engine._file_scopes,
             verbose=verbose,
         )
-        # Set the graph and caches on the analyzer
         engine._graph_analyzer._graph = cached.graph
-        engine._graph_analyzer._pagerank_cache = cached.pagerank or {}
-        engine._graph_analyzer._betweenness_cache = cached.betweenness or {}
+        engine._graph_analyzer._centrality = engine._centrality
 
-        # Create stats
-        engine._stats = IndexStats()
         engine._stats.total_entities = len(cached.entities)
         engine._stats.total_edges = cached.graph.number_of_edges()
         engine._stats.total_files = cached.manifest.get("file_count", 0)
         engine._stats.parsed_files = cached.manifest.get("file_count", 0)
-
         engine._indexed = True
-
         return engine
 
     def _init_semantic_index(self) -> None:
@@ -151,34 +165,93 @@ class SearchEngine:
         try:
             from .semantic import SemanticIndex
 
-            # Get model path with priority: CLI flag > env var > package model
-            model_path = Config.get_semantic_model_path(self.model_path)
+            model_path = self.model_path or get_semantic_model_path()
 
-            # Check if model exists
-            if model_path is None or not Path(model_path).exists():
+            if not Path(model_path).exists():
                 logger.warning(
-                    "Semantic model not found. "
+                    "Semantic model not found at %s. "
                     "Falling back to BM25-only search. "
-                    "To use semantic search, ensure the model is available at:\n"
-                    "  1. Custom path: --model-path <path>\n"
-                    "  2. Environment: CODEN_RETRIEVER_MODEL_PATH=<path>\n"
-                    "  3. Package model: models/embeddings/model2vec_embed_distill"
+                    "Configure via `coden config set search.semantic_model_path <path>` "
+                    "or the CODEN_RETRIEVER_MODEL_PATH env var.",
+                    model_path,
                 )
                 self.enable_semantic = False
                 return
 
+            self.model_path = model_path
             self._semantic_index = SemanticIndex(model_path)
             logger.info(f"Semantic search enabled with model at: {model_path}")
 
-        except ImportError as e:
-            logger.warning(
-                f"Cannot enable semantic search: {e}. "
-                "Install model2vec with: pip install model2vec"
-            )
-            self.enable_semantic = False
         except Exception as e:
             logger.warning(f"Failed to initialize semantic search: {e}. Falling back to BM25-only.")
             self.enable_semantic = False
+
+    @classmethod
+    def lite_from_root(cls, root: str | Path, verbose: bool = False) -> "SearchEngine":
+        """Construct a parsing-only engine for `--map-mode simple`.
+
+        Skips call graph, BM25, semantic, and centrality construction — none
+        of which `_simple_map_search` consults. Cuts cold-start time on a
+        ~1k-file repo from minutes (full centrality) to seconds (parse only).
+        """
+        engine = cls.__new__(cls)
+        engine.root = Path(root).resolve()
+        engine.verbose = verbose
+        engine.enable_semantic = False
+        engine.model_path = None
+        cls._init_default_state(engine)
+
+        # Parse files; references are discarded (no graph in lite mode).
+        documents: dict[str, str] = {}
+        discarded_refs: list[tuple[str, int, str, str, str | None]] = []
+        files = list(engine._collect_files())
+        engine._stats.total_files = len(files)
+        for file_path in files:
+            if engine._parse_file(file_path, documents, discarded_refs):
+                engine._stats.parsed_files += 1
+            else:
+                engine._stats.failed_files += 1
+
+        engine._stats.total_entities = len(engine._entities)
+        engine._indexed = True
+        return engine
+
+    @classmethod
+    def from_lite_cache(
+        cls, cached: "LiteCachedIndices", verbose: bool = False
+    ) -> "SearchEngine":
+        """Construct a `--map-mode simple` engine from a warm lite cache.
+
+        Skips parsing entirely — entities come straight from the pickle.
+        Pre-harvested `change_count` is stashed on the engine so
+        `_simple_map_search` reuses it instead of re-running `git log`.
+        Per-file blame stays lazy (and uncached on disk) — the cost is
+        bounded by `SIMPLE_MAP_BLAME_TIMEOUT_SECONDS` per file and only
+        paid for top-ranked files.
+        """
+        engine = cls.__new__(cls)
+        engine.root = Path(cached.source_dir).resolve()
+        engine.verbose = verbose
+        engine.enable_semantic = False
+        engine.model_path = None
+        cls._init_default_state(engine)
+
+        engine._entities = dict(cached.entities)
+        for nid, entity in engine._entities.items():
+            engine._name_to_nodes[entity.name].append(nid)
+            engine._file_scopes[entity.file_path].append(
+                (entity.line_start, entity.line_end, nid)
+            )
+            engine._file_to_entities[entity.file_path].append(nid)
+        for scopes in engine._file_scopes.values():
+            scopes.sort(key=lambda x: x[1] - x[0])
+
+        engine._stats.total_files = cached.manifest.get("file_count", 0)
+        engine._stats.parsed_files = cached.manifest.get("file_count", 0)
+        engine._stats.total_entities = len(engine._entities)
+        engine._lite_change_count = cached.change_count
+        engine._indexed = True
+        return engine
 
     def index(self) -> IndexStats:
         """Index the repository."""
@@ -189,9 +262,9 @@ class SearchEngine:
         self._name_to_nodes = defaultdict(list)
         self._file_scopes = defaultdict(list)
         self._file_to_entities = defaultdict(list)
-        self._pagerank_cache = None
-        self._betweenness_cache = None
+        self._centrality = CentralityCache()
         self._graph_analyzer = None
+        self._entry_scores = None
 
         start_time = time.time()
         logger.info(f"Indexing repository: {self.root}")
@@ -230,20 +303,19 @@ class SearchEngine:
         if self.enable_semantic and self._semantic_index:
             logger.info("Building semantic index...")
             try:
-                self._semantic_index.index(self._entities)
+                with encoding_progress(SEMANTIC_INDEX_PROGRESS_LABEL, len(self._entities)) as advance:
+                    self._semantic_index.index(self._entities, on_batch_done=advance)
             except Exception as e:
                 logger.warning(f"Semantic indexing failed: {e}. Continuing with BM25-only.")
                 self.enable_semantic = False
 
         logger.info("Computing centrality metrics...")
         self._graph_analyzer.compute_centrality()
-        # Keep caches for backwards compatibility
-        self._pagerank_cache = self._graph_analyzer.pagerank_cache
-        self._betweenness_cache = self._graph_analyzer.betweenness_cache
+        self._centrality = self._graph_analyzer.centrality
 
         self._stats.total_entities = len(self._entities)
         self._stats.total_edges = self._graph.number_of_edges()
-        self._stats.index_time_ms = (time.time() - start_time) * 1000
+        self._stats.index_time_ms = (time.time() - start_time) * MILLISECONDS_PER_SECOND
 
         self._indexed = True
 
@@ -254,36 +326,13 @@ class SearchEngine:
 
     def _collect_files(self) -> list[Path]:
         """Collect all source files to index."""
-        files = []
-        # Convert SKIP_DIRS to a set for O(1) lookups
-        skip_dirs = Config.SKIP_DIRS
-        skip_files = Config.SKIP_FILES
-        
-        for root, dirs, filenames in os.walk(self.root):
-            # Prune directories in-place to stop os.walk from entering them
-            # This is the critical performance fix
-            dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.')]
-            
-            for name in filenames:
-                if name in skip_files:
-                    continue
-                
-                path = Path(root) / name
-                if path.suffix.lower() in LANGUAGE_MAP:
-                    try:
-                        if path.stat().st_size > 1_000_000:
-                            continue
-                    except Exception:
-                        continue
-                    
-                    files.append(path)
-        return files
+        return [path for path, _ in iter_source_files(self.root)]
 
     def _parse_file(
         self,
         file_path: Path,
         documents: dict[str, str],
-        all_refs: list
+        all_refs: list[tuple[str, int, str, str, str | None]]
     ) -> bool:
         """Parse a single file.
         
@@ -293,7 +342,7 @@ class SearchEngine:
         """
         try:
             source_code = file_path.read_text(encoding="utf-8", errors="ignore")
-            entities, references = self._parser.parse_file(str(file_path), source_code)
+            entities, references, _ = self._parser.parse_file(str(file_path), source_code)
 
             # Process entities if any were found
             # Note: Empty entity list is valid (e.g., __init__.py with only imports)
@@ -441,7 +490,8 @@ class SearchEngine:
         query: str = "",
         use_architecture: bool = True,
         include_deps: bool = False,
-        limit: int = 100
+        limit: int = 100,
+        map_mode: MapMode = MapMode.STATIC,
     ) -> list[SearchResult]:
         """
         Search the codebase with hybrid ranking.
@@ -454,6 +504,11 @@ class SearchEngine:
             use_architecture: Include betweenness centrality in ranking
             include_deps: Include caller/callee dependency context in results
             limit: Maximum results to return
+            map_mode: When `MapMode.SIMPLE` and the call resolves to map mode,
+                bypass the combined-signal pipeline and rank by per-file git
+                commit count (line-count fallback when not in a git repository).
+                Validated +0.120 mean P@10 vs LOC on the n=5 click-GT corpus.
+                Ignored for non-map calls.
 
         Returns:
             List of SearchResult objects sorted by relevance score.
@@ -480,68 +535,237 @@ class SearchEngine:
         if not self._indexed:
             self.index()
 
-        # Lexical/Semantic scores (mutually exclusive - toggle between them)
-        scores_bm25: dict[str, float] = {}
-        scores_semantic: dict[str, float] = {}
+        # Mode picks which signals run and which weights each contributes.
+        # See search/signals.py for the registry that maps modes -> active signals.
+        mode = self._select_mode(query)
 
-        if query:
-            if self.enable_semantic and self._semantic_index:
-                # Use semantic search (replaces BM25)
-                try:
-                    scores_semantic = self._semantic_index.score_all(query)
-                except Exception as e:
-                    logger.warning(f"Semantic scoring failed: {e}. Falling back to BM25.")
-                    scores_bm25 = self._bm25.score_all(query)
-            else:
-                # Use BM25 keyword search (default)
-                scores_bm25 = self._bm25.score_all(query)
-
-        # PageRank (personalized if we have seeds)
-        scores_pr = self._get_pagerank(scores_bm25)
-
-        # Betweenness centrality
-        scores_bt: dict[str, float] = (self._betweenness_cache or {}) if use_architecture else {}
-
-        # In map mode (no query), aggregate method scores to parent classes
-        # This boosts class-level entities for architectural overview
-        if not query:
-            scores_pr, scores_bt = self._aggregate_scores_to_classes(scores_pr, scores_bt or {})
-
-        # Fuse rankings
-        final_scores = self._fuse_rankings(
-            scores_bm25, scores_pr, scores_bt or {}, scores_semantic,
-            has_query=bool(query)
+        return strategy_for(map_mode).rank(
+            self,
+            query,
+            mode=mode,
+            use_architecture=use_architecture,
+            include_deps=include_deps,
+            limit=limit,
         )
 
-        # Build results
+    def _full_signal_search(
+        self,
+        query: str,
+        *,
+        mode: Mode,
+        use_architecture: bool,
+        include_deps: bool,
+        limit: int,
+    ) -> list[SearchResult]:
+        """Combined-signal RRF ranking — the default ranking path.
+
+        Used by `StaticModeStrategy.rank` and by `SimpleModeStrategy.rank` for
+        non-map calls (where lexical/structural signals still matter).
+        """
+        active = signals_for_mode(mode)
+        by_signal: dict[str, dict[str, float]] = {}
+        for sig in active:
+            # Architectural signal (betweenness) is a user-toggleable channel.
+            if sig.name == "bt" and not use_architecture:
+                continue
+            by_signal[sig.name] = sig.compute(self, query)
+
+        # Query-time semantic failure → fall back to BM25 mode. _semantic returns {}
+        # on exception; without this, BM25 has no query_semantic weight and the fused
+        # ranking would lose its lexical signal entirely.
+        if mode == "query_semantic" and not by_signal.get("semantic"):
+            mode = "query_bm25"
+            active = signals_for_mode(mode)
+            for sig in active:
+                if sig.name == "bt" and not use_architecture:
+                    continue
+                if sig.name not in by_signal:
+                    by_signal[sig.name] = sig.compute(self, query)
+
+        signals = RankingSignals(by_signal=by_signal)
+
+        # In map mode, aggregate method/function scores into their parent classes
+        # so the architectural overview surfaces classes, not individual methods.
+        if mode == "map":
+            signals = signals.aggregate_to_classes(
+                active, self._entities, Config.MAP_AGGREGATION_DAMPENING
+            )
+
+        final_scores = self._fuse_rankings(signals, mode)
+
         results = []
         ranked_nodes = sorted(final_scores.keys(), key=lambda k: final_scores[k], reverse=True)
 
         for i, node_id in enumerate(ranked_nodes[:limit]):
             entity = self._entities[node_id]
-
-            dep_context = None
-            if include_deps:
-                dep_context = self.get_dependency_context(node_id)
-
-            components_dict = {
-                "bm25": scores_bm25.get(node_id, 0.0),
-                "pr": scores_pr.get(node_id, 0.0),
-                "bt": scores_bt.get(node_id, 0.0),
-            }
-
-            # Add semantic score if enabled
-            if scores_semantic:
-                components_dict["semantic"] = scores_semantic.get(node_id, 0.0)
-
+            dep_context = self.get_dependency_context(node_id) if include_deps else None
             results.append(SearchResult(
                 rank=i + 1,
                 entity=entity,
                 score=final_scores[node_id],
-                components=components_dict,
+                components=signals.components_for(node_id),
                 dependency_context=dep_context,
             ))
 
+        return results
+
+    def _simple_map_search(
+        self, include_deps: bool, limit: int
+    ) -> list[SearchResult]:
+        """Map-mode ranker for `--simple`: per-object git commits + line-count tiebreak.
+
+        See `research/improving-code-map/process_metrics/report.md` for the
+        empirical justification (+0.120 mean P@10 vs LOC, n=5 click-GT corpus).
+
+        Falls back to pure line-count when the project isn't a git repository
+        (or git history is unavailable locally, or a bounded blame probe fails).
+        Output is structurally identical to regular map mode — only the ranking
+        signal differs.
+        """
+        entity_lines: dict[str, float] = {
+            nid: float(entity.line_count) for nid, entity in self._entities.items()
+        }
+
+        root_str = str(self.root)
+        use_git = history_is_locally_available(root_str)
+        if self._lite_change_count is not None:
+            file_counts = self._lite_change_count
+        else:
+            file_counts = harvest_change_count(root_str) if use_git else {}
+        if not use_git:
+            logger.info(
+                "--simple: git history is incomplete locally (shallow/promisor clone); "
+                "falling back to line-count ranking"
+            )
+        elif not file_counts:
+            logger.info(
+                "--simple: no git history available, falling back to line-count ranking"
+            )
+            use_git = False
+
+        entity_scores: dict[str, float] = {}
+        entity_commits: dict[str, float] = {}
+
+        if use_git:
+            entities_by_file: dict[str, list[tuple[str, CodeEntity]]] = defaultdict(list)
+            for nid, entity in self._entities.items():
+                rel = to_repo_relative_posix(entity.file_path, root_str)
+                if rel is not None:
+                    entities_by_file[rel].append((nid, entity))
+
+            ranked_files = sorted(
+                entities_by_file,
+                key=lambda rel: file_counts.get(rel, 0),
+                reverse=True,
+            )
+
+            # Process ranked_files in batches of 8 with a thread pool. The
+            # kth-score early-termination gate is checked BEFORE each batch
+            # (ranked_files is sorted by file_counts desc, so files[idx] holds
+            # the max remaining upper_bound — if even that is below kth, no
+            # later file can enter the top-N). Within a batch, blame I/O runs
+            # in parallel; results are scored in submission order, equivalent
+            # to the sequential semantics modulo up-to-7 extra files per batch.
+            BATCH_SIZE = 8
+            idx = 0
+            blame_failed = False
+            with ThreadPoolExecutor(max_workers=BATCH_SIZE) as ex:
+                while idx < len(ranked_files) and not blame_failed:
+                    if len(entity_scores) >= limit:
+                        kth_score = sorted(entity_scores.values(), reverse=True)[limit - 1]
+                        if file_counts.get(ranked_files[idx], 0) < int(kth_score):
+                            break
+
+                    batch = ranked_files[idx:idx + BATCH_SIZE]
+                    idx += BATCH_SIZE
+
+                    zero_files = [rel for rel in batch if file_counts.get(rel, 0) <= 0]
+                    blame_files = [rel for rel in batch if file_counts.get(rel, 0) > 0]
+
+                    for rel in zero_files:
+                        for nid, _ in entities_by_file[rel]:
+                            entity_commits.setdefault(nid, 0.0)
+                            entity_scores.setdefault(
+                                nid,
+                                entity_lines[nid] / SIMPLE_MAP_LINE_TIEBREAK_DIVISOR,
+                            )
+
+                    if blame_files:
+                        blame_results = list(
+                            ex.map(lambda rel: (rel, harvest_line_blame_commits(root_str, rel)),
+                                   blame_files)
+                        )
+                        for rel, line_commits in blame_results:
+                            if line_commits is None:
+                                logger.info(
+                                    "--simple: git blame failed or timed out for %s; falling back to "
+                                    "line-count ranking",
+                                    rel,
+                                )
+                                blame_failed = True
+                                break
+
+                            for nid, entity in entities_by_file[rel]:
+                                commits = len({
+                                    line_commits[line_no]
+                                    for line_no in range(entity.line_start, entity.line_end + 1)
+                                    if line_no in line_commits
+                                })
+                                entity_commits[nid] = float(commits)
+                                # Integer commit count dominates; line_count breaks ties within
+                                # one commit bucket. The divisor (1e6) keeps even huge entities
+                                # below 1.0 so the tiebreak can never overpower one extra commit.
+                                entity_scores[nid] = (
+                                    commits + entity.line_count / SIMPLE_MAP_LINE_TIEBREAK_DIVISOR
+                                )
+
+            if blame_failed:
+                use_git = False
+                entity_scores.clear()
+                entity_commits.clear()
+
+            if use_git:
+                for nid, lines in entity_lines.items():
+                    entity_commits.setdefault(nid, 0.0)
+                    entity_scores.setdefault(
+                        nid,
+                        lines / SIMPLE_MAP_LINE_TIEBREAK_DIVISOR,
+                    )
+
+        if not use_git:
+            entity_scores = dict(entity_lines)
+
+        # Synthetic single-signal so map's class aggregation runs unchanged.
+        # `compute` is unused here (we passed scores in directly via by_signal).
+        simple_signal = Signal(
+            name="simple",
+            compute=lambda e, q: {},
+            weights={"map": 1.0},
+            aggregate=sqrt_sum,
+        )
+        signals = RankingSignals(by_signal={
+            "simple": dict(entity_scores),
+            "simple_commits": entity_commits,
+            "simple_lines": entity_lines,
+        })
+        signals = signals.aggregate_to_classes(
+            [simple_signal], self._entities, Config.MAP_AGGREGATION_DAMPENING
+        )
+
+        final_scores = signals.by_signal["simple"]
+        ranked = sorted(final_scores.keys(), key=lambda k: final_scores[k], reverse=True)
+
+        results: list[SearchResult] = []
+        for i, node_id in enumerate(ranked[:limit]):
+            entity = self._entities[node_id]
+            dep_context = self.get_dependency_context(node_id) if include_deps else None
+            results.append(SearchResult(
+                rank=i + 1,
+                entity=entity,
+                score=final_scores[node_id],
+                components=signals.components_for(node_id),
+                dependency_context=dep_context,
+            ))
         return results
 
     def _get_pagerank(
@@ -551,34 +775,55 @@ class SearchEngine:
         """Get PageRank scores, personalized if possible."""
         if self._graph_analyzer is not None:
             return self._graph_analyzer.get_pagerank(scores_bm25)
-        return self._pagerank_cache or {}
+        return self._centrality.pagerank or {}
 
-    def _aggregate_scores_to_classes(
-        self,
-        scores_pr: dict[str, float],
-        scores_bt: dict[str, float]
-    ) -> tuple[dict[str, float], dict[str, float]]:
+    def _get_dispatcher_scores(self) -> dict[str, float]:
+        """Per-function dispatcher score: fan_out * log1p(CC).
+
+        Drops fan_in deliberately — PageRank and Betweenness already reward fan_in,
+        so a fan_in-aware Disp would be redundant and would let leaf utilities
+        (sdslen, zfree) outscore real dispatchers (processCommand, beginWork).
+        Skips entities without cyclomatic_complexity (classes, modules) — they pick
+        up dispatcher signal via class aggregation."""
+        scores: dict[str, float] = {}
+        for node_id in self._graph.nodes():
+            entity = self._entities.get(node_id)
+            if entity is None or entity.cyclomatic_complexity is None:
+                continue
+            fan_out = self._graph.out_degree(node_id)
+            scores[node_id] = calculate_dispatcher_score(fan_out, entity.cyclomatic_complexity)
+        return scores
+
+    def _get_entry_scores(self) -> dict[str, float]:
+        """Reverse-PageRank: entry-point roots (no callers, broad downstream reach)
+        become sinks in the reversed graph and accumulate score there. Surfaces
+        CLI/server entry points (e.g. main, serverCron) that PR/BT/Disp systematically
+        bury because they have fan_in≈0 and are not on shortest paths.
+        Lazy, cached per SearchEngine instance."""
+        if self._entry_scores is not None:
+            return self._entry_scores
+        import networkx as nx
+        try:
+            self._entry_scores = nx.pagerank(self._graph.reverse(copy=False), weight="weight")
+        except Exception as e:
+            logger.warning(f"Entry-signal (reverse-PageRank) failed: {e}.")
+            self._entry_scores = {}
+        return self._entry_scores
+
+    def _select_mode(self, query: str) -> Mode:
+        """Pick which signal set runs for this call.
+
+        - empty query → "map" (architectural overview using static signals)
+        - query + semantic available → "query_semantic" (let semantic dominate)
+        - query, no semantic → "query_bm25" (lexical-leaning fallback)
         """
-        Aggregate method/function scores to their parent classes.
+        if not query:
+            return "map"
+        if self.enable_semantic and self._semantic_index:
+            return "query_semantic"
+        return "query_bm25"
 
-        For PageRank: Use sqrt-normalized sum to prevent runaway scores
-        For Betweenness: Use max + sum to boost classes with important methods
-
-        Returns:
-            Tuple of (aggregated_pr, aggregated_bt) dictionaries
-        """
-        if self._graph_analyzer is not None:
-            return self._graph_analyzer.aggregate_scores_to_classes(scores_pr, scores_bt)
-        return scores_pr, scores_bt
-
-    def _fuse_rankings(
-        self,
-        scores_bm25: dict[str, float],
-        scores_pr: dict[str, float],
-        scores_bt: dict[str, float],
-        scores_semantic: dict[str, float],
-        has_query: bool
-    ) -> dict[str, float]:
+    def _fuse_rankings(self, signals: RankingSignals, mode: Mode) -> dict[str, float]:
         """
         Fuse multiple ranking signals using Reciprocal Rank Fusion (RRF).
 
@@ -610,11 +855,11 @@ class SearchEngine:
         # while still giving credit to lower-ranked but consistently appearing items.
         k = Config.RRF_K
 
-        # Use different method penalties based on mode:
-        # - Map mode: use MAP_PENALTY_METHOD (very low, methods shown equally)
-        # - Query mode: use QUERY_PENALTY_METHOD (low, slight class preference)
-        # - No query + not map: use PENALTY_METHOD (high, strong class preference)
-        method_penalty = Config.MAP_PENALTY_METHOD if not has_query else Config.QUERY_PENALTY_METHOD
+        # Method penalty differs by mode: map mode shows methods almost equally,
+        # query mode lightly favors classes.
+        method_penalty = (
+            Config.MAP_PENALTY_METHOD if mode == "map" else Config.QUERY_PENALTY_METHOD
+        )
 
         def add_rrf(scores: dict[str, float], weight: float) -> None:
             """
@@ -671,31 +916,20 @@ class SearchEngine:
                 # Lower rank = higher contribution (rank 0 contributes most)
                 final_scores[node_id] += weight * (1.0 / (k + effective_rank))
 
-        # Query mode: combine all available signals with their configured weights
-        if has_query:
-            if scores_semantic:
-                # Semantic mode: use reduced structural weights to let semantic dominate
-                add_rrf(scores_pr, Config.WEIGHT_PAGERANK_SEMANTIC)
-                add_rrf(scores_bt, Config.WEIGHT_BETWEENNESS_SEMANTIC)
-                add_rrf(scores_semantic, Config.WEIGHT_SEMANTIC)
+        # Iterate the registry: each Signal carries its per-mode weight, so the
+        # mode dispatch reduces to "skip signals that don't apply to this mode".
+        for sig in signals_for_mode(mode):
+            add_rrf(signals.by_signal.get(sig.name, {}), sig.weights[mode])
 
-                # Penalize entities with no semantic relevance (below threshold)
-                # This prevents high-PageRank entities from dominating when they're
-                # semantically irrelevant to the query.
-                penalty = Config.SEMANTIC_IRRELEVANT_PENALTY
-                for node_id in final_scores:
-                    if node_id not in scores_semantic:
-                        final_scores[node_id] *= penalty
-            else:
-                # BM25 mode: use full structural weights for keyword search
-                add_rrf(scores_bm25, Config.WEIGHT_BM25)
-                add_rrf(scores_pr, Config.WEIGHT_PAGERANK_BM25)
-                add_rrf(scores_bt, Config.WEIGHT_BETWEENNESS_BM25)
-        else:
-            # Map mode (no query): only use structural signals
-            # BM25/semantic require a query, so we rely on graph-based metrics
-            add_rrf(scores_pr, Config.MAP_WEIGHT_PAGERANK)
-            add_rrf(scores_bt, Config.MAP_WEIGHT_BETWEENNESS)
+        if mode == "query_semantic":
+            # Penalize entities with no semantic relevance (below threshold).
+            # This prevents high-PageRank entities from dominating when they're
+            # semantically irrelevant to the query.
+            sem = signals.by_signal.get("semantic", {})
+            penalty = Config.SEMANTIC_IRRELEVANT_PENALTY
+            for node_id in list(final_scores):
+                if node_id not in sem:
+                    final_scores[node_id] *= penalty
 
         return dict(final_scores)
 
@@ -791,98 +1025,51 @@ class SearchEngine:
         )
         return formatter.format_tree(results)
 
-    def print_stats(self, results: list[SearchResult], limit: int = 20) -> None:
-        """Print ranking statistics to stderr."""
-        print(file=sys.stderr)
-
-        # Check if semantic scores are present
-        has_semantic = results and "semantic" in results[0].components
-
-        if has_semantic:
-            header = f"{'Rank':<4} | {'Score':<8} | {'BM25':<6} | {'Sem':<6} | {'PR':<8} | {'BT':<8} | {'Lines':<5} | {'Entity'}"
-        else:
-            header = f"{'Rank':<4} | {'Score':<8} | {'BM25':<6} | {'PR':<8} | {'BT':<8} | {'Lines':<5} | {'Entity'}"
-
-        print(header, file=sys.stderr)
-        print("-" * 120 if has_semantic else "-" * 100, file=sys.stderr)
-
-        for r in results[:limit]:
-            name = r.entity.qualified_name
-            if len(name) > 30:
-                name = "..." + name[-27:]
-
-            flags = []
-            if r.entity.is_private:
-                flags.append("priv")
-            if r.entity.is_tiny:
-                flags.append("tiny")
-            if r.entity.is_utility:
-                flags.append("util")
-            if r.entity.is_test:
-                flags.append("test")
-            flag_str = f" [{','.join(flags)}]" if flags else ""
-
-            if has_semantic:
-                print(
-                    f"{r.rank:<4} | {r.score:<8.4f} | {r.components.get('bm25', 0):<6.2f} | "
-                    f"{r.components.get('semantic', 0):<6.3f} | {r.components.get('pr', 0):<8.5f} | "
-                    f"{r.components.get('bt', 0):<8.5f} | {r.entity.line_count:<5} | {name}{flag_str}",
-                    file=sys.stderr
-                )
-            else:
-                print(
-                    f"{r.rank:<4} | {r.score:<8.4f} | {r.components.get('bm25', 0):<6.2f} | "
-                    f"{r.components.get('pr', 0):<8.5f} | {r.components.get('bt', 0):<8.5f} | "
-                    f"{r.entity.line_count:<5} | {name}{flag_str}",
-                    file=sys.stderr
-                )
-
-        print("-" * 120 if has_semantic else "-" * 100, file=sys.stderr)
-        print(file=sys.stderr)
-
     def format_stats(self, results: list[SearchResult], limit: int = 20) -> str:
         """Format ranking statistics with Rich colors and clickable links."""
         if not results:
             return ""
 
-        # Get Rich styling
         style = get_terminal_style()
         max_score = max(r.score for r in results)
 
-        lines = []
-        lines.append("")
+        active_names = set(results[0].components)
+        is_simple = "simple" in active_names
 
-        # Check if semantic scores are present
-        has_semantic = results and "semantic" in results[0].components
-
-        if has_semantic:
-            header = f"{'Rank':<4} | {'Score':<8} | {'BM25':<6} | {'Sem':<6} | {'PR':<8} | {'BT':<8} | {'Lines':<5} | {'Entity'}"
+        if is_simple:
+            has_commits = any(r.components.get("simple_commits", 0.0) > 0.0 for r in results)
+            if has_commits:
+                header = f"{'Rank':<4} | {'Score':<8} | {'Commits':<7} | {'Lines':<5} | Entity"
+            else:
+                header = f"{'Rank':<4} | {'Score':<8} | {'Lines':<5} | Entity"
+            sep_width = 60
         else:
-            header = f"{'Rank':<4} | {'Score':<8} | {'BM25':<6} | {'PR':<8} | {'BT':<8} | {'Lines':<5} | {'Entity'}"
+            columns = [s for s in SIGNALS if s.column and s.name in active_names]
+            widths = [len(s.column[1].format(0.0)) for s in columns]
+            header_cells = [f"{s.column[0]:<{w}}" for s, w in zip(columns, widths)]
+            header = (
+                f"{'Rank':<4} | {'Score':<8} | "
+                + " | ".join(header_cells)
+                + f" | {'Lines':<5} | Entity"
+            )
+            sep_width = 60 + sum(widths) + 3 * len(columns)
 
-        lines.append(header)
-        lines.append("-" * 120 if has_semantic else "-" * 100)
+        lines = ["", header, "-" * sep_width]
 
         for r in results[:limit]:
             name = r.entity.qualified_name
             if len(name) > 30:
                 name = "..." + name[-27:]
 
-            flags = []
-            if r.entity.is_private:
-                flags.append("priv")
-            if r.entity.is_tiny:
-                flags.append("tiny")
-            if r.entity.is_utility:
-                flags.append("util")
-            if r.entity.is_test:
-                flags.append("test")
+            flags = [n for n, on in [
+                ("priv", r.entity.is_private),
+                ("tiny", r.entity.is_tiny),
+                ("util", r.entity.is_utility),
+                ("test", r.entity.is_test),
+            ] if on]
             flag_str = f" [{','.join(flags)}]" if flags else ""
 
-            # Color the score using Rich
-            colored_score = style.format_rank(r.score, max_score)
-
-            # Make entity name clickable and colored using Rich
+            colored_score = style.format_rank(r.score, max_score, text=f"{r.score:<8.4f}")
             colored_entity = style.format_stats_entity(
                 name=name,
                 file_path=r.entity.file_path,
@@ -892,23 +1079,147 @@ class SearchEngine:
                 flags=flag_str,
             )
 
-            if has_semantic:
-                lines.append(
-                    f"{r.rank:<4} | {colored_score:<8} | {r.components.get('bm25', 0):<6.2f} | "
-                    f"{r.components.get('semantic', 0):<6.3f} | {r.components.get('pr', 0):<8.5f} | "
-                    f"{r.components.get('bt', 0):<8.5f} | {r.entity.line_count:<5} | {colored_entity}"
-                )
+            if is_simple:
+                if has_commits:
+                    commits = int(r.components.get("simple_commits", 0.0))
+                    middle = f"{commits:<7} | {r.entity.line_count:<5}"
+                else:
+                    middle = f"{r.entity.line_count:<5}"
+                lines.append(f"{r.rank:<4} | {colored_score} | {middle} | {colored_entity}")
             else:
+                cells = [s.column[1].format(r.components.get(s.name, 0.0)) for s in columns]
                 lines.append(
-                    f"{r.rank:<4} | {colored_score:<8} | {r.components.get('bm25', 0):<6.2f} | "
-                    f"{r.components.get('pr', 0):<8.5f} | {r.components.get('bt', 0):<8.5f} | "
-                    f"{r.entity.line_count:<5} | {colored_entity}"
+                    f"{r.rank:<4} | {colored_score} | "
+                    + " | ".join(cells)
+                    + f" | {r.entity.line_count:<5} | {colored_entity}"
                 )
 
-        lines.append("-" * 120 if has_semantic else "-" * 100)
+        lines.append("-" * sep_width)
         lines.append("")
         return "\n".join(lines)
 
     def get_stats(self) -> IndexStats:
         """Get indexing statistics."""
         return self._stats
+
+
+class ModeStrategy(ABC):
+    """Per-MapMode dispatch for engine construction, ranking, and daemon bypass.
+
+    Each MapMode value maps to one ModeStrategy instance in `_MODE_DISPATCH`,
+    so adding a mode is one enum member plus one strategy class registered in
+    one place — call sites never branch on MapMode directly.
+    """
+
+    layout: CacheLayout
+    semantic_override: SemanticConfig | None  # None = honor caller's semantic
+    bypasses_daemon: bool
+
+    @abstractmethod
+    def build_engine(self, cache: "CacheManager", verbose: bool) -> SearchEngine:
+        """Load the cache for this mode's layout and construct a SearchEngine."""
+
+    @abstractmethod
+    def rank(
+        self,
+        engine: SearchEngine,
+        query: str,
+        *,
+        mode: Mode,
+        use_architecture: bool,
+        include_deps: bool,
+        limit: int,
+    ) -> list[SearchResult]:
+        """Produce ranked SearchResults for this mode's ranking strategy."""
+
+
+class StaticModeStrategy(ModeStrategy):
+    """Default `--map-mode static` strategy: full graph + combined-signal RRF."""
+
+    layout = STATIC_LAYOUT
+    semantic_override = None
+    bypasses_daemon = False
+
+    def build_engine(self, cache: "CacheManager", verbose: bool) -> SearchEngine:
+        cached = cache.load_or_rebuild()
+        return SearchEngine.from_cached_indices(cached, verbose=verbose)
+
+    def rank(
+        self,
+        engine: SearchEngine,
+        query: str,
+        *,
+        mode: Mode,
+        use_architecture: bool,
+        include_deps: bool,
+        limit: int,
+    ) -> list[SearchResult]:
+        return engine._full_signal_search(
+            query,
+            mode=mode,
+            use_architecture=use_architecture,
+            include_deps=include_deps,
+            limit=limit,
+        )
+
+
+class SimpleModeStrategy(ModeStrategy):
+    """`--map-mode simple` strategy: lite cache + per-object git ranking.
+
+    Validated +0.120 mean P@10 vs LOC on the n=5 click-GT corpus; see
+    `_simple_map_search` for the ranking signal. The CLI also runs this mode
+    daemon-free (`bypasses_daemon = True`) because the lite cache plus a
+    bounded git-blame probe is faster than a daemon cold-start.
+    """
+
+    layout = LITE_LAYOUT
+    semantic_override = SemanticConfig(enabled=False)
+    bypasses_daemon = True
+
+    def build_engine(self, cache: "CacheManager", verbose: bool) -> SearchEngine:
+        cached = cache.load_or_rebuild_lite()
+        return SearchEngine.from_lite_cache(cached, verbose=verbose)
+
+    def rank(
+        self,
+        engine: SearchEngine,
+        query: str,
+        *,
+        mode: Mode,
+        use_architecture: bool,
+        include_deps: bool,
+        limit: int,
+    ) -> list[SearchResult]:
+        # SIMPLE only short-circuits in map mode; for a real query we still
+        # need the lexical/structural signals (matches `--map` semantics).
+        if mode == "map":
+            return engine._simple_map_search(include_deps, limit)
+        return engine._full_signal_search(
+            query,
+            mode=mode,
+            use_architecture=use_architecture,
+            include_deps=include_deps,
+            limit=limit,
+        )
+
+
+_MODE_DISPATCH: dict[MapMode, ModeStrategy] = {
+    MapMode.STATIC: StaticModeStrategy(),
+    MapMode.SIMPLE: SimpleModeStrategy(),
+}
+
+
+def strategy_for(mode: MapMode) -> ModeStrategy:
+    """Return the ModeStrategy registered for `mode`.
+
+    Raises ValueError naming the missing mode and the registry, so adding a
+    new MapMode without an _MODE_DISPATCH entry fails loudly instead of
+    surfacing a bare KeyError from deep inside the pipeline.
+    """
+    try:
+        return _MODE_DISPATCH[mode]
+    except KeyError as exc:
+        raise ValueError(
+            f"No ModeStrategy registered for MapMode {mode!r}. "
+            f"Add an entry to _MODE_DISPATCH in {__name__}."
+        ) from exc

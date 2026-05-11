@@ -43,13 +43,15 @@ def handle_flag_command(args: argparse.Namespace, root_path: Path, config) -> in
         dead_code_threshold=args.dead_code_threshold,
         min_occurrences=args.min_occurrences,
         sensitive_threshold=args.sensitive_threshold,
+        min_constant_occurrences=args.min_constant_occurrences,
+        min_constant_files=args.min_constant_files,
     )
     print(header)
     print()
 
     params = build_flag_params(args, root_path)
 
-    daemon_result = try_daemon_flag(params, host=config.daemon.host, port=config.daemon.port)
+    daemon_result = try_daemon_flag(params, address=config.daemon.address)
     if daemon_result is not None:
         return process_flag_result(daemon_result, args, formatter, start_time, "Daemon mode")
 
@@ -64,9 +66,14 @@ def handle_flag_command(args: argparse.Namespace, root_path: Path, config) -> in
         result = flag_code(
             entities=indices.entities,
             graph=indices.graph,
-            pagerank=indices.pagerank,
+            pagerank=indices.centrality.pagerank,
             params=params,
+            embedding_cache=indices.embedding_cache,
         )
+
+        if indices.embedding_cache is not None:
+            indices.embedding_cache.save(cache.cache_dir)
+
         return process_flag_result(result, args, formatter, start_time, "Direct mode")
 
     except Exception as e:
@@ -94,7 +101,7 @@ def handle_flag_clear_command(args: argparse.Namespace, root_path: Path, config)
         verbose=args.verbose,
     )
 
-    daemon_result = try_daemon_flag_clear(params, host=config.daemon.host, port=config.daemon.port)
+    daemon_result = try_daemon_flag_clear(params, address=config.daemon.address)
 
     if daemon_result is not None:
         if "error" in daemon_result:

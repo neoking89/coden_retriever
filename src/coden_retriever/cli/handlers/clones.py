@@ -7,11 +7,17 @@ import traceback
 from pathlib import Path
 
 from ...cli_metrics_contract import apply_defensive_limit, print_metric_output
+from ...constants import (
+    DEFAULT_CLONE_SEMANTIC_WEIGHT,
+    DEFAULT_CLONE_SYNTACTIC_WEIGHT,
+    DEFAULT_SYNTACTIC_FUNC_THRESHOLD,
+    DEFAULT_SYNTACTIC_LINE_THRESHOLD,
+)
 from ...daemon.client import try_daemon_clones
 from ...daemon.protocol import CloneDetectionParams
 from ...formatters import CloneFormatter
-from ...utils.optional_deps import MissingDependencyError, require_feature
-from ..utils import get_asyncio, get_clone_mode, normalize_limit
+from ...utils.progress import encoding_progress
+from ..utils import get_clone_mode, normalize_limit
 
 logger = logging.getLogger(__name__)
 
@@ -27,17 +33,10 @@ def handle_clones_command(args: argparse.Namespace, root_path: Path, config) -> 
 
     mode = get_clone_mode(args)
 
-    if mode in ("semantic", "combined"):
-        try:
-            require_feature("semantic")
-        except MissingDependencyError as e:
-            print(str(e), file=sys.stderr)
-            return 1
-
-    line_threshold = getattr(args, "line_threshold", 0.70)
-    func_threshold = getattr(args, "func_threshold", 0.50)
-    semantic_weight = getattr(args, "semantic_weight", 0.65)
-    syntactic_weight = getattr(args, "syntactic_weight", 0.35)
+    line_threshold = getattr(args, "line_threshold", DEFAULT_SYNTACTIC_LINE_THRESHOLD)
+    func_threshold = getattr(args, "func_threshold", DEFAULT_SYNTACTIC_FUNC_THRESHOLD)
+    semantic_weight = getattr(args, "semantic_weight", DEFAULT_CLONE_SEMANTIC_WEIGHT)
+    syntactic_weight = getattr(args, "syntactic_weight", DEFAULT_CLONE_SYNTACTIC_WEIGHT)
 
     from ...formatters.clone_formatter import format_clone_parameters_header
     header = format_clone_parameters_header(
@@ -67,8 +66,9 @@ def handle_clones_command(args: argparse.Namespace, root_path: Path, config) -> 
     )
 
     daemon_result = try_daemon_clones(
-        params, host=config.daemon.host, port=config.daemon.port,
+        params, address=config.daemon.address,
         timeout=max(config.daemon.daemon_timeout, _MIN_CLONE_TIMEOUT),
+        auto_start=False,
     )
 
     if daemon_result is not None:
@@ -91,21 +91,10 @@ def handle_clones_command(args: argparse.Namespace, root_path: Path, config) -> 
 
     logger.warning("Daemon not available, falling back to direct analysis...")
     try:
-        from ...mcp.clone_detection import detect_clones as mcp_detect_clones
-
-        result = get_asyncio().run(mcp_detect_clones(
-            root_directory=str(root_path),
-            mode=mode,
-            similarity_threshold=args.clone_threshold,
-            line_threshold=line_threshold,
-            func_threshold=func_threshold,
-            limit=args.limit,
-            exclude_tests=True,
-            min_lines=args.min_lines,
-            token_limit=args.tokens,
-            semantic_weight=semantic_weight,
-            syntactic_weight=syntactic_weight,
-        ))
+        result = _run_direct_clone_detection(
+            root_path, mode, args, line_threshold, func_threshold,
+            semantic_weight, syntactic_weight,
+        )
 
         if "error" in result:
             logger.error(f"Clone detection error: {result['error']}")
@@ -129,3 +118,77 @@ def handle_clones_command(args: argparse.Namespace, root_path: Path, config) -> 
         if args.verbose:
             traceback.print_exc()
         return 1
+
+
+def _run_direct_clone_detection(
+    root_path: Path,
+    mode: str,
+    args: argparse.Namespace,
+    line_threshold: float,
+    func_threshold: float,
+    semantic_weight: float,
+    syntactic_weight: float,
+) -> dict:
+    """Run clone detection directly with progress bar for encoding."""
+    from ...cache import CacheManager
+    from ...clone import detect_clones_combined, detect_clones_semantic, detect_clones_syntactic
+
+    cache = CacheManager(root_path)
+    indices = cache.load_or_rebuild()
+
+    # Count functions for progress bar (texts + names = 2x)
+    func_count = sum(
+        1 for e in indices.entities.values()
+        if e.entity_type in ("function", "method")
+        and e.source_code
+        and (e.line_end - e.line_start + 1) >= args.min_lines
+    )
+    # Each function encodes source_code + name = 2 encoding batches
+    _ENCODE_MULTIPLIER = 2
+    total_encode = func_count * _ENCODE_MULTIPLIER
+
+    if mode == "syntactic":
+        result = detect_clones_syntactic(
+            entities=indices.entities,
+            line_threshold=line_threshold,
+            func_threshold=func_threshold,
+            limit=args.limit,
+            exclude_tests=True,
+            min_lines=args.min_lines,
+            token_limit=args.tokens,
+        )
+    elif mode == "semantic":
+        with encoding_progress("Encoding functions", total_encode) as advance:
+            result = detect_clones_semantic(
+                entities=indices.entities,
+                model_path="",
+                threshold=args.clone_threshold,
+                limit=args.limit,
+                exclude_tests=True,
+                min_lines=args.min_lines,
+                token_limit=args.tokens,
+                embedding_cache=indices.embedding_cache,
+                on_encode_progress=advance,
+            )
+    else:
+        with encoding_progress("Encoding functions", total_encode) as advance:
+            result = detect_clones_combined(
+                entities=indices.entities,
+                model_path="",
+                semantic_threshold=args.clone_threshold,
+                line_threshold=line_threshold,
+                func_threshold=func_threshold,
+                limit=args.limit,
+                exclude_tests=True,
+                min_lines=args.min_lines,
+                token_limit=args.tokens,
+                semantic_weight=semantic_weight,
+                syntactic_weight=syntactic_weight,
+                embedding_cache=indices.embedding_cache,
+                on_encode_progress=advance,
+            )
+
+    if indices.embedding_cache is not None:
+        indices.embedding_cache.save(cache.cache_dir)
+
+    return result

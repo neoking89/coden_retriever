@@ -7,11 +7,15 @@ Provides consistent formatting for dead code detection results with:
 - Summary statistics
 """
 
-import json
 from typing import Any
 
-from ..constants import DEAD_CODE_CONFIDENCE_HIGH, DEAD_CODE_CONFIDENCE_MEDIUM
-from .cli_metrics import BaseCLIMetricFormatter, FALSE_POSITIVE_WARNING, SeverityTier
+from ..constants import DEAD_CODE_CONFIDENCE_HIGH, DEAD_CODE_CONFIDENCE_MEDIUM, FORMATTER_WIDTH
+from .cli_metrics import (
+    BaseCLIMetricFormatter,
+    SeverityTier,
+    extract_filename,
+    format_parameter_header,
+)
 
 
 # Table width set to 110 chars to fit standard terminal width with margins
@@ -20,32 +24,20 @@ _TABLE_WIDTH = 110
 _NAME_COL_WIDTH = 35
 
 
-def _extract_filename(file_path: str) -> str:
-    """Extract filename from a path, handling both Unix and Windows separators."""
-    return file_path.split("/")[-1].split("\\")[-1]
-
-
 def format_dead_code_parameters_header(
     confidence_threshold: float,
     exclude_tests: bool,
     limit: int | None,
 ) -> str:
     """Format parameter summary header for dead code detection."""
-    lines = []
-    lines.append("=" * 80)
-    lines.append("DEAD CODE DETECTION PARAMETERS")
-    lines.append("=" * 80)
-    lines.append(f"Confidence Threshold: >= {confidence_threshold * 100:.0f}%")
-    lines.append(f"Exclude Tests: {exclude_tests}")
-
-    if limit is None:
-        lines.append("[!] Result Limit: ALL (may be slow for large repos)")
-    else:
-        lines.append(f"[!] Result Limit: TOP {limit} -- more results may exist (use -n -1 for all)")
-
-    lines.append(FALSE_POSITIVE_WARNING)
-    lines.append("=" * 80)
-    return "\n".join(lines)
+    return format_parameter_header(
+        "DEAD CODE DETECTION PARAMETERS",
+        [
+            f"Confidence Threshold: >= {confidence_threshold * 100:.0f}%",
+            f"Exclude Tests: {exclude_tests}",
+        ],
+        limit,
+    )
 
 
 class DeadCodeFormatter(BaseCLIMetricFormatter):
@@ -67,35 +59,14 @@ class DeadCodeFormatter(BaseCLIMetricFormatter):
             return SeverityTier.MODERATE
         return SeverityTier.LOW
 
-    def format_items(
-        self,
-        items: list[dict[str, Any]],
-        output_format: str,
-        reverse: bool,
-    ) -> str:
-        """Format dead code results for CLI output with clickable hyperlinks."""
-        if output_format == "json":
-            return json.dumps(items, indent=2)
+    def _empty_message(self) -> str:
+        return "No dead code detected at the specified confidence threshold."
 
-        if not items:
-            return "No dead code detected at the specified confidence threshold."
+    def _table_width(self) -> int:
+        return _TABLE_WIDTH
 
-        display_items = items if reverse else list(reversed(items))
-
-        lines = []
-        header = self._build_header()
-        lines.append(header)
-        lines.append("-" * _TABLE_WIDTH)
-
-        for i, item in enumerate(display_items, 1):
-            rank = i if reverse else len(display_items) - i + 1
-            row = self._format_row(item, rank)
-            lines.append(row)
-
-        lines.append("-" * _TABLE_WIDTH)
-        lines.append(f"Total: {len(items)} potentially dead functions")
-
-        return "\n".join(lines)
+    def _total_label(self, count: int) -> str:
+        return f"Total: {count} potentially dead functions"
 
     def _build_header(self) -> str:
         """Build table header row."""
@@ -125,7 +96,7 @@ class DeadCodeFormatter(BaseCLIMetricFormatter):
         func_link = self.make_hyperlink(display_name, file_path, line, tier)
 
         # Extract filename for location column
-        file_short = _extract_filename(file_path)
+        file_short = extract_filename(file_path)
         location = f"{file_short}:{line}"
 
         return (
@@ -153,17 +124,17 @@ class DeadCodeFormatter(BaseCLIMetricFormatter):
 
         lines = [
             "",
-            "=" * 80,
+            "=" * FORMATTER_WIDTH,
             f"Dead Code Analysis | {total_analyzed:,} functions | {dead_found:,} potentially dead ({dead_pct:.1f}%)",
-            "-" * 80,
+            "-" * FORMATTER_WIDTH,
             "Confidence Distribution:",
             f"  HIGH (>80%):     {high_conf:>4}  (likely truly dead)",
             f"  MEDIUM (50-80%): {medium_conf:>4}  (investigate further)",
             f"  LOW (<50%):      {low_conf:>4}  (may be entry points)",
-            "-" * 80,
+            "-" * FORMATTER_WIDTH,
             "Note: Entry points (main, handlers) have lower confidence by design.",
             "      Use --include-private to include private functions.",
-            "=" * 80,
+            "=" * FORMATTER_WIDTH,
         ]
 
         return "\n".join(lines)

@@ -8,6 +8,7 @@ and Rich for the best user experience. Allows users to:
 - Quick filter with search
 """
 
+import asyncio
 from pathlib import Path
 from typing import Optional
 
@@ -26,6 +27,26 @@ from rich import box
 from rich.panel import Panel
 from rich.text import Text
 
+from .picker_styles import (
+    CLASS_DIM,
+    CLASS_HEADER,
+    CLASS_SELECTED,
+    CLASS_SEPARATOR,
+    KEY_CTRL_C,
+    KEY_DOWN,
+    KEY_ENTER,
+    KEY_ESCAPE,
+    KEY_QUIT,
+    KEY_UP,
+    KEY_VIM_DOWN,
+    KEY_VIM_UP,
+    PICKER_SEPARATOR_WIDTH,
+    SELECTED_PREFIX,
+    STYLE_SELECTED,
+    STYLE_SEPARATOR,
+    STYLE_TOOLBAR,
+    UNSELECTED_PREFIX,
+)
 from .rich_console import console
 from .ui_utils import calculate_viewport, format_scroll_indicator
 
@@ -133,19 +154,19 @@ def run_directory_browser(start_path: Optional[str] = None) -> Optional[str]:
     # Create key bindings
     kb = KeyBindings()
 
-    @kb.add('up')
-    @kb.add('k')
+    @kb.add(KEY_UP)
+    @kb.add(KEY_VIM_UP)
     def move_up(event):
         if browser.selected_index > 0:
             browser.selected_index -= 1
 
-    @kb.add('down')
-    @kb.add('j')
+    @kb.add(KEY_DOWN)
+    @kb.add(KEY_VIM_DOWN)
     def move_down(event):
         if browser.selected_index < len(browser.entries) - 1:
             browser.selected_index += 1
 
-    @kb.add('enter')
+    @kb.add(KEY_ENTER)
     @kb.add('right')
     @kb.add('l')
     def enter_dir(event):
@@ -194,13 +215,13 @@ def run_directory_browser(start_path: Optional[str] = None) -> Optional[str]:
         # Could toggle hidden files, but for now just refresh
         browser._refresh_entries()
 
-    @kb.add('escape')
-    @kb.add('q')
+    @kb.add(KEY_ESCAPE)
+    @kb.add(KEY_QUIT)
     def cancel(event):
         browser.cancelled = True
         event.app.exit()
 
-    @kb.add('c-c')
+    @kb.add(KEY_CTRL_C)
     def ctrl_c(event):
         browser.cancelled = True
         event.app.exit()
@@ -220,8 +241,8 @@ def run_directory_browser(start_path: Optional[str] = None) -> Optional[str]:
         if len(path_display) > 60:
             path_display = "..." + path_display[-57:]
 
-        lines.append(('class:header', f' {path_display}\n'))
-        lines.append(('class:separator', ' ' + '-' * 62 + '\n'))
+        lines.append((CLASS_HEADER, f' {path_display}\n'))
+        lines.append((CLASS_SEPARATOR, ' ' + '-' * PICKER_SEPARATOR_WIDTH + '\n'))
 
         # Parent directory option
         if browser.current_path.parent != browser.current_path:
@@ -235,19 +256,19 @@ def run_directory_browser(start_path: Optional[str] = None) -> Optional[str]:
 
             for i in range(start, end):
                 entry = browser.entries[i]
-                prefix = ' > ' if i == browser.selected_index else '   '
-                style = 'class:selected' if i == browser.selected_index else 'class:dir'
+                prefix = SELECTED_PREFIX if i == browser.selected_index else UNSELECTED_PREFIX
+                style = CLASS_SELECTED if i == browser.selected_index else 'class:dir'
                 lines.append((style, f'{prefix}{entry.name}/\n'))
 
             # Scroll indicator
             if len(browser.entries) > max_visible:
                 scroll_info = format_scroll_indicator(browser.selected_index, len(browser.entries))
-                lines.append(('class:dim', scroll_info + '\n'))
+                lines.append((CLASS_DIM, scroll_info + '\n'))
         else:
-            lines.append(('class:dim', '   (no subdirectories)\n'))
+            lines.append((CLASS_DIM, '   (no subdirectories)\n'))
 
         # Preview section
-        lines.append(('class:separator', '\n ' + '-' * 62 + '\n'))
+        lines.append((CLASS_SEPARATOR, '\n ' + '-' * PICKER_SEPARATOR_WIDTH + '\n'))
         lines.append(('class:preview-header', ' Preview:\n'))
 
         for preview_line in browser._get_preview()[:5]:
@@ -288,14 +309,14 @@ def run_directory_browser(start_path: Optional[str] = None) -> Optional[str]:
     # Styles
     style = Style.from_dict({
         'header': 'bold #00aa00',
-        'separator': '#666666',
+        'separator': STYLE_SEPARATOR,
         'parent': '#888888 italic',
         'dir': '#00aaff',
-        'selected': 'bold reverse #00ff00',
-        'dim': '#666666',
+        'selected': STYLE_SELECTED,
+        'dim': STYLE_SEPARATOR,
         'preview-header': 'bold #888888',
-        'preview': '#666666',
-        'toolbar': 'bg:#333333 #ffffff',
+        'preview': STYLE_SEPARATOR,
+        'toolbar': STYLE_TOOLBAR,
         'frame.border': '#00aa00',
     })
 
@@ -338,8 +359,7 @@ async def run_directory_browser_async(start_path: Optional[str] = None) -> Optio
         Selected directory path as string, or None if cancelled.
     """
     # Run in executor to not block async loop
-    import asyncio
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, run_directory_browser, start_path)
 
 

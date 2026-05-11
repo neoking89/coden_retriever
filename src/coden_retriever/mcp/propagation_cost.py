@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
@@ -22,7 +21,19 @@ import networkx as nx
 from pydantic import Field
 
 from ..cache import CacheManager
-from ..constants import PC_THRESHOLD_CRITICAL, PC_THRESHOLD_GOOD, PC_THRESHOLD_WARNING
+from ..constants import (
+    MAX_TOKEN_LIMIT,
+    MIN_TOKEN_LIMIT,
+    PC_APPROXIMATE_STATUS,
+    PC_DENSE_GRAPH_DENSITY_THRESHOLD,
+    PC_DENSE_GRAPH_NODE_THRESHOLD,
+    PC_MAX_NODES_FOR_CLOSURE,
+    PC_THRESHOLD_CRITICAL,
+    PC_THRESHOLD_GOOD,
+    PC_THRESHOLD_WARNING,
+)
+from ._defaults import RESOLVED_DEFAULT_TOKEN_BUDGET
+from .validation import validate_root_directory
 from ..daemon.client import try_daemon_propagation_cost as _daemon_propagation_cost
 from ..daemon.protocol import PropagationCostParams
 from ..token_estimator import count_tokens
@@ -37,18 +48,17 @@ _TOKEN_OVERHEAD_PROPAGATION = 200
 _TOKEN_PER_MODULE = 50
 _TOKEN_PER_PATH = 60
 
-
-def _validate_root_directory(root_directory: str) -> dict[str, Any] | None:
-    if not root_directory:
-        return {"error": "root_directory is required"}
-    if not os.path.isdir(root_directory):
-        return {"error": f"Root directory not found: {root_directory}"}
-    return None
+# Re-exported from constants.py so tests and the formatter can monkeypatch /
+# reference these via the propagation_cost module without importing constants.
+MAX_NODES_FOR_CLOSURE = PC_MAX_NODES_FOR_CLOSURE
+DENSE_GRAPH_NODE_THRESHOLD = PC_DENSE_GRAPH_NODE_THRESHOLD
+DENSE_GRAPH_DENSITY_THRESHOLD = PC_DENSE_GRAPH_DENSITY_THRESHOLD
+APPROXIMATE_STATUS = PC_APPROXIMATE_STATUS
 
 
 async def _load_cached_indices(root_directory: str) -> "CachedIndices":
     def _load_sync() -> "CachedIndices":
-        cache = CacheManager(Path(root_directory), enable_semantic=False)
+        cache = CacheManager(Path(root_directory))
         return cache.load_or_rebuild()
     return await asyncio.to_thread(_load_sync)
 
@@ -186,15 +196,42 @@ def _find_critical_paths(
     return paths[:limit]
 
 
-def _generate_recommendations(pc: float, module_breakdown: list) -> list[str]:
+def _summarize_max_module_coupling(
+    module_breakdown: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Headline figure that doesn't shrink with total ``n``.
+
+    The overall propagation cost has an n² denominator, so larger codebases trivially
+    score lower. The max per-module internal coupling uses a module-scoped denominator
+    and stays comparable across codebase sizes.
+    """
+    if not module_breakdown:
+        return None
+    top = max(module_breakdown, key=lambda m: m.get("internal_coupling", 0))
+    return {
+        "module": top.get("module", "?"),
+        "value": top.get("internal_coupling", 0),
+        "functions": top.get("functions", 0),
+    }
+
+
+def _generate_recommendations(
+    pc: float,
+    module_breakdown: list,
+    approximation_used: bool = False,
+) -> list[str]:
     """Generate actionable recommendations based on analysis.
 
     Language-agnostic: Based on metrics, not code content.
     """
     recommendations = []
 
-    # Overall health
-    if pc <= PC_THRESHOLD_GOOD:
+    if approximation_used:
+        recommendations.append(
+            "[APPROXIMATION] Overall PC is a direct-edges lower bound; "
+            "use the per-module breakdown below for actionable signal."
+        )
+    elif pc <= PC_THRESHOLD_GOOD:
         recommendations.append(f"[OK] Propagation cost is healthy ({pc*100:.1f}% < 10%)")
     elif pc <= PC_THRESHOLD_WARNING:
         recommendations.append(f"[WARNING] Moderate coupling ({pc*100:.1f}%) - monitor for increases")
@@ -225,6 +262,7 @@ def compute_propagation_cost(
     show_critical_paths: bool = True,
     exclude_tests: bool = True,
     token_limit: int | None = None,  # None = no limit (CLI), int = limit (MCP)
+    approximate: bool = False,
 ) -> dict[str, Any]:
     """Compute propagation cost metric.
 
@@ -237,9 +275,13 @@ def compute_propagation_cost(
         show_critical_paths: Include most connected paths
         exclude_tests: Exclude test nodes from analysis
         token_limit: Token budget (None = no limit for CLI, int = limit for MCP)
+        approximate: When True, allow the direct-edges fallback for graphs that exceed
+            the closure cutoff. The PASS/WARNING/CRITICAL verdict is suppressed in this
+            mode because reachable_pairs is a lower bound, not the true reachability.
 
     Returns:
-        Dict with propagation_cost, status, and detailed breakdown
+        Dict with propagation_cost, status, and detailed breakdown. If the graph exceeds
+        the closure cutoff and ``approximate`` is False, returns an error dict instead.
     """
     # Filter out test nodes if requested
     if exclude_tests:
@@ -266,26 +308,43 @@ def compute_propagation_cost(
             "recommendations": ["[INFO] Add more functions to enable propagation cost analysis"],
         }
 
-    # Compute transitive closure (reachability)
-    # Guard against memory explosion on dense graphs
-    MAX_NODES_FOR_CLOSURE = 5000  # O(N²) edges can be ~25M for 5000 nodes
+    # Compute transitive closure (reachability).
+    # Beyond MAX_NODES_FOR_CLOSURE the closure is intractable; the caller must opt
+    # in to the direct-edges lower bound via approximate=True.
     edge_count = graph.number_of_edges()
     density = edge_count / (n * (n - 1)) if n > 1 else 0
 
-    use_approximation = False
+    cutoff_reason: str | None = None
     if n > MAX_NODES_FOR_CLOSURE:
-        logger.warning(
-            f"Graph too large for transitive closure ({n} nodes > {MAX_NODES_FOR_CLOSURE}). "
-            f"Using direct edges approximation."
+        cutoff_reason = (
+            f"graph has {n:,} nodes (> {MAX_NODES_FOR_CLOSURE:,} closure limit)"
         )
-        use_approximation = True
-    elif density > 0.1 and n > 1000:
-        # Dense graphs with >10% edge density can explode
-        logger.warning(
-            f"Dense graph detected ({density*100:.1f}% edge density, {n} nodes). "
-            f"Using direct edges approximation to avoid memory issues."
+    elif density > DENSE_GRAPH_DENSITY_THRESHOLD and n > DENSE_GRAPH_NODE_THRESHOLD:
+        cutoff_reason = (
+            f"graph is dense ({density*100:.1f}% edge density at {n:,} nodes, "
+            f"> {DENSE_GRAPH_DENSITY_THRESHOLD*100:.0f}% above {DENSE_GRAPH_NODE_THRESHOLD:,})"
         )
-        use_approximation = True
+
+    if cutoff_reason and not approximate:
+        return {
+            "error": (
+                f"Cannot compute exact propagation cost: {cutoff_reason}. "
+                f"Pass --approximate to compute a direct-edges lower bound; the "
+                f"PASS/WARNING/CRITICAL verdict is suppressed in approximation mode."
+            ),
+            "graph_stats": {
+                "nodes": n,
+                "edges": edge_count,
+                "density": round(density, 4),
+            },
+        }
+
+    use_approximation = cutoff_reason is not None
+    if use_approximation:
+        logger.warning(
+            f"Propagation cost: {cutoff_reason}. "
+            f"Using direct-edges approximation (--approximate enabled)."
+        )
 
     if use_approximation:
         closure = graph
@@ -313,8 +372,15 @@ def compute_propagation_cost(
     possible_pairs = n * (n - 1)
     pc = reachable_pairs / possible_pairs if possible_pairs > 0 else 0
 
-    # Determine status based on research thresholds
-    if pc <= PC_THRESHOLD_GOOD:
+    # In approximation mode the MacCormack thresholds do not apply: reachable_pairs
+    # is a direct-edges lower bound, so the verdict is suppressed.
+    if use_approximation:
+        status = APPROXIMATE_STATUS
+        interpretation = (
+            f"Direct-edges lower bound ({pc*100:.2f}%). PASS/WARNING/CRITICAL verdict "
+            f"suppressed - the approximation systematically under-counts reachable pairs."
+        )
+    elif pc <= PC_THRESHOLD_GOOD:
         status = "PASS"
         interpretation = f"Excellent decoupling - changes affect only {pc*100:.1f}% of codebase"
     elif pc <= PC_THRESHOLD_WARNING:
@@ -333,20 +399,16 @@ def compute_propagation_cost(
         "status": status,
         "threshold": PC_THRESHOLD_CRITICAL,
         "interpretation": interpretation,
+        "approximation_used": use_approximation,
         "graph_stats": {
             "nodes": n,
             "edges": edge_count,
             "reachable_pairs": reachable_pairs,
             "possible_pairs": possible_pairs,
             "used_approximation": use_approximation,
+            "closure_node_limit": MAX_NODES_FOR_CLOSURE,
         },
     }
-
-    if use_approximation:
-        result["approximation_note"] = (
-            "Transitive closure was approximated using direct edges only. "
-            "Actual propagation cost may be higher."
-        )
 
     # Calculate remaining token budget for breakdown and paths
     breakdown_budget = None
@@ -364,6 +426,9 @@ def compute_propagation_cost(
         result["module_breakdown"] = _compute_module_breakdown(
             graph, entities, closure, breakdown_budget
         )
+        result["max_module_coupling"] = _summarize_max_module_coupling(
+            result["module_breakdown"]
+        )
 
     # Add critical paths
     if show_critical_paths:
@@ -373,7 +438,7 @@ def compute_propagation_cost(
 
     # Add recommendations
     result["recommendations"] = _generate_recommendations(
-        pc, result.get("module_breakdown", [])
+        pc, result.get("module_breakdown", []), use_approximation
     )
 
     return result
@@ -398,8 +463,16 @@ async def propagation_cost(
     ] = True,
     token_limit: Annotated[
         int | None,
-        Field(description="Soft limit on return size in tokens (None=no limit)", ge=100, le=100000),
-    ] = 4000,
+        Field(description="Soft limit on return size in tokens (None=no limit)", ge=MIN_TOKEN_LIMIT, le=MAX_TOKEN_LIMIT),
+    ] = RESOLVED_DEFAULT_TOKEN_BUDGET,
+    approximate: Annotated[
+        bool,
+        Field(description=(
+            "Allow direct-edges approximation when the call graph exceeds the closure "
+            "limit. When True, the PASS/WARNING/CRITICAL verdict is suppressed because "
+            "reachable_pairs becomes a lower bound."
+        )),
+    ] = False,
 ) -> dict[str, Any]:
     """Measure propagation cost - how changes ripple through the codebase.
 
@@ -423,7 +496,7 @@ async def propagation_cost(
     - critical_paths: Most connected function chains
     - recommendations: Actionable suggestions to reduce coupling
     """
-    validation_error = _validate_root_directory(root_directory)
+    validation_error = validate_root_directory(root_directory)
     if validation_error:
         return validation_error
 
@@ -433,6 +506,7 @@ async def propagation_cost(
         show_critical_paths=show_critical_paths,
         exclude_tests=exclude_tests,
         token_limit=token_limit,
+        approximate=approximate,
     )
     daemon_result = _daemon_propagation_cost(daemon_params, auto_start=False)
     if daemon_result is not None:
@@ -451,6 +525,7 @@ async def propagation_cost(
         show_critical_paths=show_critical_paths,
         exclude_tests=exclude_tests,
         token_limit=token_limit,
+        approximate=approximate,
     )
 
 

@@ -1,7 +1,7 @@
 """Combined semantic + syntactic clone detection.
 
 Provides comprehensive clone detection by combining:
-1. Semantic similarity (Model2Vec embeddings)
+1. Semantic similarity (MiniLM ONNX embeddings)
 2. Syntactic similarity (line-by-line Jaccard)
 
 Uses weighted harmonic mean for score aggregation with block bonus.
@@ -9,20 +9,52 @@ Uses weighted harmonic mean for score aggregation with block bonus.
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
-from ..search.semantic import get_cached_model
-from ..token_estimator import count_tokens
+from ..constants import (
+    CLONE_CONSOLIDATE_SCORE,
+    CLONE_DIFFERENT_IMPL_SYN,
+    CLONE_EXACT_SEMANTIC_THRESHOLD,
+    CLONE_EXACT_SYNTACTIC_THRESHOLD,
+    CLONE_HIGH_SIM_THRESHOLD,
+    CLONE_IDENTICAL_NAME_SIM,
+    CLONE_LINE_OVERLAP_SYN,
+    CLONE_LINE_RATIO_THRESHOLD,
+    CLONE_MIN_BLOCK_SIZE,
+    CLONE_NEAR_SEMANTIC_THRESHOLD,
+    CLONE_NEAR_SYNTACTIC_THRESHOLD,
+    CLONE_REUSE_MAX_LINES,
+    CLONE_SAME_FILE_NAME_SIM,
+    CLONE_SEM_STRUCT_SYNTACTIC_THRESHOLD,
+    CLONE_SHORT_FUNC_MAX_LINES,
+    CLONE_STRUCTURAL_SYNTACTIC_THRESHOLD,
+    CLONE_UNRELATED_NAME_SIM,
+    CLONE_VERY_HIGH_SIM_THRESHOLD,
+    CloneCategory,
+    DEFAULT_CLONE_RESULT_LIMIT,
+    DEFAULT_CLONE_SEMANTIC_THRESHOLD,
+    DEFAULT_CLONE_SEMANTIC_WEIGHT,
+    DEFAULT_CLONE_SYNTACTIC_WEIGHT,
+    DEFAULT_SYNTACTIC_FUNC_THRESHOLD,
+    DEFAULT_SYNTACTIC_LINE_THRESHOLD,
+)
+from ..cache.embedding_cache import encode_with_cache
+from ..graph_utils import apply_token_budget_filter
+from ._constants import (
+    TOKEN_OVERHEAD_CLONES,
+    TOKEN_PER_COMBINED_CLONE_PAIR,
+    clone_pair_text,
+)
 from .sparse_utils import SparseJaccardComputer
 from .tokenizer import tokenize_function
 
 if TYPE_CHECKING:
+    from ..cache.embedding_cache import EmbeddingCache
     from ..models import CodeEntity
-
-_TOKEN_OVERHEAD_CLONES = 200
-_TOKEN_PER_CLONE_PAIR = 100  # Slightly higher for combined output
+    from ..utils.progress import ProgressCallback
 
 # Block bonus constants for consecutive matching lines
 BLOCK_BONUS_THRESHOLD = 5   # Minimum block size to trigger bonus
@@ -33,8 +65,8 @@ def compute_combined_score(
     semantic_sim: float | None,
     syntactic_pct: float | None,
     max_block_size: int = 0,
-    semantic_weight: float = 0.65,
-    syntactic_weight: float = 0.35,
+    semantic_weight: float = DEFAULT_CLONE_SEMANTIC_WEIGHT,
+    syntactic_weight: float = DEFAULT_CLONE_SYNTACTIC_WEIGHT,
 ) -> float:
     """Compute combined clone score using weighted harmonic mean.
 
@@ -109,17 +141,17 @@ def _get_combined_category(
     sem = semantic_sim or 0
     syn = syntactic_pct or 0
 
-    if sem >= 0.9999 and syn >= 0.95:
-        return "EXACT"
-    if sem >= 0.98 and syn >= 0.80:
-        return "NEAR-CLONE"
-    if sem >= 0.95 and syn >= 0.50:
-        return "SEMANTIC-STRUCTURAL"
-    if syn >= 0.70 and max_block_size >= 5:
-        return "STRUCTURAL"
-    if sem >= 0.95:
-        return "SEMANTIC"
-    return "PARTIAL"
+    if sem >= CLONE_EXACT_SEMANTIC_THRESHOLD and syn >= CLONE_EXACT_SYNTACTIC_THRESHOLD:
+        return CloneCategory.EXACT
+    if sem >= CLONE_NEAR_SEMANTIC_THRESHOLD and syn >= CLONE_NEAR_SYNTACTIC_THRESHOLD:
+        return CloneCategory.NEAR_CLONE
+    if sem >= DEFAULT_CLONE_SEMANTIC_THRESHOLD and syn >= CLONE_SEM_STRUCT_SYNTACTIC_THRESHOLD:
+        return CloneCategory.SEMANTIC_STRUCTURAL
+    if syn >= CLONE_STRUCTURAL_SYNTACTIC_THRESHOLD and max_block_size >= CLONE_MIN_BLOCK_SIZE:
+        return CloneCategory.STRUCTURAL
+    if sem >= DEFAULT_CLONE_SEMANTIC_THRESHOLD:
+        return CloneCategory.SEMANTIC
+    return CloneCategory.PARTIAL
 
 
 def _suggest_action(
@@ -134,11 +166,11 @@ def _suggest_action(
         return f"EXTRACT: Move '{e1.name}' to shared utility module"
     if e1.file_path == e2.file_path:
         return "MERGE: Combine into single parameterized function"
-    if combined_score >= 0.95:
+    if combined_score >= CLONE_CONSOLIDATE_SCORE:
         return "CONSOLIDATE: High semantic and structural overlap"
-    if (semantic_sim or 0) >= 0.95 and (syntactic_pct or 0) < 0.50:
+    if (semantic_sim or 0) >= CLONE_HIGH_SIM_THRESHOLD and (syntactic_pct or 0) < CLONE_DIFFERENT_IMPL_SYN:
         return "REVIEW: Similar behavior, different implementation"
-    if (syntactic_pct or 0) >= 0.70:
+    if (syntactic_pct or 0) >= CLONE_LINE_OVERLAP_SYN:
         return "CONSOLIDATE: High line-by-line overlap"
     return "REVIEW: Consider if these should be unified"
 
@@ -168,50 +200,90 @@ def _is_intentional_pair(
     line_count2 = e2.line_end - e2.line_start + 1
 
     # Very short functions with high similarity
-    if line_count1 <= 5 and line_count2 <= 5 and semantic_sim >= 0.95:
+    if line_count1 <= CLONE_SHORT_FUNC_MAX_LINES and line_count2 <= CLONE_SHORT_FUNC_MAX_LINES and semantic_sim >= CLONE_HIGH_SIM_THRESHOLD:
         return True
 
     # Same parent class with high similarity
-    if e1.parent_class and e1.parent_class == e2.parent_class and semantic_sim >= 0.95:
+    if e1.parent_class and e1.parent_class == e2.parent_class and semantic_sim >= CLONE_HIGH_SIM_THRESHOLD:
         return True
 
-    if semantic_sim <= 0.97:
+    if semantic_sim <= CLONE_VERY_HIGH_SIM_THRESHOLD:
         return False
 
     # Identical names in different files = intentional reuse
-    if name_similarity >= 0.99 and e1.file_path != e2.file_path:
-        if line_count1 <= 10 and line_count2 <= 10:
+    if name_similarity >= CLONE_IDENTICAL_NAME_SIM and e1.file_path != e2.file_path:
+        if line_count1 <= CLONE_REUSE_MAX_LINES and line_count2 <= CLONE_REUSE_MAX_LINES:
             return True
         line_ratio = min(line_count1, line_count2) / max(line_count1, line_count2, 1)
-        if line_ratio > 0.7:
+        if line_ratio > CLONE_LINE_RATIO_THRESHOLD:
             return True
 
     # Same file handling
     if e1.file_path == e2.file_path:
         # High name similarity in same file = true duplicate (keep it)
-        if name_similarity >= 0.80:
+        if name_similarity >= CLONE_SAME_FILE_NAME_SIM:
             return False
         # Low name similarity with similar line counts = toggle pair (filter it)
         line_ratio = min(line_count1, line_count2) / max(line_count1, line_count2, 1)
-        if line_ratio > 0.7:
+        if line_ratio > CLONE_LINE_RATIO_THRESHOLD:
             return True
 
-    return name_similarity < 0.85
+    return name_similarity < CLONE_UNRELATED_NAME_SIM
+
+
+def _build_summary(
+    clone_pairs: list[dict[str, Any]],
+    func_entities: dict[str, "CodeEntity"],
+    filtered_pairs: list[dict[str, Any]],
+    token_budget_exceeded: bool,
+    *,
+    semantic_threshold: float,
+    line_threshold: float,
+    func_threshold: float,
+    semantic_weight: float,
+    syntactic_weight: float,
+) -> dict[str, Any]:
+    """Build the combined-mode summary dict.
+
+    Single source of truth for the summary schema — both the early-return
+    (no work done) and the populated path go through here.
+    """
+    counts = Counter(c["category"] for c in clone_pairs)
+    return {
+        "mode": "combined",
+        "total_functions": len(func_entities),
+        "clone_pairs_found": len(clone_pairs),
+        "exact_duplicates": counts[CloneCategory.EXACT],
+        "near_clones": counts[CloneCategory.NEAR_CLONE],
+        "semantic_structural": counts[CloneCategory.SEMANTIC_STRUCTURAL],
+        "structural": counts[CloneCategory.STRUCTURAL],
+        "semantic": counts[CloneCategory.SEMANTIC],
+        "partial": counts[CloneCategory.PARTIAL],
+        "semantic_threshold_used": semantic_threshold,
+        "line_threshold_used": line_threshold,
+        "func_threshold_used": func_threshold,
+        "semantic_weight": semantic_weight,
+        "syntactic_weight": syntactic_weight,
+        "results_returned": len(filtered_pairs),
+        "token_budget_exceeded": token_budget_exceeded,
+    }
 
 
 def detect_clones_combined(
     entities: dict[str, "CodeEntity"],
     model_path: str,
-    semantic_threshold: float = 0.95,
-    line_threshold: float = 0.70,
-    func_threshold: float = 0.50,
+    semantic_threshold: float = DEFAULT_CLONE_SEMANTIC_THRESHOLD,
+    line_threshold: float = DEFAULT_SYNTACTIC_LINE_THRESHOLD,
+    func_threshold: float = DEFAULT_SYNTACTIC_FUNC_THRESHOLD,
     min_shared_lines: int = 2,
-    limit: int | None = 50,
+    limit: int | None = DEFAULT_CLONE_RESULT_LIMIT,
     exclude_tests: bool = True,
     min_lines: int = 3,
     token_limit: int | None = None,
-    semantic_weight: float = 0.65,
-    syntactic_weight: float = 0.35,
+    semantic_weight: float = DEFAULT_CLONE_SEMANTIC_WEIGHT,
+    syntactic_weight: float = DEFAULT_CLONE_SYNTACTIC_WEIGHT,
+    embedding_cache: "EmbeddingCache | None" = None,
+    on_encode_progress: "ProgressCallback | None" = None,
 ) -> dict[str, Any]:
     """Detect code clones using combined semantic + syntactic analysis.
 
@@ -219,7 +291,7 @@ def detect_clones_combined(
 
     Args:
         entities: Dict of entity_id -> CodeEntity
-        model_path: Path to the Model2Vec model
+        model_path: Path to the MiniLM ONNX model
         semantic_threshold: Minimum semantic similarity threshold (0-1)
         line_threshold: Minimum Jaccard similarity for a line match (0-1)
         func_threshold: Minimum percentage of lines that must match (0-1)
@@ -234,8 +306,6 @@ def detect_clones_combined(
     Returns:
         Dict with clones list and summary statistics
     """
-    effective_limit: float = float(limit) if limit is not None else float('inf')
-
     # Filter to functions/methods
     func_entities = {
         k: v for k, v in entities.items()
@@ -248,48 +318,33 @@ def detect_clones_combined(
     if len(func_entities) < 2:
         return {
             "clones": [],
-            "summary": {
-                "mode": "combined",
-                "total_functions": len(func_entities),
-                "clone_pairs_found": 0,
-                "exact_duplicates": 0,
-                "near_clones": 0,
-                "semantic_structural": 0,
-                "structural": 0,
-                "semantic": 0,
-                "partial": 0,
-                "semantic_threshold_used": semantic_threshold,
-                "line_threshold_used": line_threshold,
-                "func_threshold_used": func_threshold,
-                "semantic_weight": semantic_weight,
-                "syntactic_weight": syntactic_weight,
-            }
+            "summary": _build_summary(
+                clone_pairs=[],
+                func_entities=func_entities,
+                filtered_pairs=[],
+                token_budget_exceeded=False,
+                semantic_threshold=semantic_threshold,
+                line_threshold=line_threshold,
+                func_threshold=func_threshold,
+                semantic_weight=semantic_weight,
+                syntactic_weight=syntactic_weight,
+            ),
         }
 
     node_ids = list(func_entities.keys())
     node_id_to_idx = {nid: idx for idx, nid in enumerate(node_ids)}
     n = len(node_ids)
 
-    # === SEMANTIC ANALYSIS ===
-    model = get_cached_model(model_path)
     texts = [func_entities[nid].source_code for nid in node_ids]
-    embeddings = model.encode(texts)
+    embeddings = encode_with_cache(texts, embedding_cache, on_batch_done=on_encode_progress)
 
-    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1, norms)
-    embeddings = embeddings / norms
-
-    # Name embeddings for intentional pair detection
+    # L2-normalized vectors: dot product = cosine similarity
     names = [func_entities[nid].name for nid in node_ids]
-    name_embeddings = model.encode(names)
-    name_norms = np.linalg.norm(name_embeddings, axis=1, keepdims=True)
-    name_norms = np.where(name_norms == 0, 1, name_norms)
-    name_embeddings = name_embeddings / name_norms
+    name_embeddings = encode_with_cache(names, embedding_cache, on_batch_done=on_encode_progress)
     name_similarity_matrix = np.dot(name_embeddings, name_embeddings.T)
 
     similarity_matrix = np.dot(embeddings, embeddings.T)
 
-    # === SYNTACTIC ANALYSIS ===
     tokenized_lines: dict[str, list[tuple[str, frozenset[str]]]] = {}
     for eid, entity in func_entities.items():
         tokenized_lines[eid] = tokenize_function(entity.source_code, entity.language)
@@ -301,17 +356,14 @@ def detect_clones_combined(
 
     computer = SparseJaccardComputer()
     computer.index_functions(func_entities, tokenized_lines)
-    syntactic_candidates = set(computer.find_candidates(valid_eids, min_shared_lines))
+    syntactic_candidates = sorted(computer.find_candidates(valid_eids, min_shared_lines))
 
-    # === FIND CLONE PAIRS ===
-    # Consider pairs that meet EITHER threshold
     i_indices, j_indices = np.triu_indices(n, k=1)
     semantic_sims = similarity_matrix[i_indices, j_indices]
 
     clone_pairs: list[dict[str, Any]] = []
     pair_data: dict[tuple[str, str], dict[str, Any]] = {}
 
-    # Process all pairs that meet semantic threshold
     above_semantic = semantic_sims >= semantic_threshold
     for idx in np.where(above_semantic)[0]:
         i, j = int(i_indices[idx]), int(j_indices[idx])
@@ -328,7 +380,6 @@ def detect_clones_combined(
         else:
             pair_data[pair_key]["semantic_sim"] = float(semantic_sims[idx])
 
-    # Process syntactic candidates
     for eid1, eid2 in syntactic_candidates:
         pair_key = (eid1, eid2) if eid1 < eid2 else (eid2, eid1)
 
@@ -356,13 +407,11 @@ def detect_clones_combined(
                 pair_data[pair_key]["syntactic_pct"] = match.match_percentage
                 pair_data[pair_key]["syntactic_match"] = match
 
-    # Build clone pairs from merged data
     for pair_key, data in pair_data.items():
         eid1, eid2 = pair_key
         i, j = data["i"], data["j"]
         e1, e2 = func_entities[eid1], func_entities[eid2]
 
-        # Skip nested functions
         if _is_nested(e1, e2):
             continue
 
@@ -370,14 +419,12 @@ def detect_clones_combined(
         syntactic_pct = data.get("syntactic_pct")
         syntactic_match = data.get("syntactic_match")
 
-        # Skip intentional pairs
         name_sim = float(name_similarity_matrix[i, j])
         if _is_intentional_pair(e1, e2, semantic_sim, name_sim):
             continue
 
-        # Compute combined score
-        # In combined mode, treat None syntactic as 0.0 (no match found)
-        # so the weighted average properly penalizes missing syntactic matches
+        # Treat missing syntactic as 0.0 so the weighted average properly
+        # penalizes pairs that have no syntactic evidence.
         max_block_size = syntactic_match.max_block_size if syntactic_match else 0
         effective_syntactic = syntactic_pct if syntactic_pct is not None else 0.0
         combined = compute_combined_score(
@@ -386,7 +433,6 @@ def detect_clones_combined(
         )
         category = _get_combined_category(semantic_sim, syntactic_pct, max_block_size)
 
-        # Build block info
         blocks_info = []
         if syntactic_match:
             for block in syntactic_match.blocks:
@@ -423,58 +469,29 @@ def detect_clones_combined(
             "suggested_action": _suggest_action(e1, e2, combined, semantic_sim, syntactic_pct),
         })
 
-        if len(clone_pairs) >= effective_limit * 10:
-            break
-
-    # Sort by combined score
     clone_pairs.sort(key=lambda x: (-x["similarity"], -x.get("max_block_size", 0)))
 
-    # Count categories
-    exact_count = sum(1 for c in clone_pairs if c["category"] == "EXACT")
-    near_count = sum(1 for c in clone_pairs if c["category"] == "NEAR-CLONE")
-    sem_struct_count = sum(1 for c in clone_pairs if c["category"] == "SEMANTIC-STRUCTURAL")
-    structural_count = sum(1 for c in clone_pairs if c["category"] == "STRUCTURAL")
-    semantic_count = sum(1 for c in clone_pairs if c["category"] == "SEMANTIC")
-    partial_count = sum(1 for c in clone_pairs if c["category"] == "PARTIAL")
-
-    # Apply limit and token budget
     slice_limit = limit if limit is not None else len(clone_pairs)
-    if token_limit is None:
-        filtered_pairs = clone_pairs[:slice_limit]
-        token_budget_exceeded = False
-    else:
-        used_tokens = _TOKEN_OVERHEAD_CLONES
-        token_budget_exceeded = False
-        filtered_pairs = []
-
-        for pair in clone_pairs[:slice_limit]:
-            pair_text = f"{pair['entity1']['name']} {pair['entity1']['file']} {pair['entity2']['name']} {pair['entity2']['file']} {pair['suggested_action']}"
-            pair_tokens = count_tokens(pair_text, is_code=False) + _TOKEN_PER_CLONE_PAIR
-            if used_tokens + pair_tokens > token_limit:
-                token_budget_exceeded = True
-                break
-            used_tokens += pair_tokens
-            filtered_pairs.append(pair)
+    filtered_pairs, _, token_budget_exceeded = apply_token_budget_filter(
+        clone_pairs[:slice_limit],
+        token_limit,
+        TOKEN_OVERHEAD_CLONES,
+        TOKEN_PER_COMBINED_CLONE_PAIR,
+        text_fields=[],
+        text_builder=clone_pair_text,
+    )
 
     return {
         "clones": filtered_pairs,
-        "summary": {
-            "mode": "combined",
-            "total_functions": len(func_entities),
-            "clone_pairs_found": len(clone_pairs),
-            "exact_duplicates": exact_count,
-            "near_clones": near_count,
-            "semantic_structural": sem_struct_count,
-            "structural": structural_count,
-            "semantic": semantic_count,
-            "partial": partial_count,
-            "threshold_used": semantic_threshold,  # Backward compat
-            "semantic_threshold_used": semantic_threshold,
-            "line_threshold_used": line_threshold,
-            "func_threshold_used": func_threshold,
-            "semantic_weight": semantic_weight,
-            "syntactic_weight": syntactic_weight,
-            "results_returned": len(filtered_pairs),
-            "token_budget_exceeded": token_budget_exceeded,
-        },
+        "summary": _build_summary(
+            clone_pairs=clone_pairs,
+            func_entities=func_entities,
+            filtered_pairs=filtered_pairs,
+            token_budget_exceeded=token_budget_exceeded,
+            semantic_threshold=semantic_threshold,
+            line_threshold=line_threshold,
+            func_threshold=func_threshold,
+            semantic_weight=semantic_weight,
+            syntactic_weight=syntactic_weight,
+        ),
     }

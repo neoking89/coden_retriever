@@ -1,19 +1,12 @@
 """
 MCP (Model Context Protocol) module for CodenRetriever.
 
-This module provides MCP servers with different tool configurations:
-- create_mcp_server(): Full server with all tools (default)
-- create_code_search_server(): Server with only code search tools
-- create_dynamic_tools_server(): Server with only dynamic tools
-
-Requires the 'mcp' extra:
-    pip install 'coden-retriever[mcp]'
+Provides the full MCP server with all tools (code search, debugging,
+file editing, dead code, clones, etc.).
 
 Public API:
-    Servers:
-        - create_mcp_server
-        - create_code_search_server
-        - create_dynamic_tools_server
+    Server:
+        - create_mcp_server (full server with all tools)
 
     Tool Registration:
         - register_code_search_tools
@@ -22,13 +15,11 @@ Public API:
         - register_all_tools (registers all tools)
 
     Tool Filtering:
-        - ToolFilter
+        - LLMToolRouter
         - ToolMetadata
         - FilteredTool
         - FilterResult
         - CORE_TOOLS
-        - is_tool_filter_enabled
-        - create_tool_filter_from_functions
         - display_filtered_tools
 """
 
@@ -37,26 +28,22 @@ def __getattr__(name: str):
     if name == "register_code_search_tools":
         from .code_search import register_code_search_tools
         return register_code_search_tools
-    if name == "create_code_search_server":
-        from .code_search_server import create_code_search_server
-        return create_code_search_server
     if name == "register_dynamic_tools":
         from .dynamic_tools import register_dynamic_tools
         return register_dynamic_tools
-    if name == "create_dynamic_tools_server":
-        from .dynamic_tools_server import create_dynamic_tools_server
-        return create_dynamic_tools_server
     if name == "register_file_edit_tools":
         from .file_edit import register_file_edit_tools
         return register_file_edit_tools
     if name == "create_mcp_server":
         from .server import create_mcp_server
         return create_mcp_server
-    if name in ("CORE_TOOLS", "FilteredTool", "FilterResult", "ToolFilter",
-                "ToolMetadata", "create_tool_filter_from_functions",
-                "display_filtered_tools", "is_tool_filter_enabled"):
+    if name in ("CORE_TOOLS", "FilteredTool", "FilterResult", "TOOL_QUERY_DESCRIPTIONS",
+                "ToolMetadata", "display_filtered_tools"):
         from . import tool_filter
         return getattr(tool_filter, name)
+    if name == "LLMToolRouter":
+        from .llm_tool_router import LLMToolRouter
+        return LLMToolRouter
     if name == "register_all_tools":
         return register_all_tools
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -82,8 +69,6 @@ def register_all_tools(mcp) -> None:
 __all__ = [
     # Server creation functions
     "create_mcp_server",
-    "create_code_search_server",
-    "create_dynamic_tools_server",
     # Tool registration functions
     "register_code_search_tools",
     "register_dynamic_tools",
@@ -91,11 +76,10 @@ __all__ = [
     "register_all_tools",
     # Tool filtering
     "CORE_TOOLS",
-    "ToolFilter",
+    "TOOL_QUERY_DESCRIPTIONS",
+    "LLMToolRouter",
     "ToolMetadata",
     "FilteredTool",
     "FilterResult",
-    "is_tool_filter_enabled",
-    "create_tool_filter_from_functions",
     "display_filtered_tools",
 ]

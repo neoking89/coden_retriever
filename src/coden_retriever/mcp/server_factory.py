@@ -3,22 +3,16 @@ MCP Server Factory.
 
 Provides a generic factory function for creating MCP servers with different configurations.
 Eliminates code duplication across server creation modules.
-
-Requires the 'mcp' extra:
-    pip install 'coden-retriever[mcp]'
 """
 import logging
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import Callable
 
-from ..utils.optional_deps import MissingDependencyError
-
-if TYPE_CHECKING:
-    from fastmcp import FastMCP
+from fastmcp import FastMCP
 
 logger = logging.getLogger(__name__)
 
 
-def register_health_endpoint(mcp: "FastMCP") -> None:
+def register_health_endpoint(mcp: FastMCP) -> None:
     """Register a health check endpoint for HTTP transport.
 
     Note: Starlette is a transitive dependency of MCP/FastMCP, so it's always available.
@@ -38,28 +32,18 @@ def register_health_endpoint(mcp: "FastMCP") -> None:
 def create_mcp_server_with_config(
     server_name: str,
     instructions: str,
-    install_dependency: str,
     register_functions: list[Callable],
-) -> Optional["FastMCP"]:
+) -> FastMCP:
     """Generic factory function for creating MCP servers.
 
     Args:
         server_name: Name of the MCP server
         instructions: Instructions text for the server
-        install_dependency: Dependency identifier for error message (e.g., 'code-search', 'all')
         register_functions: List of registration functions to call with the mcp instance
 
     Returns:
-        FastMCP instance or None if FastMCP is not installed
-
-    Raises:
-        MissingDependencyError: If FastMCP is not installed
+        FastMCP instance.
     """
-    try:
-        from fastmcp import FastMCP
-    except ImportError:
-        raise MissingDependencyError("mcp")
-
     mcp = FastMCP(
         name=server_name,
         instructions=instructions

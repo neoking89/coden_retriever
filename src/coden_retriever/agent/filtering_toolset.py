@@ -1,24 +1,24 @@
 """Filtering wrapper for pydantic-ai toolsets.
 
 Uses pydantic-ai's built-in FilteredToolset to filter which tools are visible
-to the LLM based on semantic similarity to the current query.
+to the LLM based on LLM-routed relevance to the current query.
 
 This is used with dynamic_tool_filtering to reduce context window usage
 and focus the LLM on relevant tools.
 """
 
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from pydantic_ai import RunContext
 from pydantic_ai.toolsets import FilteredToolset, AbstractToolset
 from pydantic_ai.tools import ToolDefinition
 
-from ..config_loader import get_config
-from ..mcp.tool_filter import ToolFilter
+from ..mcp.llm_tool_router import LLMToolRouter
+from ..mcp.tool_filter import FilterResult
 
 
-class SemanticToolFilter:
-    """Manages semantic filtering state for tool selection.
+class LLMToolFilter:
+    """Manages LLM-based filtering state for tool selection.
 
     This class holds the filter state (current query, allowed tools) and provides
     the filter function that pydantic-ai's FilteredToolset uses.
@@ -26,51 +26,42 @@ class SemanticToolFilter:
     The filter is updated per-query via set_filter_for_query() before agent.run().
     """
 
-    def __init__(
-        self,
-        tool_filter: Optional[ToolFilter] = None,
-        threshold: float = 0.5,
-    ):
-        """Initialize the semantic tool filter.
+    def __init__(self, tool_router: Optional[LLMToolRouter] = None):
+        """Initialize the LLM tool filter.
 
         Args:
-            tool_filter: ToolFilter instance for semantic filtering.
-            threshold: Similarity threshold for filtering (0-1).
+            tool_router: LLMToolRouter instance for LLM-based filtering.
         """
-        self.tool_filter = tool_filter
-        self.threshold = threshold
+        self.tool_router = tool_router
         self._allowed_tools: Optional[set[str]] = None
 
-    def set_filter_for_query(self, query: str) -> set[str]:
+    async def set_filter_for_query(
+        self,
+        query: str,
+        event_stream_handler: Optional[Callable[..., Any]] = None,
+    ) -> FilterResult | None:
         """Update the allowed tools based on the query.
 
         Call this before agent.run() to filter tools for that query.
-        Reads threshold from current config for immediate updates.
 
         Args:
             query: The user's query text.
+            event_stream_handler: Optional pydantic-ai event stream handler
+                for streaming the router's LLM output to the console.
 
         Returns:
-            Set of allowed tool names.
+            FilterResult from the router, or None if no router is configured.
         """
-        if self.tool_filter is None:
+        if self.tool_router is None:
             self._allowed_tools = None
-            return set()
+            return None
 
-        # Read threshold from config for immediate updates via /config set
-        config = get_config()
-        threshold = config.agent.tool_filter_threshold if config else self.threshold
-
-        filter_result = self.tool_filter.filter(query, threshold=threshold)
-
-        allowed = set()
-        for tool in filter_result.core_tools:
-            allowed.add(tool.metadata.name)
-        for tool in filter_result.domain_tools:
-            allowed.add(tool.metadata.name)
-
+        filter_result = await self.tool_router.filter(
+            query, event_stream_handler=event_stream_handler
+        )
+        allowed = {tool.metadata.name for tool in filter_result.all_tools}
         self._allowed_tools = allowed
-        return allowed
+        return filter_result
 
     def clear_filter(self) -> None:
         """Clear the filter, allowing all tools."""
@@ -92,28 +83,23 @@ class SemanticToolFilter:
 
 def create_filtered_toolset(
     toolset: AbstractToolset,
-    tool_filter: Optional[ToolFilter] = None,
-    threshold: float = 0.5,
-) -> tuple[FilteredToolset, SemanticToolFilter]:
+    tool_router: Optional[LLMToolRouter] = None,
+) -> tuple[FilteredToolset, LLMToolFilter]:
     """Create a filtered toolset using pydantic-ai's built-in FilteredToolset.
 
     Args:
         toolset: The base toolset to wrap.
-        tool_filter: ToolFilter instance for semantic filtering.
-        threshold: Similarity threshold for filtering.
+        tool_router: LLMToolRouter instance for LLM-based filtering.
 
     Returns:
-        Tuple of (FilteredToolset, SemanticToolFilter) - the filter object
+        Tuple of (FilteredToolset, LLMToolFilter) - the filter object
         is returned so callers can call set_filter_for_query() per request.
     """
-    semantic_filter = SemanticToolFilter(
-        tool_filter=tool_filter,
-        threshold=threshold,
-    )
+    llm_filter = LLMToolFilter(tool_router=tool_router)
 
     filtered_toolset = FilteredToolset(
         wrapped=toolset,
-        filter_func=semantic_filter.filter_func,
+        filter_func=llm_filter.filter_func,
     )
 
-    return filtered_toolset, semantic_filter
+    return filtered_toolset, llm_filter

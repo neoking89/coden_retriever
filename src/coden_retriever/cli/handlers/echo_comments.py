@@ -8,7 +8,7 @@ from pathlib import Path
 
 from ...cli_metrics_contract import apply_defensive_limit, print_metric_output
 from ...constants import MILLISECONDS_PER_SECOND, PERCENT, STATS_SEPARATOR_WIDTH
-from ...utils.optional_deps import MissingDependencyError, require_feature
+from ...utils.progress import encoding_progress
 from ..utils import normalize_limit
 
 logger = logging.getLogger(__name__)
@@ -16,12 +16,6 @@ logger = logging.getLogger(__name__)
 
 def handle_echo_comments_command(args: argparse.Namespace, root_path: Path, config) -> int:
     """Handle echo comment detection command (read-only analysis or file modification with --remove-comments)."""
-    try:
-        require_feature("semantic")
-    except MissingDependencyError as e:
-        print(str(e), file=sys.stderr)
-        return 1
-
     args.limit = normalize_limit(args.limit)
     start_time = time.time()
 
@@ -42,9 +36,14 @@ def handle_echo_comments_command(args: argparse.Namespace, root_path: Path, conf
             print()
 
         if args.remove_comments:
-            return _handle_remove_comments(args, indices, root_path, start_time)
+            result_code = _handle_remove_comments(args, indices, root_path, start_time)
+        else:
+            result_code = _handle_read_only_analysis(args, indices, start_time)
 
-        return _handle_read_only_analysis(args, indices, start_time)
+        if indices.embedding_cache is not None:
+            indices.embedding_cache.save(cache.cache_dir)
+
+        return result_code
 
     except Exception as e:
         logger.error(f"Echo comment detection failed: {e}")
@@ -73,8 +72,9 @@ def _handle_remove_comments(args: argparse.Namespace, indices, root_path: Path, 
     result = flag_code(
         entities=indices.entities,
         graph=indices.graph,
-        pagerank=indices.pagerank,
+        pagerank=indices.centrality.pagerank,
         params=params,
+        embedding_cache=indices.embedding_cache,
     )
 
     if "error" in result:
@@ -112,13 +112,16 @@ def _handle_read_only_analysis(args: argparse.Namespace, indices, start_time: fl
 
     formatter = FlagFormatter()
 
-    result = compute_echo_comments(
-        entities=indices.entities,
-        echo_threshold=args.echo_threshold,
-        token_limit=args.tokens,
-        include_tests=args.include_tests,
-        include_private=False,
-    )
+    with encoding_progress("Encoding comments") as progress:
+        result = compute_echo_comments(
+            entities=indices.entities,
+            echo_threshold=args.echo_threshold,
+            token_limit=args.tokens,
+            include_tests=args.include_tests,
+            include_private=False,
+            embedding_cache=indices.embedding_cache,
+            on_encode_progress=progress,
+        )
 
     if "error" in result:
         logger.error(f"Echo comment detection error: {result['error']}")

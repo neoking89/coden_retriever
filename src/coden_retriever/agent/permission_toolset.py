@@ -26,6 +26,23 @@ from .rich_console import console, get_active_live
 DepsT = TypeVar("DepsT")
 
 
+@dataclass
+class _SessionPermissionState:
+    """Mutable container for session-level permission state.
+
+    Survives dataclasses.replace() copies because replace() does a
+    shallow copy — every copy shares the same _SessionPermissionState
+    reference, so setting always_allow on any copy is visible to all.
+
+    This is necessary because pydantic-ai's Agent.run() calls
+    visit_and_replace() on every invocation, which creates new
+    WrapperToolset copies via dataclasses.replace(). A plain bool
+    field would be copied by value and mutations would be lost.
+    """
+
+    always_allow: bool = False
+
+
 def _get_ask_permission_setting() -> bool:
     """Get the current ask_tool_permission setting from config.
 
@@ -54,7 +71,18 @@ class PermissionToolsetWrapper(WrapperToolset[DepsT]):
     Extends pydantic-ai's WrapperToolset for proper framework integration.
     """
 
-    session_always_allow: bool = field(default=False)
+    _permission_state: _SessionPermissionState = field(
+        default_factory=_SessionPermissionState
+    )
+
+    @property
+    def session_always_allow(self) -> bool:
+        """Whether the user has selected 'Always Allow' for this session."""
+        return self._permission_state.always_allow
+
+    @session_always_allow.setter
+    def session_always_allow(self, value: bool) -> None:
+        self._permission_state.always_allow = value
 
     async def check_permission(self, tool_name: str, args: dict[str, Any]) -> bool:
         """Check if permission is granted to execute a tool.

@@ -254,26 +254,6 @@ async def run_with_react_display(
     )
 
 
-def format_step_for_display(step: ReActStep) -> str:
-    """Format a single ReAct step for console display."""
-    lines = [f"\n[Step {step.step_number}]"]
-
-    if step.thought:
-        lines.append(f"  Thought: {step.thought.reasoning}")
-
-    if step.action:
-        # Format tool input nicely (no truncation - show full args)
-        args_str = ", ".join(f"{k}={v!r}" for k, v in step.action.tool_input.items())
-        lines.append(f"  Action: {step.action.tool_name}({args_str})")
-
-    if step.observation:
-        status = "[ok]" if step.observation.success else "[x]"
-        content = step.observation.result or step.observation.error
-        lines.append(f"  Observation: {status} {content}")
-
-    return "\n".join(lines)
-
-
 def print_steps(steps: list[ReActStep]) -> None:
     """Print all ReAct steps to console with Rich formatting."""
     from .rich_console import print_steps_rich

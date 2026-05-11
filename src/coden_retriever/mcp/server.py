@@ -5,12 +5,12 @@ Provides the Model Context Protocol server for CodenRetriever with all tools.
 This is the default server that includes both code search and dynamic tools.
 """
 import os
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from fastmcp import FastMCP
+from fastmcp import FastMCP
 
-from .constants import FULL_SERVER_INSTRUCTIONS, SERVER_NAME_FULL, _is_dynamic_tools_enabled
+from ..config_loader import get_config, resolve_or_default
+from ..constants import DEFAULT_FULL_SERVER_INSTRUCTIONS_TEMPLATE
+from .constants import SERVER_NAME_FULL, _is_dynamic_tools_enabled
 from .server_factory import create_mcp_server_with_config
 
 
@@ -25,11 +25,8 @@ def get_disabled_tools() -> set[str]:
     return set(name.strip() for name in disabled_str.split(",") if name.strip())
 
 
-def create_mcp_server() -> "FastMCP | None":
+def create_mcp_server() -> FastMCP:
     """Create an MCP server with all tools (code search + dynamic tools).
-
-    This is the default server that includes both code search and dynamic tools functionality.
-    For specialized servers, use create_code_search_server() or create_dynamic_tools_server().
 
     Dynamic tools require enable_dynamic_tools = true in pyproject.toml [tool.coden-retriever].
     Respects CODEN_RETRIEVER_DISABLED_TOOLS env var to filter out specific tools.
@@ -38,7 +35,7 @@ def create_mcp_server() -> "FastMCP | None":
     from .clone_detection import register_clone_detection_tools
     from .code_search import register_code_search_tools
     from .dead_code import register_dead_code_tools
-    from .debug_trace import register_debug_tools
+    from .debug_registration import register_debug_tools
     from .dynamic_tools import register_dynamic_tools
     from .echo_comments import register_echo_comment_tools
     from .file_edit import register_file_edit_tools
@@ -46,6 +43,7 @@ def create_mcp_server() -> "FastMCP | None":
     from .graph_analysis import register_graph_analysis_tools
     from .propagation_cost import register_propagation_cost_tools
     from .sensitive_values import register_sensitive_value_tools
+    from .magic_constants import register_magic_constant_tools
     from .tramp_data import register_tramp_data_tools
 
     disabled_tools = get_disabled_tools()
@@ -62,6 +60,7 @@ def create_mcp_server() -> "FastMCP | None":
         lambda mcp: register_propagation_cost_tools(mcp, disabled_tools),
         lambda mcp: register_sensitive_value_tools(mcp, disabled_tools),
         lambda mcp: register_tramp_data_tools(mcp, disabled_tools),
+        lambda mcp: register_magic_constant_tools(mcp, disabled_tools),
     ]
 
     # Only register dynamic tools if explicitly enabled in pyproject.toml
@@ -70,7 +69,10 @@ def create_mcp_server() -> "FastMCP | None":
 
     return create_mcp_server_with_config(
         server_name=SERVER_NAME_FULL,
-        instructions=FULL_SERVER_INSTRUCTIONS,
-        install_dependency="all",
+        instructions=resolve_or_default(
+            get_config().mcp.full_server_instructions_template,
+            DEFAULT_FULL_SERVER_INSTRUCTIONS_TEMPLATE,
+            "full_server_instructions_template",
+        ),
         register_functions=register_functions,
     )

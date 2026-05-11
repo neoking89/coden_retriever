@@ -12,6 +12,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 from scipy import sparse
 
+from ..constants import (
+    DEFAULT_CLONE_SEMANTIC_THRESHOLD,
+    DEFAULT_SYNTACTIC_FUNC_THRESHOLD,
+    DEFAULT_SYNTACTIC_LINE_THRESHOLD,
+)
+
 if TYPE_CHECKING:
     from ..models import CodeEntity
 
@@ -169,8 +175,8 @@ class SparseJaccardComputer:
         self,
         eid1: str,
         eid2: str,
-        line_threshold: float = 0.70,
-        func_threshold: float = 0.50,
+        line_threshold: float = DEFAULT_SYNTACTIC_LINE_THRESHOLD,
+        func_threshold: float = DEFAULT_SYNTACTIC_FUNC_THRESHOLD,
     ) -> FunctionMatch | None:
         """Compare two functions using batch Jaccard.
 
@@ -253,7 +259,7 @@ class SparseJaccardComputer:
     def _find_blocks(
         self,
         matches: list[LineMatch],
-        threshold: float = 0.95,
+        threshold: float = DEFAULT_CLONE_SEMANTIC_THRESHOLD,
     ) -> list[list[LineMatch]]:
         """Find consecutive matching line blocks."""
         if not matches:
@@ -280,7 +286,3 @@ class SparseJaccardComputer:
             blocks.append(current_block)
 
         return blocks
-
-    def get_function_line_count(self, eid: str) -> int:
-        """Get the number of tokenized lines for a function."""
-        return len(self._func_lines.get(eid, []))

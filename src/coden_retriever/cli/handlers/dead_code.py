@@ -110,7 +110,7 @@ def handle_dead_code_command(
         token_limit=args.tokens,
     )
 
-    daemon_result = try_daemon_dead_code(params, host=config.daemon.host, port=config.daemon.port)
+    daemon_result = try_daemon_dead_code(params, address=config.daemon.address)
     if daemon_result is not None:
         return _process_dead_code_result(daemon_result, formatter, args, start_time, "Daemon")
 

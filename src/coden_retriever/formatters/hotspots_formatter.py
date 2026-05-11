@@ -1,7 +1,8 @@
 """Hotspot output formatting for CLI display."""
 import json
 
-from .cli_metrics import FALSE_POSITIVE_WARNING
+from ..constants import FORMATTER_WIDTH
+from .cli_metrics import FALSE_POSITIVE_WARNING, format_result_limit_line
 from .terminal_style import TerminalStyle, get_terminal_style
 
 # Table separator width matching the column layout
@@ -10,8 +11,6 @@ _TABLE_SEPARATOR_WIDTH = 110
 _ENTITY_NAME_MAX_LEN = 35
 # Characters to keep from end of truncated name (after "...")
 _ENTITY_NAME_TAIL_LEN = 32
-# Section separator width for parameter headers and stats
-_SECTION_SEPARATOR_WIDTH = 80
 # Tier inversion base for risk score coloring (11 - tier_num)
 _TIER_INVERSION_BASE = 11
 
@@ -23,21 +22,16 @@ def format_hotspots_parameters_header(
 ) -> str:
     """Format parameter summary header for hotspots analysis."""
     lines = []
-    lines.append("=" * _SECTION_SEPARATOR_WIDTH)
+    lines.append("=" * FORMATTER_WIDTH)
     lines.append("HOTSPOTS ANALYSIS PARAMETERS")
-    lines.append("-" * _SECTION_SEPARATOR_WIDTH)
+    lines.append("-" * FORMATTER_WIDTH)
     lines.append("Analysis: Coupling Hotspots (Fan-in/Fan-out + Cyclomatic Complexity)")
-    lines.append("=" * _SECTION_SEPARATOR_WIDTH)
+    lines.append("=" * FORMATTER_WIDTH)
     lines.append(f"Risk Threshold: >= {risk_threshold}")
     lines.append(f"Exclude Tests: {exclude_tests}")
-
-    if limit is None:
-        lines.append("[!] Result Limit: ALL (may be slow for large repos)")
-    else:
-        lines.append(f"[!] Result Limit: TOP {limit} -- more results may exist (use -n -1 for all)")
-
+    lines.append(format_result_limit_line(limit))
     lines.append(FALSE_POSITIVE_WARNING)
-    lines.append("=" * _SECTION_SEPARATOR_WIDTH)
+    lines.append("=" * FORMATTER_WIDTH)
     return "\n".join(lines)
 
 
@@ -123,23 +117,23 @@ def format_hotspots_stats(summary: dict) -> str:
 
     lines = [
         "",
-        "=" * _SECTION_SEPARATOR_WIDTH,
+        "=" * FORMATTER_WIDTH,
         f"Hotspots Analysis | {total:,} functions analyzed | {above_threshold:,} above threshold",
-        "-" * _SECTION_SEPARATOR_WIDTH,
+        "-" * FORMATTER_WIDTH,
         f"Risk: avg {summary.get('average_risk_score', 0):.1f} / max {summary.get('max_risk_score', 0):.1f}",
         f"Coupling: avg {summary.get('average_coupling_score', 0):.1f} / max {summary.get('highest_coupling_score', 0)}",
         f"Complexity: avg {summary.get('average_complexity', 1):.1f} / max {summary.get('max_complexity', 1)}",
-        "-" * _SECTION_SEPARATOR_WIDTH,
+        "-" * FORMATTER_WIDTH,
         f"Categories: Danger Zone: {danger} | Traffic Jam: {traffic} | Local Mess: {local} | Low Risk: {low}",
-        "-" * _SECTION_SEPARATOR_WIDTH,
+        "-" * FORMATTER_WIDTH,
         "Legend: Danger Zone = high coupling + high complexity (hardest to maintain)",
         "        Traffic Jam = high coupling, low complexity (architectural bottleneck)",
         "        Local Mess = low coupling, high complexity (hard to test/understand)",
     ]
 
     if summary.get("token_budget_exceeded"):
-        lines.append("-" * _SECTION_SEPARATOR_WIDTH)
+        lines.append("-" * FORMATTER_WIDTH)
         lines.append("Note: Results truncated due to token budget")
 
-    lines.append("=" * _SECTION_SEPARATOR_WIDTH)
+    lines.append("=" * FORMATTER_WIDTH)
     return "\n".join(lines)

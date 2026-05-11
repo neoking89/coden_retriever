@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "coden-retriever"
-version = "1.4.0"
+version = "1.0.0"
 description = "Retriever for finding most relevant code"
 readme = "README.md"
 requires-python = ">=3.10, <3.13"
@@ -22,55 +22,55 @@ dependencies = [
     "watchdog>=4.0.0",
     "scikit-learn>=1.3.0",
     "numpy",
+    "pathspec>=0.10.0",
+    "onnxruntime>=1.16.0",
+    "scipy>=1.10.0",
+    "fastmcp>=3.0",
+    "pydantic-ai-slim[mcp,openai]>=0.1.0",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
-# Model files are distributed separately via the 'semantic' extra
-# Users install: pip install 'coden-retriever[semantic]' to get embedding support
+# Bundled MiniLM ONNX model files for semantic embeddings
 [tool.setuptools.package-data]
-coden_retriever = []
+coden_retriever = [
+    "models/embeddings/minilm_onnx/*.onnx",
+    "models/embeddings/minilm_onnx/*.json",
+]
 
 [project.optional-dependencies]
-# Semantic search with Model2Vec embeddings
-semantic = [
-    "model2vec>=0.1.0",
-    "scipy>=1.10.0",
-]
-
-# MCP server mode
-mcp = [
-    "fastmcp>=0.1.0",
-]
-
-# Interactive agent with pydantic-ai
-agent = [
-    "pydantic-ai-slim[mcp,openai]>=0.1.0",
-    "fastmcp>=0.1.0",
-]
-
-# Install all optional features
-all = [
-    "coden-retriever[semantic,mcp,agent]",
-]
-
-# Development dependencies
 dev = [
     "pytest>=9.0.0",
     "pytest-asyncio>=1.3.0",
+    "pytest-timeout>=2.3.0",
     "ruff>=0.1.0",
     "mypy>=1.10.0",
     "httpx>=0.27.0",
     "debugpy>=1.8.0",
+    "hypothesis>=6.100.0",
 ]
-
-# Dynamic tools: pip install coden-retriever[dynamic-tools]
-# Then set CODEN_RETRIEVER_ENABLE_DYNAMIC_TOOLS=1
-dynamic-tools = []
 
 [project.scripts]
 coden = "coden_retriever.__main__:main"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# 120s per-test cap so a hung subprocess (DAP / MCP / daemon) fails the case
+# instead of stalling the whole run. `thread` method works on Windows.
+timeout = 120
+timeout_method = "thread"
+addopts = "-v -ra --durations=20 --tb=short --strict-markers"
+markers = [
+    "slow: test exceeds 60 s wall-clock; auto-tracked in tests/.testlog/slow_tests.txt",
+    "integration: spawns real DAP/MCP subprocesses; gated on toolchain presence",
+    "stress: CPU-heavy parser/tree-sitter stress; deterministic but slow",
+]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/debug_test_scripts/bug_scope.py" = ["F823", "F841"]
+"tests/fixtures/sensitive_values/sample_python.py" = ["F841"]
+"tests/fixtures/multilang_library/library.py" = ["E741"]

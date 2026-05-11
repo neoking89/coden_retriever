@@ -15,6 +15,13 @@ from ..constants import (
     SENSITIVE_VALUE_MAX_STRING_LENGTH,
     SENSITIVE_VALUE_MIN_STRING_LENGTH,
 )
+from ..language.definitions import language_for_path
+from ..language.literal_types import STRING_LITERAL_TYPES
+from ..language.parser_utils import (
+    get_or_create_parser,
+    prepare_entity_source_for_reparse,
+)
+from ..utils.source_walker import iter_source_files
 
 if TYPE_CHECKING:
     from ..language.loader import LanguageLoader
@@ -24,24 +31,6 @@ logger = logging.getLogger(__name__)
 
 # Type alias for file tracking info: (language, covered_lines)
 FileInfo = tuple[str, set[int]]
-
-# AST node types for string literals per language family
-STRING_LITERAL_TYPES: dict[str, frozenset[str]] = {
-    "python": frozenset({"string"}),
-    "javascript": frozenset({"string", "template_string"}),
-    "typescript": frozenset({"string", "template_string"}),
-    "go": frozenset({"interpreted_string_literal", "raw_string_literal"}),
-    "rust": frozenset({"string_literal"}),
-    "java": frozenset({"string_literal"}),
-    "c": frozenset({"string_literal"}),
-    "cpp": frozenset({"string_literal"}),
-    "c_sharp": frozenset({"string_literal"}),
-    "ruby": frozenset({"string"}),
-    "kotlin": frozenset({"string_literal"}),
-    "php": frozenset({"string", "encapsed_string"}),
-    "swift": frozenset({"string_literal"}),
-    "scala": frozenset({"string"}),
-}
 
 # AST node types for assignment/variable context
 ASSIGNMENT_TYPES: frozenset[str] = frozenset({
@@ -76,37 +65,6 @@ class StringLiteral:
     value: str
     line: int
     variable_name: str | None
-
-
-def _get_or_create_parser(
-    lang_name: str,
-    loader: "LanguageLoader",
-    cache: dict[str, Any],
-) -> Any | None:
-    """Reuse the parser cache pattern from tramp_data/param_extractor.py."""
-    if lang_name in cache:
-        return cache[lang_name]
-    language = loader.load(lang_name)
-    if language is None:
-        cache[lang_name] = None
-        return None
-    try:
-        from tree_sitter import Parser
-    except ImportError:
-        cache[lang_name] = None
-        return None
-    try:
-        try:
-            parser = Parser(language)
-        except TypeError:
-            parser = Parser()
-            parser.set_language(language)  # type: ignore[attr-defined]
-        cache[lang_name] = parser
-        return parser
-    except Exception as e:
-        logger.debug(f"Failed to create parser for {lang_name}: {e}")
-        cache[lang_name] = None
-        return None
 
 
 def _strip_quotes(raw: str) -> str:
@@ -219,12 +177,13 @@ def _parse_source_and_collect_nodes(
     Returns:
         List of (node, value) tuples for string literals found.
     """
-    parser = _get_or_create_parser(language, loader, parser_cache)
+    parser = get_or_create_parser(language, loader, parser_cache)
     if parser is None:
         return []
 
     try:
-        tree = parser.parse(source.encode("utf-8"))
+        prepared = prepare_entity_source_for_reparse(source, language)
+        tree = parser.parse(prepared.encode("utf-8"))
     except Exception as e:
         logger.debug(f"Failed to parse {context_name}: {e}")
         return []
@@ -309,11 +268,16 @@ def _extract_module_level_strings(
 
 def extract_all_strings(
     entities: dict[str, "CodeEntity"],
+    root_dir: str | Path | None = None,
 ) -> dict[str, list[StringLiteral]]:
     """Extract string literals from all entities and module-level code.
 
     Returns mapping of entity node_id -> list of StringLiteral.
     Module-level strings use a synthetic key: "module::<file_path>".
+
+    When ``root_dir`` is given, also scans source files that produced no
+    entities (e.g. modules containing only top-level assignments) so their
+    module-level string literals are not silently skipped.
     """
     from ..language.loader import LanguageLoader
 
@@ -334,6 +298,18 @@ def extract_all_strings(
             file_info[fp] = (entity.language, set())
         for line in range(entity.line_start, entity.line_end + 1):
             file_info[fp][1].add(line)
+
+    # Phase 1b: Include source files that produced zero entities so their
+    # module-level literals (top-level assignments, constants) still scan.
+    if root_dir is not None:
+        for path, _stat in iter_source_files(Path(root_dir)):
+            fp_str = str(path)
+            if fp_str in file_info:
+                continue
+            language = language_for_path(path)
+            if language is None:
+                continue
+            file_info[fp_str] = (language, set())
 
     # Phase 2: Extract module-level strings from uncovered lines
     for fp, (language, covered_lines) in file_info.items():

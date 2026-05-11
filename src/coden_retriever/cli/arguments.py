@@ -10,7 +10,7 @@ def create_serve_parser(config) -> argparse.ArgumentParser:
     """Create parser for 'serve' subcommand."""
     parser = argparse.ArgumentParser(
         prog="coden serve",
-        description="Run as MCP server. Requires [mcp] extra: pip install 'coden-retriever[mcp]'",
+        description="Run as MCP server.",
         formatter_class=DefaultValueHelpFormatter,
     )
     parser.add_argument("--transport", choices=["stdio", "http", "sse", "streamable-http"],
@@ -27,7 +27,7 @@ def create_agent_parser(config) -> argparse.ArgumentParser:
     """Create parser for 'agent' subcommand."""
     parser = argparse.ArgumentParser(
         prog="coden agent",
-        description="Interactive coding agent with ReAct reasoning. Requires [agent] extra: pip install 'coden-retriever[agent]'",
+        description="Interactive coding agent with ReAct reasoning.",
         formatter_class=DefaultValueHelpFormatter,
     )
     parser.add_argument("root", nargs="?", default=".",
@@ -64,6 +64,8 @@ def _create_daemon_settings_parser() -> argparse.ArgumentParser:
                         help="Auto-shutdown after idle (e.g., 30m, 1h)")
     parser.add_argument("--no-watch", action="store_true",
                         help="Disable automatic file watching for index updates")
+    parser.add_argument("--daemon-timeout", type=float, default=config.daemon.daemon_timeout,
+                        help="Socket timeout for client connections (seconds)")
     return parser
 
 

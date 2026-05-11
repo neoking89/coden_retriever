@@ -7,15 +7,14 @@ and git_history_context for understanding recent changes via git blame.
 import asyncio
 import logging
 import os
-import re
-from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
 
 from pydantic import Field
 
 from .file_edit import mark_file_as_read
-from ..git.commands import run_git_command
+from ..git.blame_port import SubprocessGitBlameSource
+from ..git.history_context import GitHistoryContextService, HistoryContextRequest
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +35,6 @@ EXTENSION_TO_LANGUAGE = {
     ".hpp": "cpp",
     ".cs": "csharp",
     ".php": "php",
-    ".swift": "swift",
     ".kt": "kotlin",
     ".scala": "scala",
     ".sh": "bash",
@@ -48,36 +46,6 @@ EXTENSION_TO_LANGUAGE = {
     ".md": "markdown",
     ".xml": "xml",
 }
-
-
-def _parse_date_to_timestamp(date_str: str) -> int | None:
-    """Parse a date string into a Unix timestamp.
-
-    Supports common formats like:
-    - YYYY-MM-DD
-    - YYYY-MM-DD HH:MM:SS
-    - ISO 8601 format
-
-    Returns None if parsing fails.
-    """
-    date_formats = [
-        "%Y-%m-%d",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y/%m/%d",
-        "%d-%m-%Y",
-        "%m/%d/%Y",
-    ]
-
-    for fmt in date_formats:
-        try:
-            dt = datetime.strptime(date_str, fmt)
-            return int(dt.timestamp())
-        except ValueError:
-            continue
-
-    return None
 
 
 async def read_source_range(
@@ -473,309 +441,15 @@ async def git_history_context(
     Optionally includes diff, per-line blame, and rename history.
     When filters are applied, only matching commits are included.
     """
-    # Validate file exists
-    if not os.path.isfile(file_path):
-        return {"error": f"File not found: {file_path}"}
-
-    # Ensure start <= end
-    if start_line > end_line:
-        start_line, end_line = end_line, start_line
-
-    # Get the directory containing the file for git operations
-    file_dir = str(Path(file_path).parent)
-
-    # First, check if we're in a git repository
-    returncode, stdout_check, stderr = await run_git_command(["rev-parse", "--git-dir"], file_dir)
-    if returncode != 0:
-        error_detail = stderr.strip() if stderr.strip() else f"git rev-parse failed in {file_dir}"
-        return {"error": f"Not a git repository: {error_detail}"}
-
-    # Run git blame with porcelain format for the line range
-    blame_args = ["blame", "-L", f"{start_line},{end_line}", "--porcelain"]
-    if follow_renames:
-        # -C -C -C: detect copies/renames across files, even in different commits
-        blame_args.extend(["-C", "-C", "-C"])
-    blame_args.append(file_path)
-    returncode, stdout, stderr = await run_git_command(blame_args, file_dir)
-
-    if returncode != 0:
-        if "no such path" in stderr.lower():
-            return {"error": f"File not tracked by git: {file_path}"}
-        return {"error": f"git blame failed: {stderr.strip()}"}
-
-    if not stdout.strip():
-        return {"error": "No blame information available for the specified lines"}
-
-    # Parse porcelain output to extract commit info and per-line blame
-    # Porcelain format: each block starts with commit hash, followed by metadata
-    commits: dict[str, dict[str, Any]] = {}
-    current_commit = ""
-    line_blame: list[dict[str, Any]] = []
-    current_line_num = start_line
-
-    for line in stdout.splitlines():
-        # Line starting with 40-char hash indicates new commit block
-        if re.match(r'^[0-9a-f]{40}', line):
-            parts = line.split()
-            current_commit = parts[0]
-            if current_commit not in commits:
-                commits[current_commit] = {}
-            # Track which line this blame entry is for
-            if include_line_blame:
-                line_blame.append({
-                    "line": current_line_num,
-                    "hash": current_commit[:8],
-                })
-                current_line_num += 1
-        elif current_commit:
-            # Parse metadata lines
-            if line.startswith("author "):
-                commits[current_commit]["author"] = line[7:]
-                if include_line_blame and line_blame:
-                    line_blame[-1]["author"] = line[7:]
-            elif line.startswith("author-mail "):
-                commits[current_commit]["author_email"] = line[12:].strip("<>")
-            elif line.startswith("author-time "):
-                commits[current_commit]["author_time"] = line[12:]
-                if include_line_blame and line_blame:
-                    try:
-                        ts = int(line[12:])
-                        line_blame[-1]["date"] = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
-                    except (ValueError, OSError):
-                        pass
-            elif line.startswith("summary "):
-                commits[current_commit]["summary"] = line[8:]
-
-    if not commits:
-        return {"error": "Could not parse git blame output"}
-
-    # Apply filters to commits
-    filtered_commits: dict[str, dict[str, Any]] = {}
-    for commit_hash, commit_info in commits.items():
-        # Author filter: check if author name or email contains the filter string
-        if author:
-            commit_author = commit_info.get("author", "").lower()
-            commit_email = commit_info.get("author_email", "").lower()
-            author_lower = author.lower()
-            if author_lower not in commit_author and author_lower not in commit_email:
-                continue
-
-        # Date filters: check commit timestamp
-        try:
-            commit_ts = int(commit_info.get("author_time", "0"))
-        except (ValueError, TypeError):
-            commit_ts = 0
-
-        if since and commit_ts > 0:
-            # Parse 'since' date - try common formats
-            since_ts = _parse_date_to_timestamp(since)
-            if since_ts is not None and commit_ts < since_ts:
-                continue
-
-        if until and commit_ts > 0:
-            # Parse 'until' date - try common formats
-            until_ts = _parse_date_to_timestamp(until)
-            if until_ts is not None and commit_ts > until_ts:
-                continue
-
-        filtered_commits[commit_hash] = commit_info
-
-    # If filters removed all commits, report that
-    if not filtered_commits and (author or since or until):
-        filter_desc = []
-        if author:
-            filter_desc.append(f"author='{author}'")
-        if since:
-            filter_desc.append(f"since='{since}'")
-        if until:
-            filter_desc.append(f"until='{until}'")
-        return {
-            "message": f"No commits match the specified filters: {', '.join(filter_desc)}",
-            "total_commits_before_filter": len(commits),
-        }
-
-    # Use filtered commits if filters were applied, otherwise use all commits
-    commits = filtered_commits if (author or since or until) else commits
-
-    # Sort commits by time (newest first)
-    sorted_commits = sorted(
-        commits.items(),
-        key=lambda x: int(x[1].get("author_time", "0")),
-        reverse=True
-    )
-
-    # Find the most recent commit
-    most_recent_hash, most_recent = sorted_commits[0]
-
-    # Find the oldest (first) commit for "when introduced"
-    oldest_hash, oldest = sorted_commits[-1]
-
-    # Get the full commit message for the most recent commit
-    show_args = ["show", "-s", "--format=%B", most_recent_hash]
-    returncode, commit_msg, _ = await run_git_command(show_args, file_dir)
-
-    if returncode == 0:
-        commit_message = commit_msg.strip()
-    else:
-        commit_message = most_recent.get("summary", "")
-
-    # Format dates from Unix timestamp
-    def format_timestamp(ts_str: str) -> str:
-        try:
-            timestamp = int(ts_str)
-            return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S")
-        except (ValueError, OSError):
-            return "unknown"
-
-    date_str = format_timestamp(most_recent.get("author_time", "0"))
-
-    # Build result
-    author = most_recent.get("author", "Unknown")
-    short_hash = most_recent_hash[:8]
-
-    summary = f"Lines {start_line}-{end_line} last modified by {author} in commit {short_hash}: {most_recent.get('summary', 'No message')}"
-
-    result: dict[str, Any] = {
-        "summary": summary,
-        "most_recent": {
-            "commit_hash": most_recent_hash,
-            "short_hash": short_hash,
-            "author": author,
-            "author_email": most_recent.get("author_email", ""),
-            "date": date_str,
-            "commit_message": commit_message,
-        },
-        "commits_in_range": len(commits),
-        "all_commits": [
-            {
-                "hash": h[:8],
-                "author": info.get("author", "Unknown"),
-                "summary": info.get("summary", ""),
-                "date": format_timestamp(info.get("author_time", "0")),
-            }
-            for h, info in sorted_commits
-        ],
-        # Keep legacy fields for backwards compatibility
-        "commit_hash": most_recent_hash,
-        "short_hash": short_hash,
-        "author": author,
-        "author_email": most_recent.get("author_email", ""),
-        "date": date_str,
-        "commit_message": commit_message,
-    }
-
-    # Add "first introduced" info if different from most recent
-    if oldest_hash != most_recent_hash:
-        result["first_introduced"] = {
-            "commit_hash": oldest_hash,
-            "short_hash": oldest_hash[:8],
-            "author": oldest.get("author", "Unknown"),
-            "date": format_timestamp(oldest.get("author_time", "0")),
-            "summary": oldest.get("summary", ""),
-        }
-
-    # Add per-line blame if requested
-    if include_line_blame and line_blame:
-        # Enrich line blame entries with author info from commits dict
-        for entry in line_blame:
-            full_hash = None
-            for h in commits:
-                if h.startswith(entry["hash"]):
-                    full_hash = h
-                    break
-            if full_hash and full_hash in commits:
-                commit_info = commits[full_hash]
-                if "author" not in entry and "author" in commit_info:
-                    entry["author"] = commit_info["author"]
-                if "date" not in entry and "author_time" in commit_info:
-                    try:
-                        ts = int(commit_info["author_time"])
-                        entry["date"] = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
-                    except (ValueError, OSError):
-                        pass
-        result["line_blame"] = line_blame
-
-    # Add diff if requested
-    if include_diff:
-        # Get the diff for the most recent commit affecting this file
-        diff_args = [
-            "show", most_recent_hash,
-            "--format=",  # No commit message, just diff
-            "-p",  # Patch format
-            "--",
-            file_path
-        ]
-        returncode, diff_output, _ = await run_git_command(diff_args, file_dir)
-
-        if returncode == 0 and diff_output.strip():
-            # Extract just the relevant lines from the diff
-            # Filter to show only hunks that touch our line range
-            filtered_diff = _filter_diff_to_range(diff_output, start_line, end_line)
-            result["diff"] = filtered_diff if filtered_diff else diff_output.strip()
-
-    # Add rename history if requested
-    if follow_renames:
-        # Get file rename history using git log --follow
-        log_args = [
-            "log", "--follow", "--name-status", "--format=%H",
-            "--diff-filter=R",  # Only show renames
-            "--", file_path
-        ]
-        returncode, log_output, _ = await run_git_command(log_args, file_dir)
-
-        if returncode == 0 and log_output.strip():
-            rename_history: list[dict[str, str]] = []
-            lines = log_output.strip().splitlines()
-            current_hash = ""
-
-            for line in lines:
-                if re.match(r'^[0-9a-f]{40}$', line):
-                    current_hash = line
-                elif line.startswith("R") and current_hash:
-                    # Format: R100\told_name\tnew_name or R\told_name\tnew_name
-                    parts = line.split("\t")
-                    if len(parts) >= 3:
-                        old_name = parts[1]
-                        new_name = parts[2]
-                        rename_history.append({
-                            "commit": current_hash[:8],
-                            "old_name": old_name,
-                            "new_name": new_name,
-                        })
-
-            if rename_history:
-                result["rename_history"] = rename_history
-                result["note"] = f"File was renamed {len(rename_history)} time(s)"
-
-    return result
-
-
-def _filter_diff_to_range(diff_output: str, start_line: int, end_line: int) -> str:
-    """Filter a diff to only include hunks that affect the specified line range."""
-    lines = diff_output.splitlines()
-    result_lines: list[str] = []
-    in_relevant_hunk = False
-    hunk_header_pattern = re.compile(r'^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@')
-
-    for line in lines:
-        # Check if this is a hunk header
-        match = hunk_header_pattern.match(line)
-        if match:
-            hunk_start = int(match.group(1))
-            hunk_len = int(match.group(2)) if match.group(2) else 1
-            hunk_end = hunk_start + hunk_len - 1
-
-            # Check if this hunk overlaps with our range
-            in_relevant_hunk = (
-                (hunk_start <= end_line and hunk_end >= start_line)
-            )
-            if in_relevant_hunk:
-                result_lines.append(line)
-        elif in_relevant_hunk:
-            result_lines.append(line)
-        elif line.startswith('diff --git') or line.startswith('index ') or line.startswith('--- ') or line.startswith('+++ '):
-            # Always include file header lines
-            if not result_lines or not result_lines[-1].startswith('diff'):
-                result_lines.append(line)
-
-    return "\n".join(result_lines)
+    service = GitHistoryContextService(SubprocessGitBlameSource())
+    return await service.run(HistoryContextRequest(
+        file_path=file_path,
+        start_line=start_line,
+        end_line=end_line,
+        include_diff=include_diff,
+        include_line_blame=include_line_blame,
+        follow_renames=follow_renames,
+        author=author,
+        since=since,
+        until=until,
+    ))

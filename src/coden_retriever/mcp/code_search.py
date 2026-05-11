@@ -6,47 +6,81 @@ Uses daemon for fast searches when available, with fallback to direct search.
 """
 import asyncio
 import logging
-import os
+import re
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
 from ..cache import CacheManager
-from ..config import OutputFormat
+from ..constants import MAX_TOKEN_LIMIT, MIN_TOKEN_LIMIT
+from ._defaults import RESOLVED_DEFAULT_TOKEN_BUDGET
+from .validation import validate_root_directory
+from ..config import MapMode, OutputFormat
 from ..daemon.client import try_daemon_search as _daemon_search, try_daemon_trace_dependency as _daemon_trace_dependency
 from ..daemon.protocol import SearchParams, TraceDependencyParams
 from ..formatters import get_formatter
 from ..formatters.base import OutputFormatter
 from ..search import SearchEngine
+from ..search.engine import strategy_for
+from ..semantic_config import SemanticConfig
 from .git_analysis import code_evolution, find_hotspots
 from .inspection import git_history_context, read_source_range, read_source_ranges
 from .stacktrace import debug_stacktrace
 
 logger = logging.getLogger(__name__)
 
+# Strips ANSI SGR sequences and OSC hyperlinks from formatter output.
+# The tree/context-map formatters embed terminal colors and clickable
+# vscode:// links that are useful in the CLI but pure noise for an LLM.
+_ANSI_RE = re.compile(r"\x1b(?:\]8;[^\\]*\\|\[[0-9;]*[A-Za-z])")
 
-async def _create_engine(root_directory: str, enable_semantic: bool = False) -> SearchEngine:
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape codes from text before it enters the LLM context."""
+    return _ANSI_RE.sub("", text)
+
+
+async def _create_engine(
+    root_directory: str,
+    semantic: SemanticConfig = SemanticConfig(),
+) -> SearchEngine:
     """Create a SearchEngine using cached indices when possible.
 
     Uses CacheManager for fast startup when codebase hasn't changed.
 
     Args:
         root_directory: Absolute path to the root directory.
-        enable_semantic: Whether to enable semantic search.
+        semantic: Semantic search configuration. None means disabled.
 
     Returns:
         SearchEngine instance for the project.
     """
     def _create_sync() -> SearchEngine:
-        cache = CacheManager(
-            Path(root_directory),
-            enable_semantic=enable_semantic
-        )
+        cache = CacheManager(Path(root_directory), semantic=semantic)
         cached_indices = cache.load_or_rebuild()
         return SearchEngine.from_cached_indices(cached_indices)
 
     return await asyncio.to_thread(_create_sync)
+
+
+def _build_engine_for_mode(root_directory: str, map_mode: MapMode) -> SearchEngine:
+    """Build a `SearchEngine` for `map_mode` via the strategy registry.
+
+    Picks the cache layout (LITE for SIMPLE, STATIC otherwise) and the
+    strategy's `semantic_override` so the direct MCP fallback gets the same
+    per-mode cache shape and warm-cache speedup as the CLI. The MCP entry
+    points do not currently propagate the caller's `enable_semantic`, so
+    semantic scoring is off here by default.
+    """
+    strategy = strategy_for(map_mode)
+    semantic = strategy.semantic_override or SemanticConfig()
+    cache = CacheManager(
+        Path(root_directory),
+        semantic=semantic,
+        layout=strategy.layout,
+    )
+    return strategy.build_engine(cache, verbose=False)
 
 
 async def _code_search_impl(
@@ -59,8 +93,8 @@ async def _code_search_impl(
     enable_semantic: bool,
 ) -> dict[str, Any]:
     """Internal implementation for code search - shared by keyword and semantic search tools."""
-    if not os.path.isdir(root_directory):
-        return {"error": f"Root directory not found: {root_directory}"}
+    if err := validate_root_directory(root_directory):
+        return err
 
     search_mode = "semantic" if enable_semantic else "keyword"
 
@@ -83,9 +117,9 @@ async def _code_search_impl(
             logger.debug(f"Using daemon for code_search(mode='{search_mode}') (fast path)")
             result_dict = {}
             if show_tree and "directory_tree" in daemon_result:
-                result_dict["directory_tree"] = daemon_result["directory_tree"]
+                result_dict["directory_tree"] = _strip_ansi(daemon_result["directory_tree"])
             result_dict.update({
-                "results": daemon_result.get("output", ""),
+                "results": _strip_ansi(daemon_result.get("output", "")),
                 "count": daemon_result.get("result_count", 0),
                 "total_found": daemon_result.get("total_matched", 0),
                 "stats": daemon_result.get("stats", ""),
@@ -99,7 +133,7 @@ async def _code_search_impl(
 
         # Fallback: Create a fresh engine for each request
         logger.debug(f"Daemon not available, using direct search for code_search(mode='{search_mode}') (fallback)")
-        engine = await _create_engine(root_directory, enable_semantic=enable_semantic)
+        engine = await _create_engine(root_directory, semantic=SemanticConfig(enabled=enable_semantic))
 
         # Run blocking search operations in thread pool for true async
         results = await asyncio.to_thread(
@@ -124,10 +158,10 @@ async def _code_search_impl(
             tree_output = await asyncio.to_thread(
                 engine.generate_directory_tree, included_results
             )
-            result_dict["directory_tree"] = tree_output
+            result_dict["directory_tree"] = _strip_ansi(tree_output)
 
         result_dict.update({
-            "results": output,
+            "results": _strip_ansi(output),
             "count": len(included_results),
             "total_found": len(results),
             "stats": str(engine.get_stats()),
@@ -166,7 +200,7 @@ async def code_search(
         Field(
             description=(
                 "'keyword': BM25 lexical matching for exact code terminology; "
-                "'semantic': Model2Vec embeddings for natural language questions"
+                "'semantic': MiniLM ONNX embeddings for natural language questions"
             )
         )
     ] = "keyword",
@@ -174,10 +208,10 @@ async def code_search(
         int,
         Field(
             description="Soft limit on the return size in tokens",
-            ge=100,
-            le=100000
+            ge=MIN_TOKEN_LIMIT,
+            le=MAX_TOKEN_LIMIT
         )
-    ] = 4000,
+    ] = RESOLVED_DEFAULT_TOKEN_BUDGET,
     output_format: Annotated[
         Literal["tree", "xml", "markdown", "json"],
         Field(
@@ -201,7 +235,7 @@ async def code_search(
 
     MODES:
     - 'keyword': BM25 lexical matching - finds exact word matches, fast and precise
-    - 'semantic': Model2Vec embeddings - understands meaning, finds conceptually similar code
+    - 'semantic': MiniLM ONNX embeddings - understands meaning, finds conceptually similar code
 
     WHEN TO USE:
     - mode='keyword': when you know exact terminology (e.g., 'password reset', 'UserFactory')
@@ -236,10 +270,10 @@ async def code_map(
         int,
         Field(
             description="Maximum tokens for the map output",
-            ge=100,
-            le=100000
+            ge=MIN_TOKEN_LIMIT,
+            le=MAX_TOKEN_LIMIT
         )
-    ] = 4000,
+    ] = RESOLVED_DEFAULT_TOKEN_BUDGET,
     output_format: Annotated[
         Literal["tree", "xml", "markdown", "json"],
         Field(
@@ -258,6 +292,19 @@ async def code_map(
             description="Include the recursive directory tree structure"
         )
     ] = True,
+    map_mode: Annotated[
+        MapMode,
+        Field(
+            description=(
+                "Ranking strategy. 'static' (default): combined-signal score "
+                "(PageRank + Betweenness + BM25 + ...). 'simple': rank by "
+                "per-file git commit count with line-count fallback when no git "
+                "history is present. 'simple' empirically beats 'static' by "
+                "+0.260 mean P@10 on a 5-repo click-GT fixture. Output is "
+                "structurally identical between modes."
+            )
+        )
+    ] = MapMode.STATIC,
 ) -> dict[str, Any]:
     """Generates a high-level architectural overview of the entire repository. Use this FIRST when exploring a new codebase.
 
@@ -270,8 +317,8 @@ async def code_map(
     - Do NOT use to find specific functions or lines of code (use code_search or find_identifier)
     - Do NOT use if you only need to list files in a directory
     """
-    if not os.path.isdir(root_directory):
-        return {"error": f"Root directory not found: {root_directory}"}
+    if err := validate_root_directory(root_directory):
+        return err
 
     try:
         # Try daemon first for fast sub-200ms response
@@ -281,9 +328,10 @@ async def code_map(
             tokens=token_limit,
             show_deps=show_dependencies,
             output_format=output_format,
-            map_mode=True,
+            show_map=True,
             dir_tree=show_tree,
             stats=True,
+            map_mode=map_mode.value,
         )
         daemon_result = await asyncio.to_thread(_daemon_search, params, auto_start=False)
 
@@ -292,9 +340,9 @@ async def code_map(
             logger.debug("Using daemon for code_map (fast path)")
             result_dict = {}
             if show_tree and "directory_tree" in daemon_result:
-                result_dict["directory_tree"] = daemon_result["directory_tree"]
+                result_dict["directory_tree"] = _strip_ansi(daemon_result["directory_tree"])
             result_dict.update({
-                "map": daemon_result.get("output", ""),
+                "map": _strip_ansi(daemon_result.get("output", "")),
                 "stats": daemon_result.get("stats", ""),
                 "search_time_ms": daemon_result.get("search_time_ms", 0),
                 "source": "daemon",
@@ -304,9 +352,14 @@ async def code_map(
                 result_dict["warning"] = daemon_result["warning"]
             return result_dict
 
-        # Fallback: Create a fresh engine for each request
+        # Fallback: Create a fresh engine for each request via the strategy
+        # matching `map_mode`. SIMPLE resolves the lite cache (or full lite
+        # rebuild) via the same path the CLI uses, skipping the heavy
+        # centrality build; STATIC builds the full graph.
         logger.debug("Daemon not available, using direct map (fallback)")
-        engine = await _create_engine(root_directory)
+        engine = await asyncio.to_thread(
+            _build_engine_for_mode, root_directory, map_mode
+        )
 
         # Run blocking search operations in thread pool for true async
         results = await asyncio.to_thread(
@@ -314,7 +367,8 @@ async def code_map(
             query="",
             use_architecture=True,
             include_deps=show_dependencies,
-            limit=500
+            limit=500,
+            map_mode=map_mode,
         )
 
         # Apply token budget
@@ -333,10 +387,10 @@ async def code_map(
             tree_output = await asyncio.to_thread(
                 engine.generate_directory_tree, included_results
             )
-            result_dict["directory_tree"] = tree_output
+            result_dict["directory_tree"] = _strip_ansi(tree_output)
 
         result_dict.update({
-            "map": map_output,
+            "map": _strip_ansi(map_output),
             "stats": str(engine.get_stats()),
             "source": "direct",
         })
@@ -399,8 +453,8 @@ async def find_identifier(
     WHEN NOT TO USE:
     - Do NOT use for general concepts (e.g., 'how does auth work?'). Use code_search for that
     """
-    if not os.path.isdir(root_directory):
-        return {"error": f"Root directory not found: {root_directory}"}
+    if err := validate_root_directory(root_directory):
+        return err
 
     try:
         # Try daemon first for fast sub-200ms response
@@ -419,9 +473,9 @@ async def find_identifier(
             logger.debug("Using daemon for find_identifier (fast path)")
             result_dict = {}
             if show_tree and "directory_tree" in daemon_result:
-                result_dict["directory_tree"] = daemon_result["directory_tree"]
+                result_dict["directory_tree"] = _strip_ansi(daemon_result["directory_tree"])
             result_dict.update({
-                "results": daemon_result.get("output", ""),
+                "results": _strip_ansi(daemon_result.get("output", "")),
                 "count": daemon_result.get("result_count", 0),
                 "search_time_ms": daemon_result.get("search_time_ms", 0),
                 "source": "daemon",
@@ -468,7 +522,7 @@ async def find_identifier(
             tree_output = await asyncio.to_thread(
                 engine.generate_directory_tree, results
             )
-            result_dict["directory_tree"] = tree_output
+            result_dict["directory_tree"] = _strip_ansi(tree_output)
 
         result_dict["results"] = output
         result_dict["source"] = "direct"

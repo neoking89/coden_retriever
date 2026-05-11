@@ -17,15 +17,20 @@ from typing import TYPE_CHECKING, Annotated, Any
 from pydantic import Field
 
 from ..constants import (
+    DEFAULT_CLONE_SEMANTIC_THRESHOLD,
+    DEFAULT_ECHO_COMMENT_THRESHOLD,
+    DEFAULT_HOTSPOT_RISK_THRESHOLD,
+    DEFAULT_PROPAGATION_COST_THRESHOLD,
     FLAG_ANALYSIS_LIMIT,
     FLAG_MIN_LINES,
 )
 from ..daemon.protocol import FlagParams
 from ..graph_utils import compute_coupling_hotspots
-from ..language.definitions import LANGUAGE_MAP
+from ..language.definitions import language_for_path
 
 if TYPE_CHECKING:
     import networkx as nx
+    from ..cache.embedding_cache import EmbeddingCache
     from ..models import CodeEntity
 
 logger = logging.getLogger(__name__)
@@ -45,7 +50,6 @@ COMMENT_SYNTAX: dict[str, str] = {
     "c": "//",
     "php": "//",
     "c_sharp": "//",
-    "swift": "//",
     "kotlin": "//",
     "scala": "//",
     "ruby": "#",
@@ -60,12 +64,6 @@ HASH_COMMENT_LANGUAGES = {"python", "ruby", "shell", "bash"}
 def _get_comment_prefix(language: str) -> str:
     """Get the comment prefix for a language."""
     return COMMENT_SYNTAX.get(language, "//")
-
-
-def _get_language_from_file(file_path: str) -> str | None:
-    """Get language name from file extension."""
-    ext = Path(file_path).suffix.lower()
-    return LANGUAGE_MAP.get(ext)
 
 
 def _generate_hotspot_comment(item: dict, comment_prefix: str) -> list[str]:
@@ -436,6 +434,7 @@ def _collect_clone_items(
     line_threshold: float,
     func_threshold: float,
     exclude_tests: bool,
+    embedding_cache: "EmbeddingCache | None" = None,
 ) -> list[dict]:
     """Collect flaggable items from clone detection."""
     from ..clone import detect_clones_combined, detect_clones_semantic, detect_clones_syntactic
@@ -463,6 +462,7 @@ def _collect_clone_items(
             exclude_tests=exclude_tests,
             min_lines=FLAG_MIN_LINES,
             token_limit=_NO_TOKEN_LIMIT,
+            embedding_cache=embedding_cache,
         )
     else:  # combined (default)
         clone_result = detect_clones_combined(
@@ -475,6 +475,7 @@ def _collect_clone_items(
             exclude_tests=exclude_tests,
             min_lines=FLAG_MIN_LINES,
             token_limit=_NO_TOKEN_LIMIT,
+            embedding_cache=embedding_cache,
         )
 
     for clone in clone_result.get("clones", []):
@@ -517,6 +518,7 @@ def _collect_echo_items(
     echo_threshold: float,
     exclude_tests: bool,
     remove_comments: bool,
+    embedding_cache: "EmbeddingCache | None" = None,
 ) -> list[dict]:
     """Collect flaggable items from echo comment detection."""
     from .echo_comments import compute_echo_comments
@@ -528,6 +530,7 @@ def _collect_echo_items(
         token_limit=_NO_TOKEN_LIMIT,
         include_tests=not exclude_tests,
         include_private=False,
+        embedding_cache=embedding_cache,
     )
 
     for echo in echo_result.get("echo_comments", []):
@@ -622,6 +625,57 @@ def _generate_tramp_data_comment(item: dict, comment_prefix: str) -> list[str]:
         f"{comment_prefix} {CODEN_MARKER} Consider grouping into a config/data object to reduce parameter passing.",
     ]
     return lines
+
+
+def _collect_magic_constant_items(
+    entities: dict[str, "CodeEntity"],
+    min_occurrences: int,
+    min_files: int,
+    exclude_tests: bool,
+) -> list[dict]:
+    """Collect flaggable items from magic constant detection."""
+    from ..magic_constants.detector import detect_magic_constants
+
+    result = detect_magic_constants(
+        entities=entities,
+        min_occurrences=min_occurrences,
+        min_files=min_files,
+        exclude_tests=exclude_tests,
+        limit=FLAG_ANALYSIS_LIMIT,
+    )
+
+    items: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for constant in result.get("magic_constants", []):
+        value = constant.get("value", "?")
+        count = constant.get("count", 0)
+        files = constant.get("files", 0)
+        for occ in constant.get("occurrences", []):
+            key = (value, occ.get("file", ""))
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append({
+                "type": "magic_constant",
+                "file": occ.get("file"),
+                "line": occ.get("line"),
+                "name": occ.get("entity_name"),
+                "value": value,
+                "occurrences": count,
+                "files": files,
+            })
+    return items
+
+
+def _generate_magic_constant_comment(item: dict, comment_prefix: str) -> list[str]:
+    """Generate comment lines for a magic constant flag."""
+    value = item.get("value", "?")
+    occurrences = item.get("occurrences", 0)
+    files = item.get("files", 0)
+    return [
+        f"{comment_prefix} {CODEN_MARKER} MAGIC_CONSTANT: Value {value} appears {occurrences} times across {files} files",
+        f"{comment_prefix} {CODEN_MARKER} Consider extracting to a named constant.",
+    ]
 
 
 def _collect_sensitive_value_items(
@@ -760,6 +814,7 @@ def _apply_flag_to_item(
         "dead_code": _generate_dead_code_comment,
         "tramp_data": _generate_tramp_data_comment,
         "sensitive_value": _generate_sensitive_value_comment,
+        "magic_constant": _generate_magic_constant_comment,
     }
     generator = comment_generators.get(item_type)
     if not generator:
@@ -792,7 +847,7 @@ def _process_flagged_file(
     if not os.path.isfile(file_path):
         return 0, 0
 
-    language = _get_language_from_file(file_path)
+    language = language_for_path(file_path)
     if not language:
         return 0, 0
 
@@ -891,6 +946,7 @@ def _build_flag_summary(items: list[dict]) -> dict[str, int]:
             type_counts.get("sensitive_value", 0)
             + type_counts.get("sensitive_value_replace", 0)
         ),
+        "magic_constants": type_counts.get("magic_constant", 0),
     }
 
 
@@ -899,6 +955,7 @@ def _collect_all_flaggable_items(
     graph: "nx.DiGraph",
     pagerank: dict[str, float],
     params: FlagParams,
+    embedding_cache: "EmbeddingCache | None" = None,
 ) -> list[dict] | dict[str, Any]:
     """Collect flaggable items from all enabled analysis types.
 
@@ -925,10 +982,12 @@ def _collect_all_flaggable_items(
         items.extend(_collect_clone_items(
             entities, params.clone_threshold, params.clone_mode,
             params.line_threshold, params.func_threshold, params.exclude_tests,
+            embedding_cache=embedding_cache,
         ))
     if params.echo_comments:
         items.extend(_collect_echo_items(
             entities, params.echo_threshold, params.exclude_tests, params.remove_comments,
+            embedding_cache=embedding_cache,
         ))
     if params.dead_code:
         items.extend(_collect_dead_code_items(
@@ -944,6 +1003,11 @@ def _collect_all_flaggable_items(
             entities, params.sensitive_threshold, params.exclude_tests, params.replace_value,
             whitelist=params.sensitive_whitelist, root_dir=params.source_dir,
         ))
+    if params.magic_constants:
+        items.extend(_collect_magic_constant_items(
+            entities, params.magic_constant_min_occurrences,
+            params.magic_constant_min_files, params.exclude_tests,
+        ))
 
     return items
 
@@ -953,6 +1017,7 @@ def flag_code(
     graph: "nx.DiGraph",
     pagerank: dict[str, float],
     params: FlagParams,
+    embedding_cache: "EmbeddingCache | None" = None,
 ) -> dict[str, Any]:
     """Flag code objects with [CODEN] comments based on analysis.
 
@@ -961,11 +1026,12 @@ def flag_code(
         graph: Call graph (nx.DiGraph)
         pagerank: PageRank scores for entities
         params: Configuration for which analyses to run and their thresholds
+        embedding_cache: Optional content-addressable embedding cache
 
     Returns:
         Dict with flagged_count, files_modified, items (list of flagged items)
     """
-    result = _collect_all_flaggable_items(entities, graph, pagerank, params)
+    result = _collect_all_flaggable_items(entities, graph, pagerank, params, embedding_cache)
     if isinstance(result, dict):
         return result
 
@@ -1025,7 +1091,7 @@ def flag_clear(
             file_path = os.path.join(root, filename)
 
             # Check if it's a supported source file
-            language = _get_language_from_file(file_path)
+            language = language_for_path(file_path)
             if not language:
                 continue
 
@@ -1091,18 +1157,19 @@ def register_flag_tools(mcp, disabled_tools: set[str] | None = None) -> None:
     disabled = disabled_tools or set()
 
     if "flag_code" not in disabled:
-        @mcp.tool()
+        @mcp.tool(name="flag_code")
         async def flag_code_tool(
             root_directory: Annotated[str, Field(description="Root directory of the codebase to analyze")],
             hotspots: Annotated[bool, Field(default=False, description="Flag coupling hotspots")] = False,
             propagation: Annotated[bool, Field(default=False, description="Flag high propagation cost functions")] = False,
             clones: Annotated[bool, Field(default=False, description="Flag code clones")] = False,
             echo_comments: Annotated[bool, Field(default=False, description="Flag echo comments (redundant comments that restate the code)")] = False,
-            risk_threshold: Annotated[float, Field(default=50.0, description="Min risk score for hotspot flagging (raw score, typically 50-200+)")] = 50.0,
-            propagation_threshold: Annotated[float, Field(default=0.25, description="Min propagation cost for flagging (0-1)")] = 0.25,
-            clone_threshold: Annotated[float, Field(default=0.95, description="Min similarity for clone flagging (0-1)")] = 0.95,
-            echo_threshold: Annotated[float, Field(default=0.85, description="Min similarity for echo comment detection (0-1)")] = 0.85,
+            risk_threshold: Annotated[float, Field(default=DEFAULT_HOTSPOT_RISK_THRESHOLD, description="Min risk score for hotspot flagging (raw score, typically 50-200+)")] = DEFAULT_HOTSPOT_RISK_THRESHOLD,
+            propagation_threshold: Annotated[float, Field(default=DEFAULT_PROPAGATION_COST_THRESHOLD, description="Min propagation cost for flagging (0-1)")] = DEFAULT_PROPAGATION_COST_THRESHOLD,
+            clone_threshold: Annotated[float, Field(default=DEFAULT_CLONE_SEMANTIC_THRESHOLD, description="Min similarity for clone flagging (0-1)")] = DEFAULT_CLONE_SEMANTIC_THRESHOLD,
+            echo_threshold: Annotated[float, Field(default=DEFAULT_ECHO_COMMENT_THRESHOLD, description="Min similarity for echo comment detection (0-1)")] = DEFAULT_ECHO_COMMENT_THRESHOLD,
             remove_comments: Annotated[bool, Field(default=False, description="Remove echo comments directly instead of flagging them")] = False,
+            magic_constants: Annotated[bool, Field(default=False, description="Flag magic constants - repeated literal values across files")] = False,
             dry_run: Annotated[bool, Field(default=True, description="Preview changes without modifying files")] = True,
         ) -> dict[str, Any]:
             """Insert [CODEN] comments in source code based on analysis results.
@@ -1112,6 +1179,7 @@ def register_flag_tools(mcp, disabled_tools: set[str] | None = None) -> None:
             - Propagation cost: Functions with high change propagation risk
             - Code clones: Semantically similar functions
             - Echo comments: Redundant comments that merely restate the code
+            - Magic constants: Repeated literal values across files
 
             The comments use [CODEN] marker for easy identification and removal.
             When remove_comments=True with echo_comments=True, echo comments are
@@ -1123,8 +1191,8 @@ def register_flag_tools(mcp, disabled_tools: set[str] | None = None) -> None:
             from pathlib import Path
             import asyncio
 
-            if not (hotspots or propagation or clones or echo_comments):
-                return {"error": "At least one analysis type (hotspots, propagation, clones, or echo_comments) is required"}
+            if not (hotspots or propagation or clones or echo_comments or magic_constants):
+                return {"error": "At least one analysis type (hotspots, propagation, clones, echo_comments, or magic_constants) is required"}
 
             params = FlagParams(
                 source_dir=root_directory,
@@ -1132,6 +1200,7 @@ def register_flag_tools(mcp, disabled_tools: set[str] | None = None) -> None:
                 propagation=propagation,
                 clones=clones,
                 echo_comments=echo_comments,
+                magic_constants=magic_constants,
                 risk_threshold=risk_threshold,
                 propagation_threshold=propagation_threshold,
                 clone_threshold=clone_threshold,
@@ -1154,14 +1223,14 @@ def register_flag_tools(mcp, disabled_tools: set[str] | None = None) -> None:
                 return flag_code(
                     entities=indices.entities,
                     graph=indices.graph,
-                    pagerank=indices.pagerank,
+                    pagerank=indices.centrality.pagerank,
                     params=params,
                 )
 
             return await asyncio.to_thread(_run_direct)
 
     if "flag_clear" not in disabled:
-        @mcp.tool()
+        @mcp.tool(name="flag_clear")
         async def flag_clear_tool(
             root_directory: Annotated[str, Field(description="Root directory to scan for [CODEN] comments")],
             dry_run: Annotated[bool, Field(default=True, description="Preview changes without modifying files")] = True,

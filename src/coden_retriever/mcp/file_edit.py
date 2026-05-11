@@ -194,7 +194,7 @@ def _find_symbol_in_file(
 
     parser = RepoParser()
     try:
-        entities, _ = parser.parse_file(file_path, source_code)
+        entities, _, _ = parser.parse_file(file_path, source_code)
     except Exception as e:
         logger.warning(f"Tree-sitter parsing failed for {file_path}: {e}")
         return None, []
@@ -568,6 +568,75 @@ async def write_file(
     return await asyncio.to_thread(_write_sync)
 
 
+def _no_blocks_error(diff_content: str) -> dict[str, Any]:
+    """Build the error for a diff payload that contains no SEARCH/SYMBOL blocks."""
+    received = diff_content[:500] + "..." if len(diff_content) > 500 else diff_content
+    return {
+        "error": "No valid SEARCH/REPLACE or SYMBOL/REPLACE blocks found",
+        "hint": "Format must be:\n"
+               "<<<<<<< SEARCH\n[text]\n=======\n[replacement]\n>>>>>>> REPLACE\n"
+               "OR\n"
+               "<<<<<<< SYMBOL\n[symbol_name]\n=======\n[replacement]\n>>>>>>> REPLACE",
+        "received": received,
+    }
+
+
+def _apply_edit_blocks(
+    resolved_blocks: list[tuple[str, str, str]],
+    content: str,
+) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None]:
+    """Validate and apply each block atomically. Returns (new_content, change_log, error_or_none).
+
+    On error, returns the content as last successfully modified and the partial change log.
+    Callers MUST check the error slot before treating the new content as authoritative.
+    """
+    modified = content
+    applied: list[dict[str, Any]] = []
+    for idx, (search_text, replace_text, block_type) in enumerate(resolved_blocks):
+        if search_text not in modified:
+            return modified, applied, _build_no_match_error(
+                search_text, modified.split('\n'), block_type, idx
+            )
+        occurrences = modified.count(search_text)
+        if occurrences > 1:
+            block_label = "SYMBOL" if block_type == "symbol" else "SEARCH"
+            preview = search_text[:200] + "..." if len(search_text) > 200 else search_text
+            return modified, applied, {
+                "error": f"{block_label} block {idx + 1} is ambiguous - found {occurrences} matches",
+                "block_type": block_type,
+                "search_block_preview": preview,
+                "hint": "Expand the block to include more surrounding context "
+                        "to make it unique, or use multiple smaller edits."
+            }
+        match_start = modified.find(search_text)
+        line_number = modified[:match_start].count('\n') + 1
+        modified = modified.replace(search_text, replace_text, 1)
+        applied.append({
+            "block": idx + 1,
+            "block_type": block_type,
+            "line": line_number,
+            "search_preview": (search_text[:50] + "...") if len(search_text) > 50 else search_text,
+            "lines_removed": search_text.count('\n') + 1,
+            "lines_added": replace_text.count('\n') + 1,
+        })
+    return modified, applied, None
+
+
+def _write_with_endings(
+    abs_path: str,
+    normalized_content: str,
+    original_line_ending: str,
+) -> None:
+    """Write `normalized_content` to disk, restoring CRLF if the original used it."""
+    out = (
+        normalized_content.replace('\n', '\r\n')
+        if original_line_ending == '\r\n'
+        else normalized_content
+    )
+    with open(abs_path, 'w', encoding='utf-8', newline='') as f:
+        f.write(out)
+
+
 async def edit_file(
     file_path: Annotated[
         str,
@@ -673,102 +742,46 @@ async def edit_file(
 
     def _edit_sync() -> dict[str, Any]:
         try:
-            # Read in binary mode first to detect line endings accurately
-            # (Python's text mode normalizes line endings, losing CRLF info)
+            # Read raw bytes first so we can detect CRLF vs LF (text-mode read would lose it)
             with open(abs_path, 'rb') as f:
                 raw_content = f.read()
-
-            # Detect original line ending style from raw bytes
             original_line_ending = '\r\n' if b'\r\n' in raw_content else '\n'
+            normalized_content = _normalize_line_endings(raw_content.decode('utf-8'))
 
-            # Decode and normalize for processing
-            file_content = raw_content.decode('utf-8')
-
-            # Normalize for processing
-            normalized_content = _normalize_line_endings(file_content)
-            normalized_diff = _normalize_line_endings(diff_content)
-
-            # Parse edit blocks from diff content
-            all_blocks = _parse_edit_blocks(normalized_diff)
-
+            all_blocks = _parse_edit_blocks(_normalize_line_endings(diff_content))
             if not all_blocks:
-                return {
-                    "error": "No valid SEARCH/REPLACE or SYMBOL/REPLACE blocks found",
-                    "hint": "Format must be:\n"
-                           "<<<<<<< SEARCH\n[text]\n=======\n[replacement]\n>>>>>>> REPLACE\n"
-                           "OR\n"
-                           "<<<<<<< SYMBOL\n[symbol_name]\n=======\n[replacement]\n>>>>>>> REPLACE",
-                    "received": diff_content[:500] + "..." if len(diff_content) > 500 else diff_content
-                }
+                return _no_blocks_error(diff_content)
 
-            # Resolve SYMBOL blocks to their source code using Tree-sitter
             resolved_blocks, resolve_error = _resolve_symbol_blocks(
                 all_blocks, abs_path, normalized_content
             )
             if resolve_error:
                 return resolve_error
 
-            # Validate all blocks before applying any changes (atomic operation)
-            modified_content = normalized_content
-            applied_changes: list[dict[str, Any]] = []
-
-            for idx, (search_text, replace_text, block_type) in enumerate(resolved_blocks):
-                # Check for exact match
-                if search_text not in modified_content:
-                    file_lines = modified_content.split('\n')
-                    return _build_no_match_error(search_text, file_lines, block_type, idx)
-
-                # Check uniqueness - search_text should appear exactly once
-                occurrences = modified_content.count(search_text)
-                if occurrences > 1:
-                    block_label = "SYMBOL" if block_type == "symbol" else "SEARCH"
-                    return {
-                        "error": f"{block_label} block {idx + 1} is ambiguous - found {occurrences} matches",
-                        "block_type": block_type,
-                        "search_block_preview": search_text[:200] + "..." if len(search_text) > 200 else search_text,
-                        "hint": "Expand the block to include more surrounding context "
-                                "to make it unique, or use multiple smaller edits."
-                    }
-
-                # Track the change location for reporting
-                match_start = modified_content.find(search_text)
-                line_number = modified_content[:match_start].count('\n') + 1
-
-                # Apply the replacement (only first occurrence, which should be unique)
-                modified_content = modified_content.replace(search_text, replace_text, 1)
-
-                applied_changes.append({
-                    "block": idx + 1,
-                    "block_type": block_type,
-                    "line": line_number,
-                    "search_preview": (search_text[:50] + "...") if len(search_text) > 50 else search_text,
-                    "lines_removed": search_text.count('\n') + 1,
-                    "lines_added": replace_text.count('\n') + 1,
-                })
+            modified_content, applied_changes, apply_error = _apply_edit_blocks(
+                resolved_blocks, normalized_content
+            )
+            if apply_error:
+                return apply_error
 
             if dry_run:
+                preview = (
+                    modified_content[:1000] + "..."
+                    if len(modified_content) > 1000
+                    else modified_content
+                )
                 return {
                     "status": "dry_run",
                     "message": f"Validation passed - {len(resolved_blocks)} change(s) would be applied",
                     "file_path": abs_path,
                     "changes": applied_changes,
-                    "preview": modified_content[:1000] + "..." if len(modified_content) > 1000 else modified_content,
+                    "preview": preview,
                 }
 
-            # Save current state for undo AFTER validation passes and BEFORE writing
-            # This ensures we don't overwrite undo history for failed edits
+            # Save undo state AFTER validation passes so failed edits don't overwrite history
             _save_for_undo(abs_path, was_new_file=False)
-
-            # Restore original line endings if needed
-            if original_line_ending == '\r\n':
-                modified_content = modified_content.replace('\n', '\r\n')
-
-            # Write the modified content
-            with open(abs_path, 'w', encoding='utf-8', newline='') as f:
-                f.write(modified_content)
-
-            # Update the read cache with new content
-            mark_file_as_read(abs_path, _normalize_line_endings(modified_content))
+            _write_with_endings(abs_path, modified_content, original_line_ending)
+            mark_file_as_read(abs_path, modified_content)
 
             return {
                 "status": "success",

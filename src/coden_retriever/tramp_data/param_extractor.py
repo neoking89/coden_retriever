@@ -9,6 +9,11 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from ..language.parser_utils import (
+    get_or_create_parser,
+    prepare_entity_source_for_reparse,
+)
+
 if TYPE_CHECKING:
     from ..language.loader import LanguageLoader
     from ..models.entities import CodeEntity
@@ -20,6 +25,7 @@ PARAM_LIST_TYPES: frozenset[str] = frozenset({
     "parameters",
     "formal_parameters",
     "parameter_list",
+    "function_value_parameters",  # Kotlin
 })
 
 # Individual AST nodes representing a single parameter
@@ -36,6 +42,9 @@ PARAM_SINGLE_TYPES: frozenset[str] = frozenset({
     "rest_parameter",
     "spread_parameter",
     "keyword_parameter",
+    # PHP-specific param node types
+    "variadic_parameter",
+    "property_promotion_parameter",
 })
 
 # AST node types that represent identifiers within parameters
@@ -45,6 +54,13 @@ PARAM_IDENTIFIER_TYPES: frozenset[str] = frozenset({
     "simple_identifier",
     "name",
     "word",
+})
+
+# Wrapper nodes that hold the parameter identifier as a child (PHP wraps
+# every $var in `variable_name > $ + name`); we descend into them rather
+# than picking up sibling type names like `union_type > named_type > name`.
+PARAM_IDENTIFIER_WRAPPERS: frozenset[str] = frozenset({
+    "variable_name",
 })
 
 # Common parameter names that are noise (language boilerplate, not data coupling)
@@ -82,13 +98,13 @@ def extract_params_from_entity(
     if entity.language in LANGUAGES_WITHOUT_PARAMS:
         return []
 
-    parser = _get_or_create_parser(entity.language, loader, parser_cache)
+    parser = get_or_create_parser(entity.language, loader, parser_cache)
     if parser is None:
         return []
 
     try:
-        source_bytes = entity.source_code.encode("utf-8")
-        tree = parser.parse(source_bytes)
+        prepared = prepare_entity_source_for_reparse(entity.source_code, entity.language)
+        tree = parser.parse(prepared.encode("utf-8"))
     except Exception as e:
         logger.debug(f"Failed to parse entity {entity.name}: {e}")
         return []
@@ -98,59 +114,26 @@ def extract_params_from_entity(
     return [p for p in params if p not in EXCLUDED_PARAM_NAMES]
 
 
-def _get_or_create_parser(
-    lang_name: str,
-    loader: "LanguageLoader",
-    cache: dict[str, Any],
-) -> Any | None:
-    """Get a cached parser or create a new one for the language.
+def _collect_param_identifiers(node: Any, params: list[str]) -> bool:
+    """Recursively walk AST to collect identifier names from the OUTER signature.
 
-    Mirrors RepoParser._get_parser() version-compatible creation.
-    """
-    if lang_name in cache:
-        return cache[lang_name]
-
-    language = loader.load(lang_name)
-    if language is None:
-        cache[lang_name] = None
-        return None
-
-    try:
-        from tree_sitter import Parser
-    except ImportError:
-        cache[lang_name] = None
-        return None
-
-    try:
-        try:
-            parser = Parser(language)
-        except TypeError:
-            parser = Parser()
-            parser.set_language(language)  # type: ignore[attr-defined]
-
-        cache[lang_name] = parser
-        return parser
-    except Exception as e:
-        logger.debug(f"Failed to create parser for {lang_name}: {e}")
-        cache[lang_name] = None
-        return None
-
-
-def _collect_param_identifiers(node: Any, params: list[str]) -> None:
-    """Recursively walk AST to collect identifier names inside parameter nodes.
-
-    Only descends into parameter-related nodes, never into function bodies.
+    Returns True once the first parameter list (or singleton) is processed so
+    the caller stops walking — any later param-list nodes belong to nested
+    closures/lambdas/arrow-funcs in the body and would pollute the result.
+    Empty outer signatures still halt the walk (no params is the right answer).
     """
     if node.type in PARAM_LIST_TYPES:
         _process_param_list(node, params)
-        return
+        return True
 
     if node.type in PARAM_SINGLE_TYPES:
         _extract_first_identifier(node, params)
-        return
+        return True
 
     for child in node.children:
-        _collect_param_identifiers(child, params)
+        if _collect_param_identifiers(child, params):
+            return True
+    return False
 
 
 def _process_param_list(node: Any, params: list[str]) -> None:
@@ -180,6 +163,9 @@ def _extract_first_identifier(node: Any, params: list[str]) -> None:
             params.append(name)
             return
         if child.type in PARAM_SINGLE_TYPES:
+            _extract_first_identifier(child, params)
+            return
+        if child.type in PARAM_IDENTIFIER_WRAPPERS:
             _extract_first_identifier(child, params)
             return
 

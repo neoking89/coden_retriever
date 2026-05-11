@@ -14,17 +14,17 @@ from pathlib import Path
 
 from ..constants import (
     DEFAULT_CLIENT_TIMEOUT,
-    DEFAULT_DAEMON_HOST,
-    DEFAULT_DAEMON_PORT,
     DEFAULT_HEAVY_ANALYSIS_TIMEOUT,
     DEFAULT_DAEMON_TIMEOUT,
 )
+from .address import DaemonAddress
 from .protocol import (
     MESSAGE_DELIMITER,
     CloneDetectionParams,
     DeadCodeParams,
     FlagClearParams,
     FlagParams,
+    MagicConstantParams,
     PropagationCostParams,
     GraphAnalysisParams,
     Request,
@@ -64,12 +64,10 @@ class DaemonClient:
 
     def __init__(
         self,
-        host: str = DEFAULT_DAEMON_HOST,
-        port: int = DEFAULT_DAEMON_PORT,
+        address: DaemonAddress = DaemonAddress(),
         timeout: float = DEFAULT_DAEMON_TIMEOUT,
     ):
-        self.host = host
-        self.port = port
+        self.address = address
         self.timeout = timeout
         self._request_id = 0
 
@@ -87,9 +85,25 @@ class DaemonClient:
         )
 
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(self.timeout)
-            sock.connect((self.host, self.port))
+            # Resolve address family dynamically to support both IPv4 and IPv6
+            addr_infos = socket.getaddrinfo(
+                self.address.host, self.address.port, socket.AF_UNSPEC, socket.SOCK_STREAM
+            )
+            sock = None
+            last_error: socket.error | None = None
+            for family, socktype, proto, _canonname, sockaddr in addr_infos:
+                try:
+                    sock = socket.socket(family, socktype, proto)
+                    sock.settimeout(self.timeout)
+                    sock.connect(sockaddr)
+                    break
+                except socket.error as e:
+                    last_error = e
+                    if sock is not None:
+                        sock.close()
+                    sock = None
+            if sock is None:
+                raise DaemonConnectionError(f"Connection failed: {last_error}")
 
             try:
                 # Send request
@@ -258,12 +272,16 @@ class DaemonClient:
         response = self._send_request("detect_sensitive_values", params.to_dict())
         return self._validate_result(response.result)
 
+    def detect_magic_constants(self, params: MagicConstantParams) -> dict:
+        """Detect magic constants using in-memory indices."""
+        response = self._send_request("detect_magic_constants", params.to_dict())
+        return self._validate_result(response.result)
+
 
 def _try_daemon_request(
     client_method: str,
     params,
-    host: str = DEFAULT_DAEMON_HOST,
-    port: int = DEFAULT_DAEMON_PORT,
+    address: DaemonAddress = DaemonAddress(),
     auto_start: bool = True,
     timeout: float = DEFAULT_CLIENT_TIMEOUT,
 ) -> dict | None:
@@ -279,8 +297,7 @@ def _try_daemon_request(
     Args:
         client_method: Name of the DaemonClient method to call
         params: Parameters to pass to the method
-        host: Daemon host
-        port: Daemon port
+        address: Daemon network endpoint
         auto_start: Auto-start daemon if not running (default: True)
         timeout: Request timeout in seconds (default: DEFAULT_CLIENT_TIMEOUT)
 
@@ -288,16 +305,16 @@ def _try_daemon_request(
         Result dict, or None if daemon unavailable and couldn't start
     """
     if auto_start:
-        if not ensure_daemon_running(host=host, port=port, auto_start=True):
+        if not ensure_daemon_running(address=address, auto_start=True):
             return None
     else:
-        client = DaemonClient(host=host, port=port, timeout=1.0)
+        client = DaemonClient(address=address, timeout=1.0)
         try:
             client.ping()
         except DaemonConnectionError:
             return None
 
-    client = DaemonClient(host=host, port=port, timeout=timeout)
+    client = DaemonClient(address=address, timeout=timeout)
 
     try:
         method = getattr(client, client_method)
@@ -308,8 +325,7 @@ def _try_daemon_request(
 
 def try_daemon_search(
     params: SearchParams,
-    host: str = DEFAULT_DAEMON_HOST,
-    port: int = DEFAULT_DAEMON_PORT,
+    address: DaemonAddress = DaemonAddress(),
     auto_start: bool = True,
 ) -> dict | None:
     """
@@ -317,21 +333,19 @@ def try_daemon_search(
 
     Args:
         params: Search parameters (use SearchParams dataclass)
-        host: Daemon host
-        port: Daemon port
+        address: Daemon network endpoint
         auto_start: Auto-start daemon if not running (default: True)
 
     Returns:
         Search result dict, or None if daemon unavailable and couldn't start
     """
     method = "find" if params.find_identifier else "search"
-    return _try_daemon_request(method, params, host, port, auto_start)
+    return _try_daemon_request(method, params, address, auto_start)
 
 
 def try_daemon_hotspots(
     params: GraphAnalysisParams,
-    host: str = DEFAULT_DAEMON_HOST,
-    port: int = DEFAULT_DAEMON_PORT,
+    address: DaemonAddress = DaemonAddress(),
     auto_start: bool = True,
 ) -> dict | None:
     """
@@ -339,20 +353,18 @@ def try_daemon_hotspots(
 
     Args:
         params: GraphAnalysisParams with source_dir and options
-        host: Daemon host
-        port: Daemon port
+        address: Daemon network endpoint
         auto_start: Auto-start daemon if not running (default: True)
 
     Returns:
         Hotspots result dict, or None if daemon unavailable and couldn't start
     """
-    return _try_daemon_request("coupling_hotspots", params, host, port, auto_start)
+    return _try_daemon_request("coupling_hotspots", params, address, auto_start)
 
 
 def try_daemon_clones(
     params: CloneDetectionParams,
-    host: str = DEFAULT_DAEMON_HOST,
-    port: int = DEFAULT_DAEMON_PORT,
+    address: DaemonAddress = DaemonAddress(),
     auto_start: bool = True,
     timeout: float | None = None,
 ) -> dict | None:
@@ -361,8 +373,7 @@ def try_daemon_clones(
 
     Args:
         params: CloneDetectionParams with source_dir and options
-        host: Daemon host
-        port: Daemon port
+        address: Daemon network endpoint
         auto_start: Auto-start daemon if not running (default: True)
         timeout: Request timeout (default: uses config daemon_timeout or 60s)
 
@@ -373,15 +384,14 @@ def try_daemon_clones(
     # Default to config daemon_timeout, fallback to heavy analysis timeout
     effective_timeout = timeout if timeout is not None else DEFAULT_HEAVY_ANALYSIS_TIMEOUT
     return _try_daemon_request(
-        "detect_clones", params, host, port, auto_start,
+        "detect_clones", params, address, auto_start,
         timeout=effective_timeout
     )
 
 
 def try_daemon_propagation_cost(
     params: PropagationCostParams,
-    host: str = DEFAULT_DAEMON_HOST,
-    port: int = DEFAULT_DAEMON_PORT,
+    address: DaemonAddress = DaemonAddress(),
     auto_start: bool = True,
 ) -> dict | None:
     """
@@ -389,8 +399,7 @@ def try_daemon_propagation_cost(
 
     Args:
         params: PropagationCostParams with source_dir and options
-        host: Daemon host
-        port: Daemon port
+        address: Daemon network endpoint
         auto_start: Auto-start daemon if not running (default: True)
 
     Returns:
@@ -398,7 +407,7 @@ def try_daemon_propagation_cost(
     """
     # Propagation cost analysis can be heavy on large codebases
     return _try_daemon_request(
-        "propagation_cost", params, host, port, auto_start,
+        "propagation_cost", params, address, auto_start,
         timeout=DEFAULT_HEAVY_ANALYSIS_TIMEOUT
     )
 
@@ -406,8 +415,7 @@ def try_daemon_propagation_cost(
 def try_daemon_graph_analysis(
     method: str,
     params: GraphAnalysisParams,
-    host: str = DEFAULT_DAEMON_HOST,
-    port: int = DEFAULT_DAEMON_PORT,
+    address: DaemonAddress = DaemonAddress(),
     auto_start: bool = True,
 ) -> dict | None:
     """
@@ -416,20 +424,18 @@ def try_daemon_graph_analysis(
     Args:
         method: One of "change_impact_radius", "coupling_hotspots", "architectural_bottlenecks"
         params: GraphAnalysisParams with source_dir and options
-        host: Daemon host
-        port: Daemon port
+        address: Daemon network endpoint
         auto_start: Auto-start daemon if not running (default: True)
 
     Returns:
         Graph analysis result dict, or None if daemon unavailable
     """
-    return _try_daemon_request(method, params, host, port, auto_start)
+    return _try_daemon_request(method, params, address, auto_start)
 
 
 def try_daemon_stacktrace(
     params: StacktraceParams,
-    host: str = DEFAULT_DAEMON_HOST,
-    port: int = DEFAULT_DAEMON_PORT,
+    address: DaemonAddress = DaemonAddress(),
     auto_start: bool = True,
 ) -> dict | None:
     """
@@ -437,20 +443,18 @@ def try_daemon_stacktrace(
 
     Args:
         params: StacktraceParams with stacktrace and source_dir
-        host: Daemon host
-        port: Daemon port
+        address: Daemon network endpoint
         auto_start: Auto-start daemon if not running (default: True)
 
     Returns:
         Stacktrace analysis result dict, or None if daemon unavailable
     """
-    return _try_daemon_request("debug_stacktrace", params, host, port, auto_start)
+    return _try_daemon_request("debug_stacktrace", params, address, auto_start)
 
 
 def try_daemon_trace_dependency(
     params: TraceDependencyParams,
-    host: str = DEFAULT_DAEMON_HOST,
-    port: int = DEFAULT_DAEMON_PORT,
+    address: DaemonAddress = DaemonAddress(),
     auto_start: bool = True,
 ) -> dict | None:
     """
@@ -458,20 +462,18 @@ def try_daemon_trace_dependency(
 
     Args:
         params: TraceDependencyParams with identifier and source_dir
-        host: Daemon host
-        port: Daemon port
+        address: Daemon network endpoint
         auto_start: Auto-start daemon if not running (default: True)
 
     Returns:
         Dependency trace result dict, or None if daemon unavailable
     """
-    return _try_daemon_request("trace_dependency", params, host, port, auto_start)
+    return _try_daemon_request("trace_dependency", params, address, auto_start)
 
 
 def try_daemon_flag(
     params: FlagParams,
-    host: str = DEFAULT_DAEMON_HOST,
-    port: int = DEFAULT_DAEMON_PORT,
+    address: DaemonAddress = DaemonAddress(),
     auto_start: bool = True,
 ) -> dict | None:
     """
@@ -479,20 +481,18 @@ def try_daemon_flag(
 
     Args:
         params: FlagParams with source_dir and flag options
-        host: Daemon host
-        port: Daemon port
+        address: Daemon network endpoint
         auto_start: Auto-start daemon if not running (default: True)
 
     Returns:
         Flag result dict, or None if daemon unavailable
     """
-    return _try_daemon_request("flag_code", params, host, port, auto_start)
+    return _try_daemon_request("flag_code", params, address, auto_start)
 
 
 def try_daemon_flag_clear(
     params: FlagClearParams,
-    host: str = DEFAULT_DAEMON_HOST,
-    port: int = DEFAULT_DAEMON_PORT,
+    address: DaemonAddress = DaemonAddress(),
     auto_start: bool = True,
 ) -> dict | None:
     """
@@ -500,20 +500,18 @@ def try_daemon_flag_clear(
 
     Args:
         params: FlagClearParams with source_dir
-        host: Daemon host
-        port: Daemon port
+        address: Daemon network endpoint
         auto_start: Auto-start daemon if not running (default: True)
 
     Returns:
         Flag clear result dict, or None if daemon unavailable
     """
-    return _try_daemon_request("flag_clear", params, host, port, auto_start)
+    return _try_daemon_request("flag_clear", params, address, auto_start)
 
 
 def try_daemon_dead_code(
     params: DeadCodeParams,
-    host: str = DEFAULT_DAEMON_HOST,
-    port: int = DEFAULT_DAEMON_PORT,
+    address: DaemonAddress = DaemonAddress(),
     auto_start: bool = True,
 ) -> dict | None:
     """
@@ -521,68 +519,79 @@ def try_daemon_dead_code(
 
     Args:
         params: DeadCodeParams with source_dir and options
-        host: Daemon host
-        port: Daemon port
+        address: Daemon network endpoint
         auto_start: Auto-start daemon if not running (default: True)
 
     Returns:
         Dead code detection result dict, or None if daemon unavailable
     """
-    return _try_daemon_request("detect_dead_code", params, host, port, auto_start)
+    return _try_daemon_request("detect_dead_code", params, address, auto_start)
 
 
 def try_daemon_tramp_data(
     params: TrampDataParams,
-    host: str = DEFAULT_DAEMON_HOST,
-    port: int = DEFAULT_DAEMON_PORT,
+    address: DaemonAddress = DaemonAddress(),
     auto_start: bool = True,
 ) -> dict | None:
     """Try to detect tramp data via daemon, auto-starting if needed.
 
     Args:
         params: TrampDataParams with source_dir and options
-        host: Daemon host
-        port: Daemon port
+        address: Daemon network endpoint
         auto_start: Auto-start daemon if not running (default: True)
 
     Returns:
         Tramp data detection result dict, or None if daemon unavailable
     """
-    return _try_daemon_request("detect_tramp_data", params, host, port, auto_start)
+    return _try_daemon_request("detect_tramp_data", params, address, auto_start)
 
 
 def try_daemon_sensitive_values(
     params: SensitiveValueParams,
-    host: str = DEFAULT_DAEMON_HOST,
-    port: int = DEFAULT_DAEMON_PORT,
+    address: DaemonAddress = DaemonAddress(),
     auto_start: bool = True,
 ) -> dict | None:
     """Try to detect sensitive values via daemon, auto-starting if needed.
 
     Args:
         params: SensitiveValueParams with source_dir and options
-        host: Daemon host
-        port: Daemon port
+        address: Daemon network endpoint
         auto_start: Auto-start daemon if not running (default: True)
 
     Returns:
         Sensitive value detection result dict, or None if daemon unavailable
     """
-    return _try_daemon_request("detect_sensitive_values", params, host, port, auto_start)
+    return _try_daemon_request("detect_sensitive_values", params, address, auto_start)
 
 
-def stop_daemon(host: str = DEFAULT_DAEMON_HOST, port: int = DEFAULT_DAEMON_PORT) -> bool:
+def try_daemon_magic_constants(
+    params: MagicConstantParams,
+    address: DaemonAddress = DaemonAddress(),
+    auto_start: bool = True,
+) -> dict | None:
+    """Try to detect magic constants via daemon, auto-starting if needed.
+
+    Returns:
+        Magic constant detection result dict, or None if daemon unavailable
+    """
+    return _try_daemon_request("detect_magic_constants", params, address, auto_start)
+
+
+def stop_daemon(address: DaemonAddress = DaemonAddress()) -> bool:
     """
     Stop the daemon server.
 
     Returns:
         True if successfully stopped, False otherwise.
     """
-    client = DaemonClient(host=host, port=port, timeout=DEFAULT_CLIENT_TIMEOUT)
+    client = DaemonClient(address=address, timeout=DEFAULT_CLIENT_TIMEOUT)
 
     try:
         client.shutdown()
         time.sleep(0.5)
+        return True
+    except KeyboardInterrupt:
+        # Shutdown was sent; don't crash on interrupt during wait
         return True
     except DaemonConnectionError:
         # Try killing by PID
@@ -632,14 +641,14 @@ def _kill_daemon_process(pid: int, force: bool = False) -> bool:
         return False
 
 
-def get_daemon_status(host: str = DEFAULT_DAEMON_HOST, port: int = DEFAULT_DAEMON_PORT) -> dict | None:
+def get_daemon_status(address: DaemonAddress = DaemonAddress()) -> dict | None:
     """
     Get daemon status.
 
     Returns:
         Status dict if daemon is running, None otherwise.
     """
-    client = DaemonClient(host=host, port=port, timeout=2.0)
+    client = DaemonClient(address=address, timeout=2.0)
 
     try:
         return client.status()
@@ -653,8 +662,7 @@ PORT_RELEASE_WAIT = 0.5  # Time for OS to release socket after process terminati
 
 
 def _spawn_daemon_process(
-    host: str,
-    port: int,
+    address: DaemonAddress,
     max_projects: int,
     enable_watch: bool,
 ) -> bool:
@@ -662,8 +670,7 @@ def _spawn_daemon_process(
     Spawn the daemon process without waiting for it to be ready.
 
     Args:
-        host: Host to bind to
-        port: Port to bind to
+        address: Daemon network endpoint
         max_projects: Maximum projects to cache
         enable_watch: Enable file watching
 
@@ -680,8 +687,8 @@ def _spawn_daemon_process(
         python_exe,
         "-m", "coden_retriever",
         "daemon", "run",
-        "--daemon-host", host,
-        "--daemon-port", str(port),
+        "--daemon-host", address.host,
+        "--daemon-port", str(address.port),
         "--max-projects", str(max_projects),
     ]
 
@@ -730,8 +737,7 @@ def _spawn_daemon_process(
 
 
 def start_daemon_async(
-    host: str = DEFAULT_DAEMON_HOST,
-    port: int = DEFAULT_DAEMON_PORT,
+    address: DaemonAddress = DaemonAddress(),
     max_projects: int = 5,
     enable_watch: bool = True,
 ) -> bool:
@@ -742,8 +748,7 @@ def start_daemon_async(
     returns immediately without waiting for it to become responsive.
 
     Args:
-        host: Host to bind to
-        port: Port to bind to
+        address: Daemon network endpoint
         max_projects: Maximum projects to cache
         enable_watch: Enable file watching
 
@@ -751,19 +756,18 @@ def start_daemon_async(
         True if daemon was spawned (or already running), False on spawn failure
     """
     # Quick check if already running (short timeout for speed)
-    client = DaemonClient(host=host, port=port, timeout=0.5)
+    client = DaemonClient(address=address, timeout=0.5)
     try:
         client.ping()
         return True
     except DaemonConnectionError:
         pass
 
-    return _spawn_daemon_process(host, port, max_projects, enable_watch)
+    return _spawn_daemon_process(address, max_projects, enable_watch)
 
 
 def start_daemon_silent(
-    host: str = DEFAULT_DAEMON_HOST,
-    port: int = DEFAULT_DAEMON_PORT,
+    address: DaemonAddress = DaemonAddress(),
     max_projects: int = 5,
     enable_watch: bool = True,
 ) -> bool:
@@ -774,8 +778,7 @@ def start_daemon_silent(
     window. Waits for daemon to become responsive before returning.
 
     Args:
-        host: Host to bind to
-        port: Port to bind to
+        address: Daemon network endpoint
         max_projects: Maximum projects to cache
         enable_watch: Enable file watching
 
@@ -783,37 +786,35 @@ def start_daemon_silent(
         True if daemon started successfully, False otherwise
     """
     # Check if already running
-    client = DaemonClient(host=host, port=port, timeout=1.0)
+    client = DaemonClient(address=address, timeout=1.0)
     try:
         client.ping()
         return True
     except DaemonConnectionError:
         pass
 
-    if not _spawn_daemon_process(host, port, max_projects, enable_watch):
+    if not _spawn_daemon_process(address, max_projects, enable_watch):
         return False
 
     # Wait for daemon to become responsive
-    return _wait_for_daemon(host, port, timeout=DAEMON_START_TIMEOUT)
+    return _wait_for_daemon(address, timeout=DAEMON_START_TIMEOUT)
 
 
 def _wait_for_daemon(
-    host: str,
-    port: int,
+    address: DaemonAddress,
     timeout: float = DAEMON_START_TIMEOUT,
 ) -> bool:
     """
     Wait for daemon to become responsive.
 
     Args:
-        host: Daemon host
-        port: Daemon port
+        address: Daemon network endpoint
         timeout: Maximum time to wait
 
     Returns:
         True if daemon is responsive, False if timeout
     """
-    client = DaemonClient(host=host, port=port, timeout=1.0)
+    client = DaemonClient(address=address, timeout=1.0)
     start_time = time.time()
 
     while (time.time() - start_time) < timeout:
@@ -827,8 +828,7 @@ def _wait_for_daemon(
 
 
 def ensure_daemon_running(
-    host: str = DEFAULT_DAEMON_HOST,
-    port: int = DEFAULT_DAEMON_PORT,
+    address: DaemonAddress = DaemonAddress(),
     auto_start: bool = True,
 ) -> bool:
     """
@@ -838,15 +838,14 @@ def ensure_daemon_running(
     not responding).
 
     Args:
-        host: Daemon host
-        port: Daemon port
+        address: Daemon network endpoint
         auto_start: If True, start daemon if not running
 
     Returns:
         True if daemon is running (or was started), False otherwise
     """
     # Quick check via ping
-    client = DaemonClient(host=host, port=port, timeout=1.0)
+    client = DaemonClient(address=address, timeout=1.0)
     try:
         client.ping()
         return True
@@ -875,6 +874,6 @@ def ensure_daemon_running(
 
     # Not running (or zombie was killed) - start if allowed
     if auto_start:
-        return start_daemon_silent(host=host, port=port)
+        return start_daemon_silent(address=address)
 
     return False

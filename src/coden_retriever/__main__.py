@@ -4,6 +4,7 @@ import argparse
 import io
 import logging
 import sys
+from pathlib import Path
 
 from .cli.arguments import (
     create_agent_parser,
@@ -14,6 +15,7 @@ from .cli.arguments import (
 from .cli.arguments_search import add_flag_arguments, create_search_parser
 from .cli.handlers.cache import handle_cache_command
 from .cli.handlers.daemon import handle_daemon_command
+from .cli.handlers.debug_availability import handle_debug_availability_command
 from .cli.handlers.flag import handle_flag_clear_command, handle_flag_command
 from .cli.handlers.search import handle_search_command
 from .cli.handlers.serve import handle_agent_command, handle_serve_command
@@ -72,8 +74,6 @@ def main() -> int:
             remaining_args = sys.argv[2:]
             if remaining_args and remaining_args[0] == "clear":
                 args = flag_parser.parse_args(remaining_args)
-                from pathlib import Path
-
                 root_path = Path(args.root).resolve()
                 return handle_flag_clear_command(args, root_path, config)
             else:
@@ -84,8 +84,6 @@ def main() -> int:
                 )
                 add_flag_arguments(add_parser, config)
                 args = add_parser.parse_args(remaining_args)
-                from pathlib import Path
-
                 root_path = Path(args.root).resolve()
                 return handle_flag_command(args, root_path, config)
 
@@ -94,6 +92,9 @@ def main() -> int:
 
         if cmd == "cache":
             return handle_cache_command(sys.argv[2:])
+
+        if cmd == "debug-availability":
+            return handle_debug_availability_command(sys.argv[2:])
 
         if cmd == "reset":
             return handle_reset_command()

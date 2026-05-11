@@ -11,16 +11,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 from ..cache import CachedIndices
-from ..config import OutputFormat
+from ..config import MapMode, OutputFormat, get_project_cache_dir
 from ..constants import DEFAULT_SEARCH_RESULT_LIMIT
+from ..pipeline import check_semantic_used
 from ..formatters import get_formatter
 from ..formatters.base import OutputFormatter
 from ..graph_utils import (
     _TOKEN_OVERHEAD_BOTTLENECKS,
-    _TOKEN_OVERHEAD_CHANGE_IMPACT,
     _TOKEN_PER_BOTTLENECK,
-    _TOKEN_PER_CALLER,
     AUTO_MIN_IMPORTANCE,
+    BfsContext,
     apply_token_budget_filter,
     build_bottleneck_info,
     build_caller_info,
@@ -29,6 +29,7 @@ from ..graph_utils import (
     extract_module_from_path,
     find_symbol_nodes,
     get_connected_modules,
+    trace_impact_bfs,
 )
 from ..search import SearchEngine
 from ..token_estimator import count_tokens
@@ -37,6 +38,7 @@ from .protocol import (
     DeadCodeParams,
     FlagClearParams,
     FlagParams,
+    MagicConstantParams,
     PropagationCostParams,
     GraphAnalysisParams,
     SearchParams,
@@ -112,8 +114,8 @@ class StatusHandler(BaseHandler):
             idle_seconds = current_time - server._last_activity
         return {
             "running": True,
-            "host": server.host,
-            "port": server.port,
+            "host": server.address.host,
+            "port": server.address.port,
             "uptime_seconds": current_time - server._start_time,
             "idle_seconds": idle_seconds,
             "cache": server._project_cache.status(),
@@ -253,12 +255,15 @@ class SearchHandlerBase(BaseHandler):
         search_time_ms = (time.time() - start_time) * 1000
         output = self._format_output(display_results, engine, search_params)
 
+        semantic_used = check_semantic_used(results)
+
         result = {
             "output": output,
             "result_count": len(included_results),
             "total_matched": len(results),
             "search_time_ms": round(search_time_ms, 2),
             "tokens_used": used_tokens,
+            "semantic_used": semantic_used,
         }
 
         # Add warning when token budget filtered out all results
@@ -280,12 +285,13 @@ class SearchHandler(SearchHandlerBase):
     def handle(self, params: dict) -> dict:
         def do_search(search_params: SearchParams, engine: SearchEngine) -> list:
             limit = search_params.limit if search_params.limit is not None else DEFAULT_SEARCH_RESULT_LIMIT
-            if search_params.map_mode or not search_params.query:
+            if search_params.show_map or not search_params.query:
                 return engine.search(
                     query="",
                     use_architecture=True,
                     include_deps=search_params.show_deps,
                     limit=limit,
+                    map_mode=MapMode(search_params.map_mode),
                 )
             else:
                 return engine.search(
@@ -327,8 +333,8 @@ class ArchitecturalBottlenecksHandler(BaseHandler):
 
         graph = indices.graph
         entities = indices.entities
-        betweenness = indices.betweenness
-        pagerank = indices.pagerank
+        betweenness = indices.centrality.betweenness
+        pagerank = indices.centrality.pagerank
 
         root_path = Path(graph_params.source_dir).resolve()
         bottlenecks = []
@@ -368,7 +374,7 @@ class ArchitecturalBottlenecksHandler(BaseHandler):
         bottlenecks = bottlenecks[: graph_params.limit]
 
         # Apply token budget using shared function
-        filtered_bottlenecks, token_budget_exceeded = apply_token_budget_filter(
+        filtered_bottlenecks, _, token_budget_exceeded = apply_token_budget_filter(
             bottlenecks,
             graph_params.token_limit,
             _TOKEN_OVERHEAD_BOTTLENECKS,
@@ -405,7 +411,7 @@ class CouplingHotspotsHandler(BaseHandler):
         result = compute_coupling_hotspots(
             graph=indices.graph,
             entities=indices.entities,
-            pagerank=indices.pagerank,
+            pagerank=indices.centrality.pagerank,
             limit=graph_params.limit,
             min_coupling_score=graph_params.min_coupling_score,
             exclude_tests=graph_params.exclude_tests,
@@ -429,8 +435,8 @@ class ChangeImpactRadiusHandler(BaseHandler):
 
         graph = indices.graph
         entities = indices.entities
-        pagerank = indices.pagerank
-        name_to_nodes = indices.name_to_nodes
+        pagerank = indices.centrality.pagerank
+        name_to_nodes = indices.lookups.name_to_nodes
 
         # Use shared helper for symbol lookup
         symbol_name = graph_params.symbol_name.strip()
@@ -448,13 +454,8 @@ class ChangeImpactRadiusHandler(BaseHandler):
         if not target_entity:
             return {"error": f"Entity data not found for {target_node}"}
 
-        # Token budget tracking using shared constants
-        used_tokens = _TOKEN_OVERHEAD_CHANGE_IMPACT
-        token_budget_exceeded = False
-
         min_importance = graph_params.min_importance
 
-        # Use shared helper for high-connectivity detection
         target_fan_in = graph.in_degree(target_node)
         is_high_connectivity, warning_info = detect_high_connectivity(
             target_entity, target_fan_in
@@ -469,84 +470,40 @@ class ChangeImpactRadiusHandler(BaseHandler):
             if min_importance < AUTO_MIN_IMPORTANCE:
                 min_importance = AUTO_MIN_IMPORTANCE
 
-        # BFS to find all upstream callers
-        callers_by_depth: dict[int, list[dict]] = {}
-        visited = {target_node}
-        current_level = {target_node}
-        all_affected_files: set[str] = set()
-        root_callers: list[dict] = []
+        ctx = BfsContext(
+            graph=graph,
+            entities=entities,
+            pagerank=pagerank,
+            min_importance=min_importance,
+        )
+        acc = trace_impact_bfs(
+            target_node, ctx, graph_params.max_depth, graph_params.token_limit
+        )
 
         root_path = Path(graph_params.source_dir).resolve()
-
-        for depth in range(1, graph_params.max_depth + 1):
-            next_level: set[str] = set()
-            depth_callers: list[dict] = []
-
-            for node in current_level:
-                if node in graph:
-                    for caller_node in graph.predecessors(node):
-                        if caller_node not in visited:
-                            visited.add(caller_node)
-                            next_level.add(caller_node)
-
-                            caller_entity = entities.get(caller_node)
-                            if caller_entity:
-                                importance = pagerank.get(caller_node, 0.0)
-
-                                if importance < min_importance:
-                                    continue
-
-                                # Use shared helper for building caller info
-                                caller_info = build_caller_info(caller_entity, importance)
-                                depth_callers.append(caller_info)
-                                all_affected_files.add(caller_entity.file_path)
-
-                                if graph.in_degree(caller_node) == 0:
-                                    root_callers.append(caller_info)
-
-            if depth_callers:
-                depth_callers.sort(key=lambda x: x["importance"], reverse=True)
-
-                filtered_callers = []
-                for caller in depth_callers:
-                    text = f"{caller['name']} {caller['file']} {caller['type']}"
-                    tokens = count_tokens(text, is_code=False) + _TOKEN_PER_CALLER
-                    if used_tokens + tokens > graph_params.token_limit:
-                        token_budget_exceeded = True
-                        break
-                    used_tokens += tokens
-                    filtered_callers.append(caller)
-
-                callers_by_depth[depth] = filtered_callers
-
-            if not next_level or token_budget_exceeded:
-                break
-            current_level = next_level
-
-        # Calculate affected modules
         affected_modules: set[str] = set()
-        for file_path in all_affected_files:
+        for file_path in acc.affected_files:
             module = extract_module_from_path(file_path, root_path)
             if module:
                 affected_modules.add(module)
 
-        total_callers = sum(len(callers) for callers in callers_by_depth.values())
-        direct_count = len(callers_by_depth.get(1, []))
+        total_callers = sum(len(callers) for callers in acc.callers_by_depth.values())
+        direct_count = len(acc.callers_by_depth.get(1, []))
 
         result = {
             "symbol": build_caller_info(target_entity, pagerank.get(target_node, 0.0)),
             "impact_summary": {
                 "direct_callers": direct_count,
                 "total_affected": total_callers,
-                "affected_files": len(all_affected_files),
+                "affected_files": len(acc.affected_files),
                 "affected_modules": sorted(affected_modules),
-                "max_depth_reached": max(callers_by_depth.keys())
-                if callers_by_depth
+                "max_depth_reached": max(acc.callers_by_depth.keys())
+                if acc.callers_by_depth
                 else 0,
-                "token_budget_exceeded": token_budget_exceeded,
+                "token_budget_exceeded": acc.token_budget_exceeded,
             },
-            "root_callers": root_callers[:10],
-            "callers_by_depth": callers_by_depth,
+            "root_callers": acc.root_callers[:10],
+            "callers_by_depth": acc.callers_by_depth,
             "source": "daemon",
         }
 
@@ -619,7 +576,7 @@ class DebugStacktraceHandler(BaseHandler):
 
             if resolved_path and st_params.show_dependencies:
                 # Find entities at this line
-                file_entities = indices.file_to_entities.get(resolved_path, [])
+                file_entities = indices.lookups.file_to_entities.get(resolved_path, [])
                 for entity_id in file_entities:
                     entity = indices.entities.get(entity_id)
                     if (
@@ -650,7 +607,7 @@ class CloneDetectionHandler(BaseHandler):
 
     Supports three modes:
     - combined (default): Both semantic + syntactic analysis
-    - semantic: Model2Vec embedding similarity only
+    - semantic: MiniLM ONNX embedding similarity only
     - syntactic: Line-by-line Jaccard similarity only
     """
 
@@ -694,6 +651,7 @@ class CloneDetectionHandler(BaseHandler):
                 exclude_tests=clone_params.exclude_tests,
                 min_lines=clone_params.min_lines,
                 token_limit=clone_params.token_limit,
+                embedding_cache=indices.embedding_cache,
             )
         else:  # combined (default)
             result = detect_clones_combined(
@@ -709,7 +667,12 @@ class CloneDetectionHandler(BaseHandler):
                 token_limit=clone_params.token_limit,
                 semantic_weight=clone_params.semantic_weight,
                 syntactic_weight=clone_params.syntactic_weight,
+                embedding_cache=indices.embedding_cache,
             )
+
+        if indices.embedding_cache is not None:
+            cache_dir = get_project_cache_dir(Path(clone_params.source_dir))
+            indices.embedding_cache.save(cache_dir)
 
         result["source"] = "daemon"
         return result
@@ -731,6 +694,7 @@ class PropagationCostHandler(BaseHandler):
             show_critical_paths=pc_params.show_critical_paths,
             exclude_tests=pc_params.exclude_tests,
             token_limit=pc_params.token_limit,
+            approximate=pc_params.approximate,
         )
         result["source"] = "daemon"
         return result
@@ -753,6 +717,7 @@ class DeadCodeHandler(BaseHandler):
             include_private=dc_params.include_private,
             min_lines=dc_params.min_lines,
             limit=dc_params.limit,
+            used_names=indices.used_names,
         )
         result["source"] = "daemon"
         return result
@@ -800,6 +765,26 @@ class SensitiveValueHandler(BaseHandler):
         return result
 
 
+class MagicConstantHandler(BaseHandler):
+    """Handler for magic constant detection requests."""
+
+    def handle(self, params: dict) -> dict:
+        from ..magic_constants.detector import detect_magic_constants
+
+        mc_params = MagicConstantParams.from_dict(params)
+        indices, _ = self._server._get_or_load_project(mc_params.source_dir)
+
+        result = detect_magic_constants(
+            entities=indices.entities,
+            min_occurrences=mc_params.min_occurrences,
+            min_files=mc_params.min_files,
+            exclude_tests=mc_params.exclude_tests,
+            limit=mc_params.limit,
+        )
+        result["source"] = "daemon"
+        return result
+
+
 class FlagHandler(BaseHandler):
     """Handler for code flagging requests."""
 
@@ -812,9 +797,15 @@ class FlagHandler(BaseHandler):
         result = flag_code(
             entities=indices.entities,
             graph=indices.graph,
-            pagerank=indices.pagerank,
+            pagerank=indices.centrality.pagerank,
             params=flag_params,
+            embedding_cache=indices.embedding_cache,
         )
+
+        if indices.embedding_cache is not None:
+            cache_dir = get_project_cache_dir(indices.source_dir)
+            indices.embedding_cache.save(cache_dir)
+
         result["source"] = "daemon"
         return result
 
@@ -862,6 +853,7 @@ def create_handler_registry(server: "DaemonServer") -> dict[str, BaseHandler]:
         "detect_dead_code": DeadCodeHandler(server),
         "detect_tramp_data": TrampDataHandler(server),
         "detect_sensitive_values": SensitiveValueHandler(server),
+        "detect_magic_constants": MagicConstantHandler(server),
         "flag_code": FlagHandler(server),
         "flag_clear": FlagClearHandler(server),
     }

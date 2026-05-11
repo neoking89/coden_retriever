@@ -63,10 +63,6 @@ AUTO_FILL_PARAMS = {
     "root_directory": lambda ctx: ctx.root_directory,
 }
 
-# Trigger keywords for the tool wizard (run a tool manually)
-WIZARD_TRIGGERS = ("run", "execute", "menu")
-
-
 def introspect_tool(tool: Tool) -> list[ToolParameter]:
     """Extract parameters from MCP Tool's inputSchema.
 
@@ -108,14 +104,6 @@ def introspect_tool(tool: Tool) -> list[ToolParameter]:
         params.append(param)
 
     return params
-
-
-def get_tool_by_name(tools: Sequence[Tool], name: str) -> Tool | None:
-    """Find a tool by name."""
-    for tool in tools:
-        if tool.name == name:
-            return tool
-    return None
 
 
 def print_tool_menu(tools: Sequence[Tool]) -> list[Tool]:
@@ -682,15 +670,3 @@ async def run_tool_wizard(
     except KeyboardInterrupt:
         print_wizard_cancelled()
         return None
-
-
-def is_wizard_trigger(user_input: str) -> bool:
-    """Check if user input should trigger the tool wizard.
-
-    Args:
-        user_input: The user's input string.
-
-    Returns:
-        True if the wizard should be triggered.
-    """
-    return user_input.lower().strip() in WIZARD_TRIGGERS

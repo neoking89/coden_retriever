@@ -10,6 +10,7 @@ Features:
 
 Also provides a compact shallow tree generator for system prompt injection.
 """
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -18,7 +19,7 @@ from .terminal_style import get_terminal_style
 
 if TYPE_CHECKING:
     from ..models.entities import CodeEntity
-    from ..models import SearchResult 
+    from ..models import SearchResult
 
 
 # Priority files to always show at root level (language-agnostic)
@@ -78,6 +79,97 @@ DIR_PRIORITY = {
 }
 
 
+# Tree drawing characters - ASCII-safe for shell compatibility
+_BRANCH = "+-- "
+_LAST = "`-- "
+_PIPE = "|   "
+_SPACE = "    "
+
+# Sort priority for directories not in DIR_PRIORITY: between source code and docs
+_DEFAULT_DIR_PRIORITY = 15
+
+
+def _is_nested_project(dir_path: str) -> bool:
+    """Check if directory is a nested project (has its own project file)."""
+    try:
+        with os.scandir(dir_path) as entries:
+            for entry in entries:
+                if entry.name in PROJECT_MARKERS and entry.is_file(follow_symlinks=False):
+                    return True
+    except OSError:
+        pass
+    return False
+
+
+def _dir_sort_key(item: tuple[str, str]) -> tuple[int, str]:
+    name = item[0].lower()
+    return (DIR_PRIORITY.get(name, _DEFAULT_DIR_PRIORITY), name)
+
+
+def _is_priority_file(name: str) -> bool:
+    """Check if filename is a priority file (supports `*.ext` glob patterns)."""
+    if name in ROOT_PRIORITY_FILES:
+        return True
+    for pattern in ROOT_PRIORITY_FILES:
+        if pattern.startswith("*.") and name.endswith(pattern[1:]):
+            return True
+    return False
+
+
+def _scan_dir(dir_path: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Fast directory scan via os.scandir(). Returns (dirs, files) sorted for display."""
+    skip_dirs = Config.SKIP_DIRS
+    skip_files = Config.SKIP_FILES
+    dirs: list[tuple[str, str]] = []
+    files: list[tuple[str, str]] = []
+    try:
+        with os.scandir(dir_path) as entries:
+            for entry in entries:
+                name = entry.name
+                if name[0] == "." or name in skip_dirs or name in skip_files:
+                    continue
+                if name.endswith(".egg-info"):
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    dirs.append((name, entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    files.append((name, entry.path))
+    except OSError:
+        pass
+    dirs.sort(key=_dir_sort_key)
+    files.sort(key=lambda x: (not _is_priority_file(x[0]), x[0].lower()))
+    return dirs, files
+
+
+def _select_collapsed_entries(
+    dirs: list[tuple[str, str]],
+    files: list[tuple[str, str]],
+    collapse_threshold: int,
+) -> tuple[list[tuple[str, str, bool]], int, int]:
+    """When a dir has too many items, keep top-N dirs + priority files. Returns (entries, hidden_dirs, hidden_files)."""
+    priority_only = [(n, p) for n, p in files if n in ROOT_PRIORITY_FILES]
+    shown_dirs = dirs[:collapse_threshold]
+    hidden_dirs = len(dirs) - len(shown_dirs)
+    hidden_files = len(files) - len(priority_only)
+    entries = (
+        [(n, p, True) for n, p in shown_dirs]
+        + [(n, p, False) for n, p in priority_only]
+    )
+    return entries, hidden_dirs, hidden_files
+
+
+def _format_hidden_notice(hidden_dirs: int, hidden_files: int) -> str | None:
+    """Format `... (N more dirs, M more files)` or None if nothing hidden."""
+    if hidden_dirs <= 0 and hidden_files <= 0:
+        return None
+    parts = []
+    if hidden_dirs > 0:
+        parts.append(f"{hidden_dirs} more dirs")
+    if hidden_files > 0:
+        parts.append(f"{hidden_files} more files")
+    return f"... ({', '.join(parts)})"
+
+
 def generate_shallow_tree(
     root: Path,
     max_depth: int = 3,
@@ -107,222 +199,94 @@ def generate_shallow_tree(
     Returns:
         Compact tree string suitable for LLM context
     """
-    import os
-
     root_path = str(Path(root).resolve())
-    root_name = os.path.basename(root_path)
-    lines: list[str] = [f"{root_name}/"]
+    lines: list[str] = [f"{os.path.basename(root_path)}/"]
     truncated = False
 
-    # Tree drawing characters - ASCII-safe for shell compatibility
-    BRANCH, LAST, PIPE, SPACE = ("+-- ", "`-- ", "|   ", "    ")
-
-    # Pre-fetch skip sets for O(1) lookup
-    skip_dirs = Config.SKIP_DIRS
-    skip_files = Config.SKIP_FILES
-    priority_files = ROOT_PRIORITY_FILES
-
-    def _is_nested_project(dir_path: str) -> bool:
-        """Check if directory is a nested project (has its own project file)."""
-        try:
-            with os.scandir(dir_path) as entries:
-                for entry in entries:
-                    if entry.name in PROJECT_MARKERS and entry.is_file(follow_symlinks=False):
-                        return True
-        except OSError:
-            pass
-        return False
-
-    def _dir_sort_key(item: tuple[str, str]) -> tuple[int, str]:
-        """Sort directories by priority, then alphabetically."""
-        name = item[0].lower()
-        priority = DIR_PRIORITY.get(name, 15)  # Default priority between source and docs
-        return (priority, name)
-
-    def _is_priority_file(name: str) -> bool:
-        """Check if filename is a priority file (supports glob patterns)."""
-        if name in priority_files:
-            return True
-        # Check glob patterns (*.csproj, *.sln, etc.)
-        for pattern in priority_files:
-            if pattern.startswith("*.") and name.endswith(pattern[1:]):
-                return True
-        return False
-
-    def _scan_dir(dir_path: str) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
-        """
-        Fast directory scan using os.scandir().
-        Returns (dirs, files) as lists of (name, full_path) tuples.
-        """
-        dirs, files = [], []
-        try:
-            with os.scandir(dir_path) as entries:
-                for entry in entries:
-                    name = entry.name
-                    # Fast filtering - check name patterns before stat
-                    if name[0] == "." or name in skip_dirs or name in skip_files:
-                        continue
-                    # Skip egg-info directories
-                    if name.endswith(".egg-info"):
-                        continue
-                    # DirEntry caches is_dir/is_file results from scandir
-                    if entry.is_dir(follow_symlinks=False):
-                        dirs.append((name, entry.path))
-                    elif entry.is_file(follow_symlinks=False):
-                        files.append((name, entry.path))
-        except OSError:
-            pass
-
-        # Sort: dirs by priority then alpha, files with priority first
-        dirs.sort(key=_dir_sort_key)
-        files.sort(key=lambda x: (not _is_priority_file(x[0]), x[0].lower()))
-        return dirs, files
-
     def _walk(dir_path: str, prefix: str, depth: int, lines_budget: int) -> int:
-        """
-        Walk directory tree and append to lines.
-
-        Args:
-            dir_path: Directory to walk
-            prefix: Line prefix for tree drawing
-            depth: Current depth level
-            lines_budget: Maximum lines available for this subtree
-
-        Returns:
-            Number of lines used
-        """
         nonlocal truncated
-
         if lines_budget <= 0:
             truncated = True
             return 0
-
         if depth > max_depth:
             return 0
 
         dirs, files = _scan_dir(dir_path)
-        total_items = len(dirs) + len(files)
+        if len(dirs) + len(files) > max_items_per_dir:
+            entries, hidden_dirs, hidden_files = _select_collapsed_entries(
+                dirs, files, collapse_threshold
+            )
+            hidden_notice = _format_hidden_notice(hidden_dirs, hidden_files)
+        else:
+            entries = (
+                [(n, p, True) for n, p in dirs]
+                + [(n, p, False) for n, p in files]
+            )
+            hidden_notice = None
+
+        last_idx = len(entries) - 1 if hidden_notice is None else -1
         lines_used = 0
-
-        # Collapse if too many items
-        if total_items > max_items_per_dir:
-            priority = [(n, p) for n, p in files if n in priority_files]
-            shown_dirs = dirs[:collapse_threshold]
-            hidden_dirs = len(dirs) - len(shown_dirs)
-            hidden_files = len(files) - len(priority)
-
-            entries = [(n, p, True) for n, p in shown_dirs] + [(n, p, False) for n, p in priority]
-            has_hidden = hidden_dirs > 0 or hidden_files > 0
-            last_idx = len(entries) - 1 if not has_hidden else -1
-
-            for i, (name, path, is_dir) in enumerate(entries):
-                if lines_used >= lines_budget:
-                    truncated = True
-                    return lines_used
-                is_last = i == last_idx
-                conn = LAST if is_last else BRANCH
-                if is_dir:
-                    # Collapse nested projects (dirs with their own pyproject.toml etc.)
-                    if _is_nested_project(path):
-                        lines.append(f"{prefix}{conn}{name}/ (nested project)")
-                        lines_used += 1
-                    else:
-                        lines.append(f"{prefix}{conn}{name}/")
-                        lines_used += 1
-                        child_prefix = prefix + (SPACE if is_last else PIPE)
-                        lines_used += _walk(path, child_prefix, depth + 1, lines_budget - lines_used)
-                else:
-                    lines.append(f"{prefix}{conn}{name}")
-                    lines_used += 1
-
-            if has_hidden and lines_used < lines_budget:
-                parts = []
-                if hidden_dirs > 0:
-                    parts.append(f"{hidden_dirs} more dirs")
-                if hidden_files > 0:
-                    parts.append(f"{hidden_files} more files")
-                lines.append(f"{prefix}{LAST}... ({', '.join(parts)})")
-                lines_used += 1
-            return lines_used
-
-        # Normal case: show all items
-        entries = [(n, p, True) for n, p in dirs] + [(n, p, False) for n, p in files]
-        last_idx = len(entries) - 1
-
         for i, (name, path, is_dir) in enumerate(entries):
             if lines_used >= lines_budget:
                 truncated = True
                 return lines_used
             is_last = i == last_idx
-            conn = LAST if is_last else BRANCH
-            child_prefix = prefix + (SPACE if is_last else PIPE)
+            conn = _LAST if is_last else _BRANCH
 
-            if is_dir:
-                # Collapse nested projects (dirs with their own pyproject.toml etc.)
-                if _is_nested_project(path):
-                    lines.append(f"{prefix}{conn}{name}/ (nested project)")
-                    lines_used += 1
-                else:
-                    lines.append(f"{prefix}{conn}{name}/")
-                    lines_used += 1
-                    lines_used += _walk(path, child_prefix, depth + 1, lines_budget - lines_used)
+            if is_dir and _is_nested_project(path):
+                lines.append(f"{prefix}{conn}{name}/ (nested project)")
+                lines_used += 1
+            elif is_dir:
+                lines.append(f"{prefix}{conn}{name}/")
+                lines_used += 1
+                child_prefix = prefix + (_SPACE if is_last else _PIPE)
+                lines_used += _walk(path, child_prefix, depth + 1, lines_budget - lines_used)
             else:
                 lines.append(f"{prefix}{conn}{name}")
                 lines_used += 1
 
+        if hidden_notice and lines_used < lines_budget:
+            lines.append(f"{prefix}{_LAST}{hidden_notice}")
+            lines_used += 1
         return lines_used
 
-    # === ROOT LEVEL: Always show priority files, cap non-priority ===
-    # Scan root directory
+    # Root level handling: priority files always shown, non-priority files capped.
     root_dirs, root_files = _scan_dir(root_path)
-
-    # Separate priority and non-priority root files
     priority_root_files = [(n, p) for n, p in root_files if _is_priority_file(n)]
     other_root_files = [(n, p) for n, p in root_files if not _is_priority_file(n)]
 
-    # Cap non-priority files to prevent token explosion (e.g., 500+ files in root)
-    hidden_root_files = 0
-    if len(other_root_files) > MAX_ROOT_FILES_NON_PRIORITY:
-        hidden_root_files = len(other_root_files) - MAX_ROOT_FILES_NON_PRIORITY
+    hidden_root_files = max(0, len(other_root_files) - MAX_ROOT_FILES_NON_PRIORITY)
+    if hidden_root_files > 0:
         other_root_files = other_root_files[:MAX_ROOT_FILES_NON_PRIORITY]
-
-    # Combine: priority files first, then capped non-priority
     shown_root_files = priority_root_files + other_root_files
 
-    # Reserve lines for root files (priority files MUST be shown)
     root_files_count = len(shown_root_files) + (1 if hidden_root_files > 0 else 0)
-    # Budget for directories = max_lines - header line - root files - potential truncation notice
     dir_budget = max_lines - 1 - root_files_count - 1
 
-    # Process directories first with limited budget
     for i, (name, path) in enumerate(root_dirs):
-        is_last_dir = (i == len(root_dirs) - 1) and (len(shown_root_files) == 0)
-        conn = LAST if is_last_dir else BRANCH
+        is_last_dir = (i == len(root_dirs) - 1) and not shown_root_files
+        conn = _LAST if is_last_dir else _BRANCH
 
-        remaining_budget = dir_budget - (len(lines) - 1)  # -1 for root line
+        remaining_budget = dir_budget - (len(lines) - 1)
         if remaining_budget <= 0:
             truncated = True
             break
 
-        # Collapse nested projects
         if _is_nested_project(path):
             lines.append(f"{conn}{name}/ (nested project)")
         else:
             lines.append(f"{conn}{name}/")
-            child_prefix = SPACE if is_last_dir else PIPE
+            child_prefix = _SPACE if is_last_dir else _PIPE
             _walk(path, child_prefix, 2, remaining_budget - 1)
 
-    # ALWAYS show root files after directories
-    for i, (name, path) in enumerate(shown_root_files):
+    for i, (name, _path) in enumerate(shown_root_files):
         is_last = (i == len(shown_root_files) - 1) and hidden_root_files == 0
-        conn = LAST if is_last else BRANCH
+        conn = _LAST if is_last else _BRANCH
         lines.append(f"{conn}{name}")
 
-    # Show hidden files count if we had to cap
     if hidden_root_files > 0:
-        lines.append(f"{LAST}... ({hidden_root_files} more files)")
+        lines.append(f"{_LAST}... ({hidden_root_files} more files)")
 
-    # Add truncation notice if we hit the limit (in subdirs, not root files)
     if truncated:
         lines.append("... (truncated)")
 

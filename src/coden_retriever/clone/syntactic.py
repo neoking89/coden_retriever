@@ -8,15 +8,22 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from ..token_estimator import count_tokens
+from ..constants import (
+    CLONE_EXACT_SYNTACTIC_THRESHOLD,
+    CLONE_MIN_BLOCK_SIZE,
+    CLONE_NEAR_SYNTACTIC_THRESHOLD,
+    CloneCategory,
+    DEFAULT_CLONE_RESULT_LIMIT,
+    DEFAULT_SYNTACTIC_FUNC_THRESHOLD,
+    DEFAULT_SYNTACTIC_LINE_THRESHOLD,
+)
+from ..graph_utils import apply_token_budget_filter
+from ._constants import TOKEN_OVERHEAD_CLONES, TOKEN_PER_CLONE_PAIR, clone_pair_text
 from .sparse_utils import SparseJaccardComputer
 from .tokenizer import tokenize_function
 
 if TYPE_CHECKING:
     from ..models import CodeEntity
-
-_TOKEN_OVERHEAD_CLONES = 200
-_TOKEN_PER_CLONE_PAIR = 80
 
 
 def _suggest_action(e1: "CodeEntity", e2: "CodeEntity", match_pct: float) -> str:
@@ -42,21 +49,21 @@ def _is_nested(e1: "CodeEntity", e2: "CodeEntity") -> bool:
 
 def _get_category(match_pct: float, max_block_size: int) -> str:
     """Determine clone category based on match percentage and block size."""
-    if match_pct >= 0.95:
-        return "EXACT"
-    if match_pct >= 0.80 and max_block_size >= 5:
-        return "NEAR-CLONE"
-    if max_block_size >= 5:
-        return "STRUCTURAL"
-    return "PARTIAL"
+    if match_pct >= CLONE_EXACT_SYNTACTIC_THRESHOLD:
+        return CloneCategory.EXACT
+    if match_pct >= CLONE_NEAR_SYNTACTIC_THRESHOLD and max_block_size >= CLONE_MIN_BLOCK_SIZE:
+        return CloneCategory.NEAR_CLONE
+    if max_block_size >= CLONE_MIN_BLOCK_SIZE:
+        return CloneCategory.STRUCTURAL
+    return CloneCategory.PARTIAL
 
 
 def detect_clones_syntactic(
     entities: dict[str, "CodeEntity"],
-    line_threshold: float = 0.70,
-    func_threshold: float = 0.50,
+    line_threshold: float = DEFAULT_SYNTACTIC_LINE_THRESHOLD,
+    func_threshold: float = DEFAULT_SYNTACTIC_FUNC_THRESHOLD,
     min_shared_lines: int = 2,
-    limit: int | None = 50,
+    limit: int | None = DEFAULT_CLONE_RESULT_LIMIT,
     exclude_tests: bool = True,
     min_lines: int = 3,
     token_limit: int | None = None,
@@ -205,29 +212,21 @@ def detect_clones_syntactic(
     clone_pairs.sort(key=lambda x: (-x["similarity"], -x["max_block_size"]))
 
     # Count categories
-    exact_count = sum(1 for c in clone_pairs if c["category"] == "EXACT")
-    near_count = sum(1 for c in clone_pairs if c["category"] == "NEAR-CLONE")
-    structural_count = sum(1 for c in clone_pairs if c["category"] == "STRUCTURAL")
-    partial_count = sum(1 for c in clone_pairs if c["category"] == "PARTIAL")
+    exact_count = sum(1 for c in clone_pairs if c["category"] == CloneCategory.EXACT)
+    near_count = sum(1 for c in clone_pairs if c["category"] == CloneCategory.NEAR_CLONE)
+    structural_count = sum(1 for c in clone_pairs if c["category"] == CloneCategory.STRUCTURAL)
+    partial_count = sum(1 for c in clone_pairs if c["category"] == CloneCategory.PARTIAL)
 
     # Apply limit and token budget
     slice_limit = limit if limit is not None else len(clone_pairs)
-    if token_limit is None:
-        filtered_pairs = clone_pairs[:slice_limit]
-        token_budget_exceeded = False
-    else:
-        used_tokens = _TOKEN_OVERHEAD_CLONES
-        token_budget_exceeded = False
-        filtered_pairs = []
-
-        for pair in clone_pairs[:slice_limit]:
-            pair_text = f"{pair['entity1']['name']} {pair['entity1']['file']} {pair['entity2']['name']} {pair['entity2']['file']} {pair['suggested_action']}"
-            pair_tokens = count_tokens(pair_text, is_code=False) + _TOKEN_PER_CLONE_PAIR
-            if used_tokens + pair_tokens > token_limit:
-                token_budget_exceeded = True
-                break
-            used_tokens += pair_tokens
-            filtered_pairs.append(pair)
+    filtered_pairs, _, token_budget_exceeded = apply_token_budget_filter(
+        clone_pairs[:slice_limit],
+        token_limit,
+        TOKEN_OVERHEAD_CLONES,
+        TOKEN_PER_CLONE_PAIR,
+        text_fields=[],
+        text_builder=clone_pair_text,
+    )
 
     return {
         "clones": filtered_pairs,

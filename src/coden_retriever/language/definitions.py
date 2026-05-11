@@ -3,6 +3,7 @@ Language definitions module.
 
 Contains language-to-extension mappings and Tree-sitter queries.
 """
+from pathlib import Path
 from typing import Dict
 
 # Language file extension mapping
@@ -17,11 +18,15 @@ LANGUAGE_MAP: Dict[str, str] = {
     ".c": "c", ".h": "c",
     ".php": "php",
     ".cs": "c_sharp",
-    ".swift": "swift",
     ".kt": "kotlin", ".kts": "kotlin",
     ".scala": "scala",
     ".sh": "bash", ".bash": "bash",
 }
+
+
+def language_for_path(file_path: str | Path) -> str | None:
+    """Resolve a file path to its tree-sitter language name, or None if unsupported."""
+    return LANGUAGE_MAP.get(Path(file_path).suffix.lower())
 
 # Tree-sitter queries for each language
 # NOTE: ref.method_call captures the FULL attribute/member node so we can extract
@@ -37,6 +42,9 @@ LANGUAGE_QUERIES: Dict[str, str] = {
         (import_statement name: (dotted_name) @ref.import)
         (argument_list (identifier) @ref.usage)
         (assignment left: (identifier) @def.variable)
+        (typed_parameter type: (_) @ref.type)
+        (typed_default_parameter type: (_) @ref.type)
+        (function_definition return_type: (_) @ref.type)
     """,
     "javascript": """
         (class_declaration name: (identifier) @def.class body: (class_body) @body.class)
@@ -58,6 +66,15 @@ LANGUAGE_QUERIES: Dict[str, str] = {
         (call_expression function: (identifier) @ref.call)
         (call_expression function: (member_expression) @ref.method_call)
         (import_statement source: (string) @ref.import)
+        (required_parameter type: (_) @ref.type)
+        (optional_parameter type: (_) @ref.type)
+        (public_field_definition type: (_) @ref.type)
+        (property_signature type: (_) @ref.type)
+        (variable_declarator type: (_) @ref.type)
+        (function_declaration return_type: (_) @ref.type)
+        (method_signature return_type: (_) @ref.type)
+        (method_definition return_type: (_) @ref.type)
+        (arrow_function return_type: (_) @ref.type)
     """,
     "go": """
         (function_declaration name: (identifier) @def.function body: (block) @body.function)
@@ -68,6 +85,11 @@ LANGUAGE_QUERIES: Dict[str, str] = {
         (call_expression function: (identifier) @ref.call)
         (call_expression function: (selector_expression) @ref.method_call)
         (import_declaration (import_spec path: (interpreted_string_literal) @ref.import))
+        (parameter_declaration type: (_) @ref.type)
+        (variadic_parameter_declaration type: (_) @ref.type)
+        (field_declaration type: (_) @ref.type)
+        (function_declaration result: (_) @ref.type)
+        (method_declaration result: (_) @ref.type)
     """,
     "rust": """
         (function_item name: (identifier) @def.function body: (block) @body.function)
@@ -79,6 +101,10 @@ LANGUAGE_QUERIES: Dict[str, str] = {
         (call_expression function: (field_expression) @ref.method_call)
         (call_expression function: (scoped_identifier name: (identifier) @ref.call))
         (use_declaration argument: (scoped_identifier) @ref.import)
+        (parameter type: (_) @ref.type)
+        (function_item return_type: (_) @ref.type)
+        (field_declaration type: (_) @ref.type)
+        (let_declaration type: (_) @ref.type)
     """,
     "java": """
         (class_declaration name: (identifier) @def.class body: (class_body) @body.class)
@@ -87,6 +113,10 @@ LANGUAGE_QUERIES: Dict[str, str] = {
         (constructor_declaration name: (identifier) @def.method body: (constructor_body) @body.method)
         (method_invocation name: (identifier) @ref.call)
         (import_declaration (scoped_identifier) @ref.import)
+        (formal_parameter type: (_) @ref.type)
+        (method_declaration type: (_) @ref.type)
+        (field_declaration type: (_) @ref.type)
+        (local_variable_declaration type: (_) @ref.type)
     """,
     "cpp": """
         (function_definition declarator: (function_declarator declarator: (identifier) @def.function) body: (compound_statement) @body.function)
@@ -122,6 +152,10 @@ LANGUAGE_QUERIES: Dict[str, str] = {
         (constructor_declaration name: (identifier) @def.method body: (block) @body.method)
         (invocation_expression function: (identifier) @ref.call)
         (using_directive (qualified_name) @ref.import)
+        (parameter type: (_) @ref.type)
+        (method_declaration type: (_) @ref.type)
+        (variable_declaration type: (_) @ref.type)
+        (property_declaration type: (_) @ref.type)
     """,
     "kotlin": """
         (class_declaration (type_identifier) @def.class (class_body) @body.class)
@@ -129,22 +163,25 @@ LANGUAGE_QUERIES: Dict[str, str] = {
         (function_declaration (simple_identifier) @def.function (function_body) @body.function)
         (call_expression (simple_identifier) @ref.call)
         (import_header (identifier) @ref.import)
-    """,
-    "swift": """
-        (class_declaration name: (type_identifier) @def.class body: (class_body) @body.class)
-        (struct_declaration name: (type_identifier) @def.class body: (struct_body) @body.class)
-        (protocol_declaration name: (type_identifier) @def.class body: (protocol_body) @body.class)
-        (function_declaration name: (simple_identifier) @def.function body: (function_body) @body.function)
-        (call_expression function: (simple_identifier) @ref.call)
-        (import_declaration (identifier) @ref.import)
+        (parameter (user_type) @ref.type)
+        (function_declaration (user_type) @ref.type)
+        (class_parameter (user_type) @ref.type)
+        (variable_declaration (user_type) @ref.type)
     """,
     "scala": """
         (class_definition name: (identifier) @def.class body: (template_body) @body.class)
         (object_definition name: (identifier) @def.class body: (template_body) @body.class)
         (trait_definition name: (identifier) @def.class body: (template_body) @body.class)
-        (function_definition name: (identifier) @def.function body: (block) @body.function)
+        (function_definition (identifier) @def.function body: (_) @body.function)
+        (function_declaration (identifier) @def.function)
         (call_expression function: (identifier) @ref.call)
-        (import_declaration (stable_identifier) @ref.import)
+        (import_declaration (identifier) @ref.import)
+        (parameter type: (_) @ref.type)
+        (class_parameter type: (_) @ref.type)
+        (function_definition return_type: (_) @ref.type)
+        (function_declaration return_type: (_) @ref.type)
+        (val_definition type: (_) @ref.type)
+        (var_definition type: (_) @ref.type)
     """,
     "bash": """
         (function_definition name: (word) @def.function body: (compound_statement) @body.function)

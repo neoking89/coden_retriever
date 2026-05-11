@@ -9,18 +9,50 @@ Uses prompt_toolkit to provide:
 """
 
 from pathlib import Path
+from typing import Callable
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 from rich.rule import Rule
 
-from ..config_loader import SETTING_METADATA
+from ..config_loader import SETTING_METADATA, get_config_dir
+from ..constants import STARTER_QUESTION_DISPLAY_LENGTH
 from .commands import registry
 from .rich_console import console
 from .starter_questions import get_starter_questions
+
+
+_SHIFT_ENTER_KEY = "s-enter"
+_ALT_ENTER_KEYS = ("escape", "enter")
+_PROMPT_HINT_WITH_SHIFT = (
+    "[dim]Shift+Enter or Alt+Enter for newline | "
+    "Tab for starter questions | /help for commands[/dim]"
+)
+_PROMPT_HINT_ALT_ONLY = (
+    "[dim]Alt+Enter for newline | "
+    "Tab for starter questions | /help for commands[/dim]"
+)
+
+
+def _supports_key_sequence(*keys: str) -> bool:
+    """Return whether prompt_toolkit accepts a key sequence."""
+    test_bindings = KeyBindings()
+
+    def _noop(event) -> None:
+        return None
+
+    try:
+        test_bindings.add(*keys)(_noop)
+    except ValueError:
+        return False
+    return True
+
+
+_SHIFT_ENTER_SUPPORTED = _supports_key_sequence(_SHIFT_ENTER_KEY)
 
 
 class SlashCommandCompleter(Completer):
@@ -121,25 +153,97 @@ class SlashCommandCompleter(Completer):
         except PermissionError:
             pass
 
+    def _find_at_reference(self, text: str) -> str | None:
+        """Check if cursor is inside an @file reference.
+
+        Args:
+            text: Text before cursor.
+
+        Returns:
+            Partial path after @ if in a reference, None otherwise.
+        """
+        # Find the last @ preceded by whitespace or at start
+        idx = text.rfind("@")
+        if idx < 0:
+            return None
+        # @ must be at start or preceded by whitespace
+        if idx > 0 and not text[idx - 1].isspace():
+            return None
+        # Extract partial path after @
+        partial = text[idx + 1:]
+        # Don't trigger if there's whitespace after @ (completed reference)
+        if " " in partial or "\t" in partial:
+            return None
+        return partial
+
+    def _complete_file_path(self, partial: str):
+        """Yield file path completions for @file references.
+
+        Args:
+            partial: Partial path typed after @.
+
+        Yields:
+            Completion objects for matching files and directories.
+        """
+        root = Path(self._get_current_dir())
+        if partial:
+            search_dir = root / Path(partial).parent
+            prefix = partial.rsplit("/", 1)[0] + "/" if "/" in partial else ""
+            name_partial = Path(partial).name
+        else:
+            search_dir = root
+            prefix = ""
+            name_partial = ""
+
+        if not search_dir.exists() or not search_dir.is_dir():
+            return
+
+        try:
+            for entry in sorted(search_dir.iterdir(), key=lambda e: e.name):
+                if entry.name.startswith("."):
+                    continue
+                if name_partial and not entry.name.lower().startswith(name_partial.lower()):
+                    continue
+
+                rel_path = f"{prefix}{entry.name}"
+                if entry.is_dir():
+                    rel_path += "/"
+                    meta = "directory"
+                else:
+                    meta = entry.suffix or "file"
+
+                yield Completion(
+                    rel_path,
+                    start_position=-len(partial),
+                    display=rel_path,
+                    display_meta=meta,
+                )
+        except PermissionError:
+            pass
+
     def _complete_questions(self, partial: str):
         """Yield question completions for starter questions.
 
         Args:
-            partial: Partial text to match against question labels.
+            partial: Partial text to match against questions.
 
         Yields:
             Completion objects for matching starter questions.
         """
         partial_lower = partial.lower().strip()
+        max_display_length = STARTER_QUESTION_DISPLAY_LENGTH
 
-        for q in self._starter_questions:
-            # Match against label
-            if not partial_lower or partial_lower in q.label.lower():
+        for question in self._starter_questions:
+            if not partial_lower or partial_lower in question.lower():
+                display = (
+                    question
+                    if len(question) <= max_display_length
+                    else question[: max_display_length - 3] + "..."
+                )
                 yield Completion(
-                    q.question,
+                    question,
                     start_position=-len(partial),
-                    display=q.label,
-                    display_meta=q.category,
+                    display=display,
                 )
 
     def get_completions(self, document, complete_event):
@@ -153,6 +257,12 @@ class SlashCommandCompleter(Completer):
             Completion objects for matching commands or questions.
         """
         text = document.text_before_cursor
+
+        # Check for @file reference completion anywhere in text
+        at_match = self._find_at_reference(text)
+        if at_match is not None:
+            yield from self._complete_file_path(at_match)
+            return
 
         # If input doesn't start with /, show starter questions
         if not text.startswith("/"):
@@ -184,9 +294,10 @@ class SlashCommandCompleter(Completer):
                 config_parts = text[1:].split()
                 # Completing subcommand or key
                 if len(config_parts) == 1 or (len(config_parts) == 2 and not text.endswith(" ")):
-                    # Complete subcommands: set, reset
+                    # Complete subcommands: set, show, reset
                     subcommands = [
                         ("set", "Set a configuration value"),
+                        ("show", "Show settings as a table"),
                         ("reset", "Reset all settings to defaults"),
                     ]
                     sub_partial = config_parts[1] if len(config_parts) > 1 else ""
@@ -211,6 +322,14 @@ class SlashCommandCompleter(Completer):
                                 display=key,
                                 display_meta=meta.short_desc,
                             )
+                    return
+                elif len(config_parts) == 3 and config_parts[1].lower() == "set" and text.endswith(" "):
+                    # Complete values for a known config key
+                    setting_key = config_parts[2].lower()
+                    meta = SETTING_METADATA.get(setting_key)
+                    if meta and meta.value_type == "bool":
+                        for val in ("true", "false"):
+                            yield Completion(val, display=val, display_meta="boolean")
                     return
 
         # Get matching commands
@@ -249,12 +368,13 @@ PROMPT_STYLE = Style.from_dict({
 def _create_key_bindings() -> KeyBindings:
     """Create custom key bindings for the prompt.
 
-    Customizes Ctrl+C behavior:
-    - If there's text in the buffer, clear it
-    - If the buffer is empty, raise KeyboardInterrupt to exit
+    Bindings:
+    - Ctrl+C: clear buffer if text present, otherwise exit
+    - Shift+Enter: insert newline for multiline input
+    - Alt+Enter (escape,enter): insert newline (fallback for terminals without Shift+Enter)
 
     Returns:
-        KeyBindings with custom Ctrl+C handling.
+        KeyBindings with custom key handling.
     """
     bindings = KeyBindings()
 
@@ -263,31 +383,44 @@ def _create_key_bindings() -> KeyBindings:
         """Handle Ctrl+C: clear buffer if text present, otherwise exit."""
         buffer = event.app.current_buffer
         if buffer.text:
-            # Clear the text field
             buffer.reset()
         else:
-            # Raise KeyboardInterrupt to exit
             raise KeyboardInterrupt
+
+    def handle_shift_enter(event):
+        """Insert newline for multiline input."""
+        event.current_buffer.insert_text("\n")
+
+    if _SHIFT_ENTER_SUPPORTED:
+        bindings.add(_SHIFT_ENTER_KEY)(handle_shift_enter)
+
+    @bindings.add(*_ALT_ENTER_KEYS)
+    def handle_alt_enter(event):
+        """Alt+Enter fallback for terminals that don't support Shift+Enter."""
+        event.current_buffer.insert_text("\n")
 
     return bindings
 
 
-def create_prompt_session(get_current_dir=None) -> PromptSession:
-    """Create a prompt session with slash command completion.
+def create_prompt_session(get_current_dir: Callable[[], str] | None = None) -> PromptSession:
+    """Create a prompt session with slash command completion and persistent history.
 
     Args:
         get_current_dir: Optional callable that returns current working directory.
                         Used for /cd path completion.
 
     Returns:
-        Configured PromptSession with auto-completion.
+        Configured PromptSession with auto-completion and file-backed history.
     """
+    # Persist input history across sessions for up/down arrow recall
+    history_path = get_config_dir() / "prompt_history.txt"
     return PromptSession(
         completer=SlashCommandCompleter(get_current_dir=get_current_dir),
         style=PROMPT_STYLE,
         complete_while_typing=True,
         complete_in_thread=True,  # Non-blocking completion
         key_bindings=_create_key_bindings(),
+        history=FileHistory(str(history_path)),
     )
 
 
@@ -301,34 +434,12 @@ async def get_user_input_async(session: PromptSession) -> str:
         The user's input string, stripped.
     """
     console.print(Rule(style="dim"))
-    console.print("[dim]Tab for starter questions, /help for commands[/dim]")
+    hint = _PROMPT_HINT_WITH_SHIFT if _SHIFT_ENTER_SUPPORTED else _PROMPT_HINT_ALT_ONLY
+    console.print(hint)
 
     try:
         # Use prompt_toolkit for input with completion
         user_input = await session.prompt_async(
-            HTML("<prompt>You: </prompt>"),
-        )
-        return user_input.strip()
-    except EOFError:
-        return "/exit"
-    except KeyboardInterrupt:
-        return "/exit"
-
-
-def get_user_input_sync(session: PromptSession) -> str:
-    """Synchronous version of get_user_input_async.
-
-    Args:
-        session: The prompt session to use.
-
-    Returns:
-        The user's input string, stripped.
-    """
-    console.print(Rule(style="dim"))
-    console.print("[dim]Tab for starter questions, /help for commands[/dim]")
-
-    try:
-        user_input = session.prompt(
             HTML("<prompt>You: </prompt>"),
         )
         return user_input.strip()

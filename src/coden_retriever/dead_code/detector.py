@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Any
 from ..constants import (
     DEAD_CODE_CONFIDENCE_HIGH,
     DEAD_CODE_CONFIDENCE_MEDIUM,
+    DEFAULT_DEAD_CODE_CONFIDENCE_THRESHOLD,
+    DEFAULT_DEAD_CODE_RESULT_LIMIT,
 )
 from .confidence import calculate_confidence, get_reason
 
@@ -41,11 +43,11 @@ def _is_runtime_called(name: str) -> bool:
 def detect_unused_functions(
     entities: dict[str, "CodeEntity"],
     graph: "nx.DiGraph",
-    confidence_threshold: float = 0.5,
+    confidence_threshold: float = DEFAULT_DEAD_CODE_CONFIDENCE_THRESHOLD,
     exclude_tests: bool = True,
     include_private: bool = False,
     min_lines: int = 3,
-    limit: int | None = 50,
+    limit: int | None = DEFAULT_DEAD_CODE_RESULT_LIMIT,
     used_names: set[str] | None = None,
 ) -> dict[str, Any]:
     """Find functions with no incoming calls in the call graph.

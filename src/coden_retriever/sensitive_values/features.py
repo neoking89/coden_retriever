@@ -128,6 +128,7 @@ FEATURE_NAMES: list[str] = [
     "has_lowercase_middle_word",
     "has_single_char_period",
     "has_hyphenated_capital_word",
+    "looks_like_email",
 ]
 
 
@@ -421,6 +422,32 @@ def has_hyphenated_capital_word(text: str) -> bool:
     return False
 
 
+_EMAIL_LOCAL_EXTRA: frozenset[str] = frozenset(".-_+")
+
+
+def looks_like_email(text: str) -> bool:
+    """Check if string has the structural shape `local@domain.tld`.
+
+    Email addresses are PII. Structural check avoids broad regex: exactly one
+    '@', non-empty local part with alnum/`.-_+`, domain with at least one dot,
+    each domain label alnum/`-`, TLD purely alphabetic and at least 2 chars.
+    """
+    if text.count("@") != 1 or " " in text:
+        return False
+    local, domain = text.split("@")
+    if not local or not domain or "." not in domain:
+        return False
+    if not all(c.isalnum() or c in _EMAIL_LOCAL_EXTRA for c in local):
+        return False
+    labels = domain.split(".")
+    if any(not lbl for lbl in labels):
+        return False
+    if not all(all(c.isalnum() or c == "-" for c in lbl) for lbl in labels):
+        return False
+    tld = labels[-1]
+    return len(tld) >= 2 and tld.isalpha()
+
+
 def has_cred_in_url(text: str) -> bool:
     """Check if URL has credentials in authority part (user:pass@host).
 
@@ -469,4 +496,5 @@ def extract_features(text: str) -> list[float]:
         float(has_lowercase_middle_word(text)),            # name particles = PII
         float(has_single_char_period(text)),               # middle initials = PII
         float(has_hyphenated_capital_word(text)),           # hyphenated names = PII
+        float(looks_like_email(text)),                       # email structure = PII
     ]

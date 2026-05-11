@@ -267,6 +267,9 @@ class PathTraceResult:
             }
         }
 
+    # WHY KEPT: Not called in production yet, but these are the human-readable
+    # rendering API for PathTraceResult. Without them the data model only has
+    # to_dict() and any CLI/script consumer would have to rewrite formatting.
     def format_summary(self) -> str:
         """Format a summary of the trace result."""
         parts = []

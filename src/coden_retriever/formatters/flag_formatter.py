@@ -11,24 +11,27 @@ import json
 from typing import Any
 
 from ..constants import (
+    DEFAULT_DEAD_CODE_CONFIDENCE_THRESHOLD,
+    FORMATTER_WIDTH,
+    MAGIC_CONSTANT_DEFAULT_MIN_FILES,
+    MAGIC_CONSTANT_DEFAULT_MIN_OCCURRENCES,
+    MAGIC_CONSTANT_TIER_HIGH,
+    MAGIC_CONSTANT_TIER_MODERATE,
+    SENSITIVE_VALUE_DEFAULT_THRESHOLD,
     SENSITIVE_VALUE_TIER_HIGH,
     SENSITIVE_VALUE_TIER_MODERATE,
+    TRAMP_DATA_DEFAULT_MIN_OCCURRENCES,
     TRAMP_DATA_TIER_HIGH,
     TRAMP_DATA_TIER_LOW,
     TRAMP_DATA_TIER_MODERATE,
 )
-from .cli_metrics import BaseCLIMetricFormatter, FALSE_POSITIVE_WARNING, SeverityTier
+from .cli_metrics import BaseCLIMetricFormatter, FALSE_POSITIVE_WARNING, SeverityTier, extract_filename, format_parameter_header
 
 
 _FLAG_TABLE_WIDTH = 130
 _FLAG_FILE_COL_WIDTH = 40
 _FLAG_NAME_COL_WIDTH = 25
 _FLAG_METRIC_COL_WIDTH = 28
-
-
-def _extract_filename(file_path: str) -> str:
-    """Extract filename from a path, handling both Unix and Windows separators."""
-    return file_path.split("/")[-1].split("\\")[-1]
 
 
 def _truncate(text: str | None, max_len: int) -> str:
@@ -48,9 +51,11 @@ def format_parameters_header(
     echo_threshold: float,
     limit: int | None,
     dry_run: bool,
-    dead_code_threshold: float = 0.5,
-    min_occurrences: int = 3,
-    sensitive_threshold: float = 0.35,
+    dead_code_threshold: float = DEFAULT_DEAD_CODE_CONFIDENCE_THRESHOLD,
+    min_occurrences: int = TRAMP_DATA_DEFAULT_MIN_OCCURRENCES,
+    sensitive_threshold: float = SENSITIVE_VALUE_DEFAULT_THRESHOLD,
+    min_constant_occurrences: int = MAGIC_CONSTANT_DEFAULT_MIN_OCCURRENCES,
+    min_constant_files: int = MAGIC_CONSTANT_DEFAULT_MIN_FILES,
 ) -> str:
     """Format parameter summary header showing active analysis and thresholds.
 
@@ -70,9 +75,9 @@ def format_parameters_header(
         Formatted parameter header string
     """
     lines = []
-    lines.append("=" * 80)
+    lines.append("=" * FORMATTER_WIDTH)
     lines.append("ANALYSIS PARAMETERS")
-    lines.append("=" * 80)
+    lines.append("=" * FORMATTER_WIDTH)
 
     # Active analysis types with their thresholds
     analysis_names = {
@@ -83,6 +88,7 @@ def format_parameters_header(
         "-D": f"Dead Code (confidence >= {dead_code_threshold * 100:.0f}%)",
         "-T": f"Tramp Data (occurrences >= {min_occurrences})",
         "-S": f"Sensitive Values (confidence >= {sensitive_threshold * 100:.0f}%)",
+        "-K": f"Magic Constants (occurrences >= {min_constant_occurrences}, files >= {min_constant_files})",
     }
     active = [analysis_names[flag] for flag in active_flags if flag in analysis_names]
 
@@ -105,7 +111,7 @@ def format_parameters_header(
             lines.append("Result Limit: ALL matching items will be flagged")
 
     lines.append(FALSE_POSITIVE_WARNING)
-    lines.append("=" * 80)
+    lines.append("=" * FORMATTER_WIDTH)
     return "\n".join(lines)
 
 
@@ -124,21 +130,14 @@ def format_echo_parameters_header(
     Returns:
         Formatted parameter header string
     """
-    lines = []
-    lines.append("=" * 80)
-    lines.append("ECHO COMMENT DETECTION PARAMETERS")
-    lines.append("=" * 80)
-    lines.append(f"Similarity Threshold: >= {echo_threshold * 100:.0f}%")
-    lines.append(f"Exclude Tests: {exclude_tests}")
-
-    if limit is None:
-        lines.append("[!] Result Limit: ALL (may be slow for large repos)")
-    else:
-        lines.append(f"[!] Result Limit: TOP {limit} -- more results may exist (use -n -1 for all)")
-
-    lines.append(FALSE_POSITIVE_WARNING)
-    lines.append("=" * 80)
-    return "\n".join(lines)
+    return format_parameter_header(
+        "ECHO COMMENT DETECTION PARAMETERS",
+        [
+            f"Similarity Threshold: >= {echo_threshold * 100:.0f}%",
+            f"Exclude Tests: {exclude_tests}",
+        ],
+        limit,
+    )
 
 
 class FlagFormatter(BaseCLIMetricFormatter):
@@ -217,6 +216,14 @@ class FlagFormatter(BaseCLIMetricFormatter):
                 return SeverityTier.MODERATE
             else:
                 return SeverityTier.LOW
+        elif flag_type == "magic_constant":
+            occurrences = item.get("occurrences", 0)
+            if occurrences >= MAGIC_CONSTANT_TIER_HIGH:
+                return SeverityTier.HIGH
+            elif occurrences >= MAGIC_CONSTANT_TIER_MODERATE:
+                return SeverityTier.MODERATE
+            else:
+                return SeverityTier.LOW
         return SeverityTier.LOW
 
     def format_items(
@@ -247,7 +254,8 @@ class FlagFormatter(BaseCLIMetricFormatter):
             "sensitive_value": 3, "sensitive_value_replace": 3,
             "dead_code": 4, "dead_code_remove": 4,
             "tramp_data": 5,
-            "echo": 6, "echo_remove": 6,
+            "magic_constant": 6,
+            "echo": 7, "echo_remove": 7,
         }
         sorted_items = sorted(
             items,
@@ -306,6 +314,10 @@ class FlagFormatter(BaseCLIMetricFormatter):
                 metric = f"Tramp: {occurrences} funcs, {group_size} params"
             elif item.get("type") in ("sensitive_value", "sensitive_value_replace"):
                 metric = f"Conf: {item.get('confidence', 0) * 100:.0f}%"
+            elif item.get("type") == "magic_constant":
+                occ = item.get("occurrences", 0)
+                files = item.get("files", 0)
+                metric = f"Magic: {occ}x in {files} files"
             else:
                 metric = "N/A"
 
@@ -322,7 +334,7 @@ class FlagFormatter(BaseCLIMetricFormatter):
             )
 
             # Short file path
-            file_short = _extract_filename(file_path)
+            file_short = extract_filename(file_path)
             file_display = f"{file_short}:{line}"
 
             lines.append(
@@ -353,28 +365,30 @@ class FlagFormatter(BaseCLIMetricFormatter):
         echo_comments = type_summary.get("echo_comments", 0)
         tramp_data = type_summary.get("tramp_data", 0)
         sensitive_values = type_summary.get("sensitive_values", 0)
+        magic_constants = type_summary.get("magic_constants", 0)
 
         mode = "[DRY-RUN] Would flag" if dry_run else "Flagged"
 
         lines = [
             "",
-            "=" * 80,
+            "=" * FORMATTER_WIDTH,
             f"Flag Command | {mode} {flagged_count} objects across {files_modified} files",
-            "-" * 80,
+            "-" * FORMATTER_WIDTH,
             f"  HOTSPOT flags: {hotspots}",
             f"  PROPAGATION flags: {propagation}",
             f"  CLONE flags: {clones}",
             f"  SENSITIVE_VALUE flags: {sensitive_values}",
             f"  DEAD_CODE flags: {dead_code}",
             f"  TRAMP_DATA flags: {tramp_data}",
+            f"  MAGIC_CONSTANT flags: {magic_constants}",
             f"  ECHO flags: {echo_comments}",
         ]
 
         if dry_run:
-            lines.append("-" * 80)
+            lines.append("-" * FORMATTER_WIDTH)
             lines.append("Run without --dry-run to apply changes.")
 
-        lines.append("=" * 80)
+        lines.append("=" * FORMATTER_WIDTH)
         return "\n".join(lines)
 
     def format_clear_stats(self, result: dict[str, Any]) -> str:
@@ -394,13 +408,13 @@ class FlagFormatter(BaseCLIMetricFormatter):
 
         lines = [
             "",
-            "=" * 80,
+            "=" * FORMATTER_WIDTH,
             f"Flag Clear | {mode} {comments_removed} [CODEN] comments from {files_cleaned} files",
         ]
 
         if dry_run:
-            lines.append("-" * 80)
+            lines.append("-" * FORMATTER_WIDTH)
             lines.append("Run without --dry-run to apply changes.")
 
-        lines.append("=" * 80)
+        lines.append("=" * FORMATTER_WIDTH)
         return "\n".join(lines)

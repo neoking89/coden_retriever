@@ -110,7 +110,7 @@ def handle_reset_command() -> int:
     if not running:
         print("  Daemon is not running")
     else:
-        if stop_daemon(config.daemon.host, config.daemon.port):
+        if stop_daemon(config.daemon.address):
             print(f"  Daemon stopped (was PID: {pid})")
         else:
             print(f"  Failed to stop daemon (PID: {pid})", file=sys.stderr)

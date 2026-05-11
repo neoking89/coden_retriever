@@ -5,7 +5,8 @@ Handles construction and analysis of the code call graph, including:
 - Graph building from parsed references
 - Centrality computation (PageRank, Betweenness)
 - Path tracing between symbols
-- Score aggregation for classes
+
+Score aggregation lives on the score domain models (see models/scores.py).
 
 This module is extracted from SearchEngine to follow SRP.
 """
@@ -16,7 +17,7 @@ from typing import TYPE_CHECKING
 
 from ..config import Config
 from ..constants import AMBIGUOUS_METHOD_NAMES
-from ..models import PathTraceResult
+from ..models import CentralityCache, PathTraceResult
 
 if TYPE_CHECKING:
     from networkx import DiGraph
@@ -45,7 +46,6 @@ class GraphAnalyzer:
     - Building call graphs from parsed code references
     - Computing centrality metrics (PageRank, Betweenness)
     - Tracing paths between code entities
-    - Aggregating scores to parent classes
 
     This class encapsulates all graph-related logic that was previously
     embedded in SearchEngine.
@@ -74,8 +74,10 @@ class GraphAnalyzer:
 
         nx = _get_nx()
         self._graph: "DiGraph" = nx.DiGraph()
-        self._pagerank_cache: dict[str, float] = {}
-        self._betweenness_cache: dict[str, float] = {}
+        # Type-annotation edges live on a parallel graph so call-graph PR is
+        # not perturbed by type references. Only the type_ref signal reads it.
+        self._type_graph: "DiGraph" = nx.DiGraph()
+        self._centrality: CentralityCache = CentralityCache()
 
     @property
     def graph(self) -> "DiGraph":
@@ -83,14 +85,9 @@ class GraphAnalyzer:
         return self._graph
 
     @property
-    def pagerank_cache(self) -> dict[str, float]:
-        """Get cached PageRank scores."""
-        return self._pagerank_cache
-
-    @property
-    def betweenness_cache(self) -> dict[str, float]:
-        """Get cached Betweenness centrality scores."""
-        return self._betweenness_cache
+    def centrality(self) -> CentralityCache:
+        """Indexed-time centrality snapshot (pagerank + betweenness)."""
+        return self._centrality
 
     def build_graph(self, references: list[tuple[str, int, str, str, str | None]]) -> None:
         """
@@ -145,11 +142,18 @@ class GraphAnalyzer:
                 if target.is_test:
                     weight *= Config.PENALTY_TEST
 
-                if self._graph.has_edge(source_id, target_id):
-                    self._graph[source_id][target_id]["weight"] += weight
-                    self._graph[source_id][target_id]["types"].add(ref_type)
-                else:
-                    self._graph.add_edge(source_id, target_id, weight=weight, types={ref_type})
+                # Type edges live in BOTH graphs: in the main graph as a low-weight
+                # structural signal (so type-only nodes accumulate some main-PR), and
+                # in the dedicated type_graph for the type_ref signal's per-relation PR.
+                graphs = [self._graph]
+                if ref_type == "type":
+                    graphs.append(self._type_graph)
+                for target_graph in graphs:
+                    if target_graph.has_edge(source_id, target_id):
+                        target_graph[source_id][target_id]["weight"] += weight
+                        target_graph[source_id][target_id]["types"].add(ref_type)
+                    else:
+                        target_graph.add_edge(source_id, target_id, weight=weight, types={ref_type})
 
     def _find_containing_scope(self, file_path: str, line: int) -> str | None:
         """Find the entity containing a given line."""
@@ -174,30 +178,54 @@ class GraphAnalyzer:
 
         These metrics are pre-computed during indexing for O(1) lookup during search.
         """
-        if len(self._graph) == 0:
-            self._pagerank_cache = {}
-            self._betweenness_cache = {}
+        if len(self._graph) == 0 and len(self._type_graph) == 0:
+            self._centrality = CentralityCache()
             return
 
-        # PageRank Computation
         nx = _get_nx()
-        try:
-            pagerank_scores = nx.pagerank(self._graph, weight="weight")
-            if self._scores_are_uniform(pagerank_scores):
-                raise ValueError("PageRank returned a uniform distribution")
-            self._pagerank_cache = pagerank_scores
-        except Exception as e:
-            logger.warning(f"PageRank failed or was uniform ({e}); falling back to weighted in-degree")
-            self._pagerank_cache = self._fallback_pagerank_scores()
+        if len(self._graph) > 0:
+            try:
+                pagerank_scores = nx.pagerank(self._graph, weight="weight")
+                if self._scores_are_uniform(pagerank_scores):
+                    raise ValueError("PageRank returned a uniform distribution")
+            except Exception as e:
+                logger.warning(f"PageRank failed or was uniform ({e}); falling back to weighted in-degree")
+                pagerank_scores = self._fallback_pagerank_scores()
 
-        # Betweenness Centrality Computation
-        try:
-            k = min(200, len(self._graph))
-            self._betweenness_cache = nx.betweenness_centrality(
-                self._graph, k=k, weight="weight", seed=42
-            )
-        except Exception:
-            self._betweenness_cache = {n: 0.0 for n in self._graph.nodes()}
+            try:
+                k = min(200, len(self._graph))
+                betweenness_scores = nx.betweenness_centrality(
+                    self._graph, k=k, weight="weight", seed=42
+                )
+            except Exception:
+                betweenness_scores = {n: 0.0 for n in self._graph.nodes()}
+        else:
+            pagerank_scores = {}
+            betweenness_scores = {}
+
+        if len(self._type_graph) > 0:
+            try:
+                # Personalize by call-graph PR: types referenced FROM architecturally
+                # important code (search engine, parser, cache) get more weight than
+                # types only referenced by leaf utility/config code.
+                personalization = {
+                    n: max(pagerank_scores.get(n, 0.0), 1e-9)
+                    for n in self._type_graph.nodes()
+                }
+                type_pagerank_scores = nx.pagerank(
+                    self._type_graph, weight="weight", personalization=personalization
+                )
+            except Exception as e:
+                logger.warning(f"Type-graph PageRank failed ({e}); empty type_ref signal")
+                type_pagerank_scores = {}
+        else:
+            type_pagerank_scores = {}
+
+        self._centrality = CentralityCache(
+            pagerank=pagerank_scores,
+            betweenness=betweenness_scores,
+            type_pagerank=type_pagerank_scores,
+        )
 
     def _scores_are_uniform(self, scores: dict[str, float], abs_tol: float = 1e-12) -> bool:
         """Return True when all scores are effectively identical."""
@@ -260,61 +288,7 @@ class GraphAnalyzer:
 
                 return self._fallback_pagerank_scores()
 
-        return self._pagerank_cache or {}
-
-    def aggregate_scores_to_classes(
-        self,
-        scores_pr: dict[str, float],
-        scores_bt: dict[str, float]
-    ) -> tuple[dict[str, float], dict[str, float]]:
-        """
-        Aggregate method/function scores to their parent classes.
-
-        For PageRank: Use sqrt-normalized sum to prevent runaway scores
-        For Betweenness: Use max + sum to boost classes with important methods
-
-        Args:
-            scores_pr: PageRank scores
-            scores_bt: Betweenness scores
-
-        Returns:
-            Tuple of (aggregated_pr, aggregated_bt) dictionaries
-        """
-        # Build fast lookup: (parent_class_name, file_path) -> class_node_id
-        class_lookup: dict[tuple, str] = {}
-        for node_id, entity in self._entities.items():
-            if entity.entity_type == "class":
-                class_lookup[(entity.name, entity.file_path)] = node_id
-
-        # Track aggregated scores per class
-        class_pr_contributions: dict[str, list] = defaultdict(list)
-        class_bt_contributions: dict[str, list] = defaultdict(list)
-
-        # Collect method scores for their parent classes
-        for node_id, entity in self._entities.items():
-            if entity.entity_type in ("method", "function") and entity.parent_class:
-                parent_id = class_lookup.get((entity.parent_class, entity.file_path))
-                if parent_id:
-                    if node_id in scores_pr:
-                        class_pr_contributions[parent_id].append(scores_pr[node_id])
-                    if node_id in scores_bt:
-                        class_bt_contributions[parent_id].append(scores_bt[node_id])
-
-        # Create copies for aggregated scores
-        agg_pr = dict(scores_pr)
-        agg_bt = dict(scores_bt)
-
-        # Aggregate to classes with dampening to balance class vs function visibility
-        dampening = Config.MAP_AGGREGATION_DAMPENING
-        for class_id, pr_values in class_pr_contributions.items():
-            if pr_values:
-                agg_pr[class_id] = agg_pr.get(class_id, 0.0) + dampening * math.sqrt(sum(pr_values))
-
-        for class_id, bt_values in class_bt_contributions.items():
-            if bt_values:
-                agg_bt[class_id] = agg_bt.get(class_id, 0.0) + dampening * (max(bt_values) + sum(bt_values))
-
-        return agg_pr, agg_bt
+        return self._centrality.pagerank or {}
 
     def trace_call_path(
         self,
@@ -462,40 +436,3 @@ class GraphAnalyzer:
             requested_path_limit=limit_paths
         )
 
-    def get_edge_info(self, source_id: str, target_id: str) -> dict | None:
-        """Get information about an edge between two nodes."""
-        if self._graph.has_edge(source_id, target_id):
-            return dict(self._graph[source_id][target_id])
-        return None
-
-    def get_node_neighbors(
-        self,
-        node_id: str,
-        direction: str = "both"
-    ) -> list[tuple[str, float, set]]:
-        """
-        Get neighbors of a node with edge info.
-
-        Args:
-            node_id: The node to get neighbors for
-            direction: "in" for predecessors, "out" for successors, "both" for all
-
-        Returns:
-            List of (neighbor_id, weight, types) tuples
-        """
-        result: list[tuple[str, float, set[str]]] = []
-
-        if node_id not in self._graph:
-            return result
-
-        if direction in ("in", "both"):
-            for pred in self._graph.predecessors(node_id):
-                edge = self._graph[pred][node_id]
-                result.append((pred, edge.get("weight", 0), edge.get("types", set())))
-
-        if direction in ("out", "both"):
-            for succ in self._graph.successors(node_id):
-                edge = self._graph[node_id][succ]
-                result.append((succ, edge.get("weight", 0), edge.get("types", set())))
-
-        return result

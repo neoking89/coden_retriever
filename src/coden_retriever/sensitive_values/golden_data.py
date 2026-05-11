@@ -176,6 +176,12 @@ SENSITIVE_VALUES: list[str] = [
     "Pieter van Hooch",
     "Simone de Beauvoir",
     "Hernan de Soto",
+    # Email addresses (PII) — anchor the looks_like_email feature
+    "ptolemy.havrosky@stagcoast.io",
+    "minerva-okonjo@duskridge.org",
+    "fabrizio.quellen+admin@palethorn.net",
+    "wenduin.crozzelby@ironpetal.co",
+    "selka.vromirov@halcyondrift.dev",
 ]
 
 # Safe values: realistic non-secret strings from codebases

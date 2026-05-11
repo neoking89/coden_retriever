@@ -20,14 +20,14 @@ from pathlib import Path
 
 from ..cache import CacheManager, CachedIndices
 from ..config import CENTRAL_CACHE_DIR
+from ..semantic_config import SemanticConfig
 from ..constants import (
-    DEFAULT_DAEMON_HOST,
-    DEFAULT_DAEMON_PORT,
     DEFAULT_MAX_PROJECTS,
     DEFAULT_DAEMON_TIMEOUT,
 )
 from ..search import SearchEngine
 from ..watcher import BatchedChanges, FileWatcher
+from .address import DaemonAddress
 from .handlers import create_handler_registry
 from .project_cache import ProjectCache
 from .protocol import (
@@ -78,7 +78,7 @@ class DaemonRequestHandler(socketserver.StreamRequestHandler):
         buffer = b""
 
         try:
-            self.request.settimeout(DEFAULT_DAEMON_TIMEOUT)
+            self.request.settimeout(daemon.daemon_timeout)
 
             while True:
                 try:
@@ -123,19 +123,19 @@ class DaemonServer:
 
     def __init__(
         self,
-        host: str = DEFAULT_DAEMON_HOST,
-        port: int = DEFAULT_DAEMON_PORT,
+        address: DaemonAddress = DaemonAddress(),
         max_projects: int = DEFAULT_MAX_PROJECTS,
         idle_timeout: int | None = None,
         verbose: bool = False,
         enable_watch: bool = True,
+        daemon_timeout: float = DEFAULT_DAEMON_TIMEOUT,
     ):
-        self.host = host
-        self.port = port
+        self.address = address
         self.max_projects = max_projects
         self.idle_timeout = idle_timeout
         self.verbose = verbose
         self.enable_watch = enable_watch
+        self.daemon_timeout = daemon_timeout
 
         # Application state
         self._project_cache = ProjectCache(max_projects)
@@ -155,14 +155,14 @@ class DaemonServer:
         """Start the daemon server."""
         try:
             self._tcp_server = DaemonTCPServer(
-                (self.host, self.port),
+                (self.address.host, self.address.port),
                 DaemonRequestHandler
             )
             # Attach self so handlers can access process_message and cache
             self._tcp_server.daemon_instance = self
 
-            logger.info(f"Daemon server listening on {self.host}:{self.port}")
-            print(f"Daemon started on {self.host}:{self.port}", file=sys.stderr)
+            logger.info(f"Daemon server listening on {self.address.host}:{self.address.port}")
+            print(f"Daemon started on {self.address.host}:{self.address.port}", file=sys.stderr)
 
             # Start idle monitor in background if timeout is set
             if self.idle_timeout:
@@ -285,8 +285,7 @@ class DaemonServer:
 
         cache_manager = CacheManager(
             source_path,
-            enable_semantic=enable_semantic,
-            model_path=model_path,
+            semantic=SemanticConfig(enabled=enable_semantic, model_path=model_path),
             verbose=self.verbose,
         )
 
@@ -353,8 +352,7 @@ class DaemonServer:
             updater = IncrementalUpdater(
                 source_dir=Path(cache_key),
                 indices=project.indices,
-                enable_semantic=enable_semantic,
-                model_path=model_path,
+                semantic=SemanticConfig(enabled=enable_semantic, model_path=model_path),
             )
 
             # Apply changes
@@ -477,25 +475,25 @@ def remove_pid_file(pid_file: Path | None = None) -> None:
 
 
 def run_daemon(
-    host: str = DEFAULT_DAEMON_HOST,
-    port: int = DEFAULT_DAEMON_PORT,
+    address: DaemonAddress = DaemonAddress(),
     max_projects: int = DEFAULT_MAX_PROJECTS,
     idle_timeout: int | None = None,
     verbose: bool = False,
     foreground: bool = False,
     enable_watch: bool = True,
+    daemon_timeout: float = DEFAULT_DAEMON_TIMEOUT,
 ) -> int:
     """
     Run the daemon server.
 
     Args:
-        host: Host address to bind to
-        port: Port to bind to
+        address: Daemon network endpoint
         max_projects: Maximum number of projects to keep in memory
         idle_timeout: Seconds of idle time before auto-shutdown (None for no timeout)
         verbose: Enable verbose logging
         foreground: Run in foreground (for debugging)
         enable_watch: Enable automatic file watching for cache updates
+        daemon_timeout: Socket timeout for client connections (seconds)
 
     Returns:
         Exit code
@@ -532,12 +530,12 @@ def run_daemon(
 
     try:
         server = DaemonServer(
-            host=host,
-            port=port,
+            address=address,
             max_projects=max_projects,
             idle_timeout=idle_timeout,
             verbose=verbose,
             enable_watch=enable_watch,
+            daemon_timeout=daemon_timeout,
         )
         server.start()
         return 0

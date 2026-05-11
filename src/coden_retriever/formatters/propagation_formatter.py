@@ -11,10 +11,8 @@ import json
 from typing import Any
 
 from .cli_metrics import BaseCLIMetricFormatter, FALSE_POSITIVE_WARNING, SeverityTier
-from ..constants import PC_THRESHOLD_WARNING
+from ..constants import FORMATTER_WIDTH, PC_APPROXIMATE_STATUS, PC_THRESHOLD_WARNING
 
-
-_PROP_TABLE_WIDTH = 80
 _MODULE_TABLE_WIDTH = 70
 
 
@@ -34,9 +32,9 @@ def format_propagation_parameters_header(
         Formatted parameter header string
     """
     lines = []
-    lines.append("=" * 80)
+    lines.append("=" * FORMATTER_WIDTH)
     lines.append("PROPAGATION COST ANALYSIS")
-    lines.append("=" * 80)
+    lines.append("=" * FORMATTER_WIDTH)
     lines.append("")
     lines.append("What this measures:")
     lines.append("  Propagation Cost (PC) = % of codebase reachable from any function")
@@ -53,7 +51,7 @@ def format_propagation_parameters_header(
     lines.append("  25-43% WARNING  High coupling, consider refactoring")
     lines.append("  > 43%  CRITICAL Architectural decay, action needed")
     lines.append("")
-    lines.append("-" * 80)
+    lines.append("-" * FORMATTER_WIDTH)
     lines.append(f"High-Coupling Threshold: >= {propagation_threshold * 100:.0f}% (modules above are flagged)")
     lines.append(f"Exclude Tests: {exclude_tests}")
 
@@ -63,7 +61,7 @@ def format_propagation_parameters_header(
         lines.append(f"[!] Module Breakdown Limit: TOP {limit} (use -n -1 for all)")
 
     lines.append(FALSE_POSITIVE_WARNING)
-    lines.append("=" * 80)
+    lines.append("=" * FORMATTER_WIDTH)
     return "\n".join(lines)
 
 
@@ -83,7 +81,45 @@ class PropagationFormatter(BaseCLIMetricFormatter):
             return SeverityTier.CRITICAL
         elif status == "WARNING":
             return SeverityTier.MODERATE
+        elif status == PC_APPROXIMATE_STATUS:
+            return SeverityTier.NOTABLE
         return SeverityTier.OPTIMAL
+
+    def _format_approximation_banner(self, result: dict[str, Any]) -> list[str]:
+        """Loud banner shown when reachable_pairs was approximated by direct edges."""
+        if not result.get("approximation_used"):
+            return []
+        stats = result.get("graph_stats", {})
+        nodes = stats.get("nodes", "?")
+        limit = stats.get("closure_node_limit", "?")
+        nodes_str = f"{nodes:,}" if isinstance(nodes, int) else str(nodes)
+        limit_str = f"{limit:,}" if isinstance(limit, int) else str(limit)
+        bar = "=" * FORMATTER_WIDTH
+        return [
+            bar,
+            self.colorize("[APPROXIMATION] DIRECT-EDGES LOWER BOUND", SeverityTier.NOTABLE),
+            bar,
+            f"Graph too large for transitive closure ({nodes_str} nodes > {limit_str}).",
+            "Reachable-pairs count is approximated by direct edges only.",
+            "PASS / WARNING / CRITICAL verdict is suppressed - the approximation",
+            "systematically under-counts. Use the per-module breakdown below for",
+            "actionable signal that does not depend on total graph size.",
+            bar,
+            "",
+        ]
+
+    def _format_max_module_coupling(self, result: dict[str, Any]) -> list[str]:
+        """Headline figure that doesn't shrink with total ``n``."""
+        summary = result.get("max_module_coupling")
+        if not summary:
+            return []
+        value = summary.get("value", 0)
+        module = summary.get("module", "?")
+        funcs = summary.get("functions", 0)
+        return [
+            f"  Max module coupling: {value*100:.2f}% (in `{module}`, {funcs} functions)",
+            "",
+        ]
 
     def _format_overall_metric(
         self, result: dict[str, Any], tier: SeverityTier
@@ -93,10 +129,19 @@ class PropagationFormatter(BaseCLIMetricFormatter):
         status = result.get("status", "N/A")
         interp = result.get("interpretation", "")
 
+        if status == PC_APPROXIMATE_STATUS:
+            status_line = (
+                f"  Status: {self.colorize('APPROXIMATE (verdict suppressed)', tier)}"
+            )
+            pc_label = "Propagation Cost (lower bound)"
+        else:
+            status_line = f"  Status: {self.colorize(status, tier)}"
+            pc_label = "Propagation Cost"
+
         return [
             "Overall Metric:",
-            f"  Propagation Cost: {self.colorize(f'{pc*100:.2f}%', tier)}",
-            f"  Status: {self.colorize(status, tier)}",
+            f"  {pc_label}: {self.colorize(f'{pc*100:.2f}%', tier)}",
+            status_line,
             f"  {interp}",
             "",
         ]
@@ -197,13 +242,16 @@ class PropagationFormatter(BaseCLIMetricFormatter):
         result = items[0]
         tier = self.get_tier(result)
 
-        lines = ["Propagation Cost Analysis", "=" * _PROP_TABLE_WIDTH, ""]
+        lines: list[str] = []
+        lines.extend(self._format_approximation_banner(result))
+        lines.extend(["Propagation Cost Analysis", "=" * FORMATTER_WIDTH, ""])
         lines.extend(self._format_overall_metric(result, tier))
+        lines.extend(self._format_max_module_coupling(result))
         lines.extend(self._format_graph_stats(result))
         lines.extend(self._format_module_breakdown(result))
         lines.extend(self._format_critical_paths(result, tier))
         lines.extend(self._format_recommendations(result))
-        lines.append("=" * _PROP_TABLE_WIDTH)
+        lines.append("=" * FORMATTER_WIDTH)
 
         return "\n".join(lines)
 
@@ -222,8 +270,8 @@ class PropagationFormatter(BaseCLIMetricFormatter):
 
         lines = [
             "",
-            "=" * 80,
+            "=" * FORMATTER_WIDTH,
             f"Propagation Cost | {pc*100:.2f}% | Status: {status} | {nodes:,} functions",
-            "=" * 80,
+            "=" * FORMATTER_WIDTH,
         ]
         return "\n".join(lines)

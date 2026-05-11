@@ -6,14 +6,24 @@ Tools are stored in ~/.coden-retriever/dynamic_tools.py for cross-platform persi
 """
 import ast
 import asyncio
+import functools
 import importlib
 import importlib.util
+import inspect
 import logging
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from types import ModuleType
 from typing import Annotated, Any, cast
 
+import anyio
+import mcp.types
+from anyio.to_thread import run_sync as _to_thread_run_sync
+from fastmcp.server.dependencies import get_context
 from pydantic import Field
+
+from coden_retriever.mcp.constants import get_dynamic_tool_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -21,18 +31,35 @@ logger = logging.getLogger(__name__)
 _MARKER_START = "# --- DYNAMIC TOOLS START ---"
 _MARKER_END = "# --- DYNAMIC TOOLS END ---"
 
+# Guidance returned to callers when the tools block is corrupted; the caller must
+# explicitly trigger recovery (e.g. clear_dynamic_tools_file) rather than silently
+# losing user tools to a blind reset.
+_CORRUPTED_BLOCK_HINT = (
+    "Dynamic tools block is unparseable; refusing insertion to avoid duplicates. "
+    "Inspect the file for forensics and call remove_dynamic_tool(remove_all=True) "
+    "to reset once recovered."
+)
+
+
+class DynamicToolsBlockCorruptedError(RuntimeError):
+    """Raised when the tools block between markers cannot be parsed as Python.
+
+    Surfaces a structured error so callers can decide whether to reset the file,
+    preserving the original content for forensic inspection.
+    """
+
 
 class DynamicToolsManager:
     """Manages dynamic MCP tools with thread-safe operations and caching."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize the Dynamic Tools Manager."""
         # MCP server instance for dynamic tool registration
-        self._mcp_server_instance = None
+        self._mcp_server_instance: Any = None
         # Asyncio lock to serialize dynamic tool writes and prevent file corruption
         self._dynamic_tools_write_lock = asyncio.Lock()
         # Cached dynamic tools module
-        self._dynamic_tools_module = None
+        self._dynamic_tools_module: ModuleType | None = None
         # Reserved tool names that cannot be used for dynamic tools
         self._reserved_tool_names = {
             "code_search",
@@ -51,11 +78,11 @@ class DynamicToolsManager:
         """Get the set of reserved tool names."""
         return self._reserved_tool_names.copy()
 
-    def set_mcp_server_instance(self, mcp) -> None:
+    def set_mcp_server_instance(self, mcp: Any) -> None:
         """Set the MCP server instance for dynamic tool registration."""
         self._mcp_server_instance = mcp
 
-    def get_mcp_server_instance(self):
+    def get_mcp_server_instance(self) -> Any:
         """Get the current MCP server instance."""
         return self._mcp_server_instance
 
@@ -127,7 +154,7 @@ def get_dynamic_tool_functions() -> list[Callable[..., object]]:
         logger.info(f"Created dynamic tools file at {dynamic_tools_file}")
 
 
-def _load_dynamic_tools_module():
+def _load_dynamic_tools_module() -> ModuleType:
     """Load the dynamic_tools module from ~/.coden-retriever/."""
     _ensure_dynamic_tools_file()
     dynamic_tools_file = get_dynamic_tools_file()
@@ -144,11 +171,132 @@ def _load_dynamic_tools_module():
     return module
 
 
-def _get_dynamic_tools_module():
+def _get_dynamic_tools_module() -> ModuleType:
     """Get or load the dynamic tools module."""
     if _manager._dynamic_tools_module is None:
         return _load_dynamic_tools_module()
     return _manager._dynamic_tools_module
+
+
+def _timeout_error_payload(name: str, timeout_s: float) -> dict[str, str]:
+    """Structured error payload returned when a dynamic tool exceeds its timeout.
+
+    Shape matches the existing error-dict convention used by create/remove so
+    the agent UI parses it the same way.
+    """
+    return {
+        "error": f"Tool '{name}' exceeded {timeout_s}s timeout",
+        "type": "TimeoutError",
+    }
+
+
+def _wrap_with_timeout(func: Callable[..., Any], timeout_s: float) -> Callable[..., Any]:
+    """Wrap a dynamic tool with a per-call timeout that surfaces a structured error.
+
+    Sync funcs are dispatched onto a worker thread (matching FastMCP's own
+    behavior for sync tool bodies); async funcs are awaited directly. In both
+    cases the call is bounded by `anyio.fail_after(timeout_s)`.
+
+    Note: `anyio.to_thread.run_sync` cannot interrupt a stuck blocking call
+    (Python cannot kill OS threads). The agent gets a clean structured error
+    after `timeout_s`, but the thread keeps running until the process exits.
+    For tools that spawn subprocesses, prefer the cancellable async helper at
+    `coden_retriever.agent.shell_exec.execute_shell` which is output-capped
+    and cancels cleanly.
+
+    Preserves __name__, __doc__, __annotations__, __signature__ so FastMCP's
+    schema generator continues to inspect the wrapper as if it were the
+    original function.
+    """
+    name = func.__name__
+    is_async = inspect.iscoroutinefunction(func)
+
+    if is_async:
+        @functools.wraps(func)
+        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+            try:
+                with anyio.fail_after(timeout_s):
+                    return await func(*args, **kwargs)
+            except TimeoutError:
+                return _timeout_error_payload(name, timeout_s)
+
+        # functools.wraps copies __wrapped__ but not __signature__ when the
+        # original was inspected via typing — set it explicitly so FastMCP's
+        # ParsedFunction sees the real signature.
+        async_wrapper.__signature__ = inspect.signature(func)  # type: ignore[attr-defined]
+        return async_wrapper
+
+    @functools.wraps(func)
+    async def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            with anyio.fail_after(timeout_s):
+                # abandon_on_cancel=True is required for fail_after to actually
+                # break out of the worker thread; without it the timeout would
+                # block until the sync body returns. The thread itself is not
+                # killable — see docstring caveat.
+                return await _to_thread_run_sync(
+                    functools.partial(func, *args, **kwargs),
+                    abandon_on_cancel=True,
+                )
+        except TimeoutError:
+            return _timeout_error_payload(name, timeout_s)
+
+    sync_wrapper.__signature__ = inspect.signature(func)  # type: ignore[attr-defined]
+    return sync_wrapper
+
+
+def _safe_remove_tool(mcp_instance: Any, name: str) -> None:
+    """Best-effort unregistration from the live FastMCP instance.
+
+    `FastMCP.remove_tool` raises `NotFoundError` when the name is unknown
+    (e.g. on remove_all the file may have been corrupted between snapshot
+    and unregister). We log and continue — the on-disk truth is already
+    correct; the live registry is best-effort.
+    """
+    try:
+        mcp_instance.remove_tool(name)
+    except Exception as exc:
+        logger.debug("remove_tool(%s) failed: %s", name, exc)
+
+
+async def _live_reserved_names(mcp_instance: Any) -> set[str]:
+    """Return the names currently registered on the live FastMCP instance."""
+    tools = await mcp_instance.list_tools()
+    return {tool.name for tool in tools}
+
+
+async def _notify_tool_list_changed() -> None:
+    """Fire ToolListChangedNotification on the active MCP request context.
+
+    pydantic-ai's MCPServerStdio caches tool listings until it receives this
+    notification; without it, dynamic tools registered mid-session never reach
+    the model's function-calling schema. Best-effort: when called outside a
+    live MCP request (offline tests, server startup), there is no active
+    context and we skip — on-disk persistence is already authoritative.
+    """
+    try:
+        ctx = get_context()
+    except RuntimeError:
+        return
+    try:
+        await ctx.send_notification(mcp.types.ToolListChangedNotification())
+    except Exception as exc:
+        logger.debug("send ToolListChangedNotification failed: %s", exc)
+
+
+def _describe_tool(func: Callable[..., Any], docstring: str) -> dict[str, str]:
+    """Return the human-readable signature + docstring for a registered tool.
+
+    Echoed back to the model so it can reason about a freshly-created tool in
+    the same turn, instead of waiting for the next turn's refreshed schema.
+    The docstring is sourced from the parsed AST rather than inspect.getdoc —
+    the MCP server is spawned with `python -OO`, which strips __doc__ from
+    bytecode and would yield an empty description.
+    """
+    return {
+        "signature": str(inspect.signature(func)),
+        "description": docstring,
+    }
 
 
 def _extract_and_validate_tool(code_str: str) -> tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]:
@@ -182,6 +330,7 @@ def _extract_and_validate_tool(code_str: str) -> tuple[str, ast.FunctionDef | as
 
 def _insert_into_dynamic_tools_file(dynamic_tools_path: Path, tool_name: str, code_str: str) -> None:
     """Insert tool code between the START/END markers in dynamic_tools.py."""
+    _ensure_dynamic_tools_file()
     content = dynamic_tools_path.read_text(encoding="utf-8")
 
     start_idx = content.find(_MARKER_START)
@@ -195,11 +344,19 @@ def _insert_into_dynamic_tools_file(dynamic_tools_path: Path, tool_name: str, co
     if block_content.strip():
         try:
             tree = ast.parse(block_content)
-            existing_functions = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
-            if tool_name in existing_functions:
-                raise ValueError(f"Tool '{tool_name}' already exists.")
-        except SyntaxError:
-            pass  # If block is unparseable, allow insertion
+        except SyntaxError as exc:
+            # Swallowing this would bypass the duplicate-guard and let partial
+            # writes compound into corruption. Surface a structured error and
+            # leave the file untouched so the user can inspect/recover.
+            logger.error(
+                "Dynamic tools block is unparseable at %s: %s",
+                dynamic_tools_path,
+                exc,
+            )
+            raise DynamicToolsBlockCorruptedError(_CORRUPTED_BLOCK_HINT) from exc
+        existing_functions = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+        if tool_name in existing_functions:
+            raise ValueError(f"Tool '{tool_name}' already exists.")
 
     # Insert just before END marker
     insertion_point = end_idx
@@ -211,6 +368,7 @@ def _insert_into_dynamic_tools_file(dynamic_tools_path: Path, tool_name: str, co
 
 def _remove_from_dynamic_tools_file(dynamic_tools_path: Path, tool_name: str) -> None:
     """Remove a tool definition from dynamic_tools.py using AST parsing."""
+    _ensure_dynamic_tools_file()
     content = dynamic_tools_path.read_text(encoding="utf-8")
 
     start_idx = content.find(_MARKER_START)
@@ -218,8 +376,9 @@ def _remove_from_dynamic_tools_file(dynamic_tools_path: Path, tool_name: str) ->
     if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
         raise RuntimeError("dynamic_tools.py markers not found or malformed.")
 
-    # Check if tool exists
-    dynamic_tools = _get_dynamic_tools_module()
+    # Reload so tools created earlier in this session are visible; the cached
+    # module would otherwise reflect only the state at server start.
+    dynamic_tools = _load_dynamic_tools_module()
     existing = {f.__name__ for f in dynamic_tools.get_dynamic_tool_functions()}
     if tool_name not in existing:
         raise ValueError(f"Tool '{tool_name}' not found in dynamic tools.")
@@ -416,7 +575,7 @@ async def _resolve_symbol_to_code(
 
     # Parse file to find entity
     parser = RepoParser()
-    entities, _ = await asyncio.to_thread(parser.parse_file, str(file_path), source_content)
+    entities, _, _ = await asyncio.to_thread(parser.parse_file, str(file_path), source_content)
 
     # Find matching entity (function only - classes/methods not supported for dynamic tools)
     matching = [e for e in entities if e.name == symbol_name and e.entity_type == "function"]
@@ -461,6 +620,7 @@ async def _resolve_symbol_to_code(
 
 def _clear_dynamic_tools_file(dynamic_tools_path: Path) -> int:
     """Clear all tools from dynamic_tools.py, return count of tools removed."""
+    _ensure_dynamic_tools_file()
     content = dynamic_tools_path.read_text(encoding="utf-8")
 
     start_idx = content.find(_MARKER_START)
@@ -468,8 +628,9 @@ def _clear_dynamic_tools_file(dynamic_tools_path: Path) -> int:
     if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
         raise RuntimeError("dynamic_tools.py markers not found or malformed.")
 
-    # Count existing tools
-    dynamic_tools = _get_dynamic_tools_module()
+    # Reload so tools created earlier in this session are counted; the cached
+    # module would otherwise reflect only the state at server start.
+    dynamic_tools = _load_dynamic_tools_module()
     tool_count = len(dynamic_tools.get_dynamic_tool_functions())
 
     # Clear the block between markers
@@ -543,8 +704,30 @@ async def create_dynamic_tool(
         if not code:
             return {"error": "Provide either 'code' or 'identifier' with 'root_directory'."}
 
-        tool_name, _ = _extract_and_validate_tool(code)
-        if tool_name in _manager.reserved_tool_names:
+        tool_name, function_def = _extract_and_validate_tool(code)
+
+        # Live registry takes precedence over the static reserved list when the
+        # MCP instance is available — the static list is incomplete (only ~9 of
+        # the ~46 tools the server actually registers). Subtract existing
+        # dynamic tool names so a `remove` → `re-create` flow stays unblocked.
+        mcp_instance = _manager.get_mcp_server_instance()
+        if mcp_instance is not None:
+            live_names = await _live_reserved_names(mcp_instance)
+            # If the on-disk module is currently corrupted, fall through with
+            # an empty existing_dynamic set so the downstream insertion path
+            # surfaces the structured `corrupted: True` error rather than
+            # this code path raising a raw SyntaxError.
+            try:
+                existing_dynamic = {
+                    f.__name__
+                    for f in _get_dynamic_tools_module().get_dynamic_tool_functions()
+                }
+            except SyntaxError:
+                existing_dynamic = set()
+            if tool_name in (live_names - existing_dynamic):
+                return {"error": f"Tool name '{tool_name}' shadows a built-in tool."}
+        elif tool_name in _manager.reserved_tool_names:
+            # Offline / test path — no live registry to consult.
             return {"error": f"Tool name '{tool_name}' is reserved."}
 
         dynamic_tools_path = get_dynamic_tools_file()
@@ -565,22 +748,33 @@ async def create_dynamic_tool(
         if func is None or not callable(func) or not getattr(func, "_is_dynamic_tool", False):
             return {"error": f"Tool '{tool_name}' was written but could not be loaded."}
 
-        mcp_instance = _manager.get_mcp_server_instance()
+        # Validation guarantees a non-empty docstring; `or ""` is a defensive
+        # fallback so type-checkers see a `str`, not `str | None`.
+        docstring = ast.get_docstring(function_def) or ""
+        description = _describe_tool(func, docstring)
+
         if mcp_instance is None:
             return {
                 "status": "saved",
                 "name": tool_name,
+                **description,
                 "message": f"Tool saved to {dynamic_tools_path}; server instance not available for immediate registration.",
             }
 
-        mcp_instance.tool()(func)
+        mcp_instance.tool()(_wrap_with_timeout(func, get_dynamic_tool_timeout()))
+        await _notify_tool_list_changed()
         return {
             "status": "success",
             "name": tool_name,
+            **description,
             "message": f"Tool '{tool_name}' created and registered. Saved to {dynamic_tools_path}",
         }
     except ValueError as e:
         return {"error": str(e)}
+    except DynamicToolsBlockCorruptedError as e:
+        # Surface a structured signal so the caller can opt into a reset
+        # rather than masking the corruption with a generic failure.
+        return {"error": str(e), "corrupted": True}
     except Exception as e:
         logger.exception(f"Failed to create dynamic tool: {e}")
         return {"error": f"Failed to create dynamic tool: {e}"}
@@ -598,9 +792,9 @@ async def remove_dynamic_tool(
 ) -> dict[str, Any]:
     """Remove dynamically created tool(s).
 
-    Removes tool definition(s) from ~/.coden-retriever/dynamic_tools.py and reloads the module.
-    Note: Tools cannot be unregistered from the current MCP session, but will
-    not be loaded on the next server restart.
+    Removes tool definition(s) from ~/.coden-retriever/dynamic_tools.py, reloads
+    the module, and unregisters the tool(s) from the live FastMCP instance so
+    they disappear from the agent's tool list immediately.
 
     WHEN TO USE:
     - tool_name: to remove a specific tool created with create_dynamic_tool
@@ -615,8 +809,21 @@ async def remove_dynamic_tool(
             return {"error": "Specify tool_name or set remove_all=True"}
 
         dynamic_tools_path = get_dynamic_tools_file()
+        mcp_instance = _manager.get_mcp_server_instance()
 
         if remove_all:
+            # Snapshot names BEFORE clearing the file — the cached module is
+            # invalidated by the clear, so we cannot recover the names after.
+            # If the file is currently corrupted, skip live unregistration
+            # rather than blocking the on-disk reset; the live registry is
+            # best-effort.
+            try:
+                names_to_unregister = [
+                    f.__name__
+                    for f in _get_dynamic_tools_module().get_dynamic_tool_functions()
+                ]
+            except SyntaxError:
+                names_to_unregister = []
             async with _manager._dynamic_tools_write_lock:
                 tool_count = await asyncio.to_thread(
                     _clear_dynamic_tools_file,
@@ -624,14 +831,18 @@ async def remove_dynamic_tool(
                 )
                 importlib.invalidate_caches()
                 _load_dynamic_tools_module()
+            if mcp_instance is not None:
+                for n in names_to_unregister:
+                    _safe_remove_tool(mcp_instance, n)
+                await _notify_tool_list_changed()
 
             return {
                 "status": "success",
                 "count": tool_count,
-                "message": f"Cleared {tool_count} dynamic tool(s). They remain registered in current session but won't load on restart.",
+                "message": f"Cleared and unregistered {tool_count} dynamic tool(s).",
             }
 
-        # Remove specific tool - tool_name is guaranteed set (checked at line 614)
+        # Remove specific tool - tool_name is guaranteed set (checked above)
         name = cast(str, tool_name)
         if name in _manager.reserved_tool_names:
             return {"error": f"Cannot remove built-in tool '{name}'."}
@@ -644,11 +855,14 @@ async def remove_dynamic_tool(
             )
             importlib.invalidate_caches()
             _load_dynamic_tools_module()
+        if mcp_instance is not None:
+            _safe_remove_tool(mcp_instance, name)
+            await _notify_tool_list_changed()
 
         return {
             "status": "success",
             "name": name,
-            "message": f"Tool '{name}' removed. It remains registered in current session but won't load on restart.",
+            "message": f"Tool '{name}' removed and unregistered from the live MCP session.",
         }
     except ValueError as e:
         return {"error": str(e)}
@@ -657,18 +871,19 @@ async def remove_dynamic_tool(
         return {"error": f"Failed to remove dynamic tool: {e}"}
 
 
-def set_mcp_server_instance(mcp) -> None:
+def set_mcp_server_instance(mcp: Any) -> None:
     """Set the MCP server instance for dynamic tool registration."""
     _manager.set_mcp_server_instance(mcp)
 
 
-def load_and_register_dynamic_tools(mcp) -> None:
+def load_and_register_dynamic_tools(mcp: Any) -> None:
     """Load and register all dynamic tools on the given MCP instance."""
     try:
         dynamic_tools = _get_dynamic_tools_module()
+        timeout_s = get_dynamic_tool_timeout()
         for tool in dynamic_tools.get_dynamic_tool_functions():
             try:
-                mcp.tool()(tool)
+                mcp.tool()(_wrap_with_timeout(tool, timeout_s))
                 logger.info(f"Registered dynamic tool: {tool.__name__}")
             except Exception as e:
                 logger.error(f"Failed to register dynamic tool {tool.__name__}: {e}")
@@ -676,7 +891,7 @@ def load_and_register_dynamic_tools(mcp) -> None:
         logger.warning(f"Could not load dynamic tools: {e}")
 
 
-def register_dynamic_tools(mcp, disabled_tools: set[str] | None = None) -> None:
+def register_dynamic_tools(mcp: Any, disabled_tools: set[str] | None = None) -> None:
     """Register dynamic tools MCP tools on the given FastMCP instance.
 
     Registers the following tools:

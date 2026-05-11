@@ -19,6 +19,7 @@ from ..constants import (
     TRAMP_DATA_MAX_RESULTS,
     TRAMP_DATA_MIN_GROUP_SIZE,
 )
+from .validation import validate_root_directory
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ def _load_and_detect(
     from ..cache import CacheManager
     from ..tramp_data.detector import detect_tramp_data
 
-    cache = CacheManager(Path(root_directory), enable_semantic=False)
+    cache = CacheManager(Path(root_directory))
     indices = cache.load_or_rebuild()
 
     return detect_tramp_data(
@@ -62,8 +63,8 @@ async def detect_tramp_data_tool(
     ] = TRAMP_DATA_MIN_GROUP_SIZE,
 ) -> dict[str, Any]:
     """Detect tramp data - parameter groups traveling together across functions."""
-    if not root_directory:
-        return {"error": "root_directory is required"}
+    if err := validate_root_directory(root_directory):
+        return err
 
     return await asyncio.to_thread(
         _load_and_detect,

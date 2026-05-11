@@ -10,6 +10,9 @@ from typing import Any, Dict, Optional, Set
 
 logger = logging.getLogger(__name__)
 
+_UNSET = object()
+_CACHED_LIBRARY_PATH: Any = _UNSET
+
 
 class LanguageLoader:
     """Loads Tree-sitter language grammars."""
@@ -23,7 +26,10 @@ class LanguageLoader:
 
     def _initialize(self) -> None:
         """Find and load the tree-sitter-languages shared library."""
-        self._lib_path = self._find_library()
+        global _CACHED_LIBRARY_PATH
+        if _CACHED_LIBRARY_PATH is _UNSET:
+            _CACHED_LIBRARY_PATH = self._find_library()
+        self._lib_path = _CACHED_LIBRARY_PATH
 
         if not self._lib_path:
             logger.warning("Could not find tree-sitter-languages library")

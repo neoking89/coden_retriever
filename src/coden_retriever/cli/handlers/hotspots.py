@@ -22,22 +22,6 @@ logger = logging.getLogger(__name__)
 _MIN_COUPLING_SCORE = 10
 
 
-def print_hotspots_output(
-    formatted_output: str,
-    stats_output: str | None,
-    reverse: bool,
-) -> None:
-    """Print hotspots output in correct order based on reverse flag."""
-    if reverse:
-        print(formatted_output)
-        if stats_output:
-            print(stats_output, file=sys.stderr)
-    else:
-        if stats_output:
-            print(stats_output, file=sys.stderr)
-        print(formatted_output)
-
-
 def handle_hotspots_command(args: argparse.Namespace, root_path: Path, config) -> int:
     """Handle hotspots mode (-H/--hotspots flag)."""
     args.limit = normalize_limit(args.limit)
@@ -60,7 +44,7 @@ def handle_hotspots_command(args: argparse.Namespace, root_path: Path, config) -
         exclude_private=False,
     )
 
-    daemon_result = try_daemon_hotspots(params, host=config.daemon.host, port=config.daemon.port)
+    daemon_result = try_daemon_hotspots(params, address=config.daemon.address)
 
     if daemon_result is not None:
         return _process_hotspots_result(daemon_result, args, start_time, "Daemon")

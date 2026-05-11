@@ -10,6 +10,7 @@ from .cli_metrics import (
 from .clone_formatter import CloneFormatter
 from .dead_code_formatter import DeadCodeFormatter
 from .directory_tree_formatter import generate_shallow_tree
+from .magic_constant_formatter import MagicConstantFormatter
 from .propagation_formatter import PropagationFormatter
 from .sensitive_value_formatter import SensitiveValueFormatter
 from .tramp_data_formatter import TrampDataFormatter
@@ -45,5 +46,6 @@ __all__ = [
     "DeadCodeFormatter",
     "PropagationFormatter",
     "SensitiveValueFormatter",
+    "MagicConstantFormatter",
     "TrampDataFormatter",
 ]

@@ -127,8 +127,8 @@ def _make_file_url(path: str, line: int | None) -> str:
 # Maps editor name -> handler function (path, line) -> url
 _EDITOR_URL_HANDLERS: dict[str, Callable[[str, int | None], str]] = {
     "vscode": _make_vscode_url,
-    "pycharm": lambda p, l: _make_jetbrains_url("pycharm", p, l),
-    "idea": lambda p, l: _make_jetbrains_url("idea", p, l),
+    "pycharm": lambda p, ln: _make_jetbrains_url("pycharm", p, ln),
+    "idea": lambda p, ln: _make_jetbrains_url("idea", p, ln),
     "sublime": _make_sublime_url,
     "file": _make_file_url,
 }
@@ -253,11 +253,16 @@ class TerminalStyle:
         text = self.make_link(line_str, file_path, line_num)
         return self.render_to_string(text)
 
-    def format_rank(self, score: float, max_score: float) -> str:
-        """Format a rank/score value with color."""
+    def format_rank(self, score: float, max_score: float, *, text: str | None = None) -> str:
+        """Format a rank/score value with color.
+
+        Pass `text` with pre-applied padding when the caller needs the
+        visible width to match a fixed column — f-string padding applied
+        *after* coloring counts ANSI escape bytes and misaligns the table.
+        """
         tier = self.get_score_tier(score, max_score)
-        text = self.colorize(f"{score:.4f}", tier)
-        return self.render_to_string(text)
+        body = text if text is not None else f"{score:.4f}"
+        return self.render_to_string(self.colorize(body, tier))
 
     def format_tree_entity(
         self,
@@ -328,8 +333,10 @@ def get_terminal_style() -> TerminalStyle:
     return _default_style
 
 
+# WHY KEPT: Not called in production, but test fixtures depend on this
+# to reset the cached singleton between tests, preventing state leakage.
 def reset_terminal_style() -> None:
-    """Reset the default terminal style instance. Thread-safe."""
+    """Reset the cached TerminalStyle singleton. Used by test fixtures to isolate state between test cases."""
     global _default_style, _SCORE_STYLES
     with _default_style_lock:
         with _score_styles_lock:

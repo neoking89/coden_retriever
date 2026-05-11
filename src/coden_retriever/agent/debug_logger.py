@@ -293,6 +293,14 @@ class DebugLogger:
         self._write_subsection("THINKING TRACE")
         self._write(thinking)
 
+    def log_compaction_event(self, summary: str) -> None:
+        """Log a history-compaction lifecycle event (attempt / success / abort)."""
+        if not self.enabled:
+            return
+
+        self._write_subsection("COMPACTION")
+        self._write(summary)
+
     def log_raw_event(self, event: Any, context: str = "") -> None:
         """Log a raw streaming event for debugging unknown event types.
 
@@ -377,6 +385,32 @@ class DebugLogger:
         # Include traceback for debugging
         import traceback
         self._write(f"Traceback:\n{traceback.format_exc()}")
+
+    def log_tool_routing(
+        self,
+        query: str,
+        selected_tools: list[str],
+        total_domain_tools: int,
+    ) -> None:
+        """Log LLM tool routing results.
+
+        Args:
+            query: The user query the router is selecting tools for.
+            selected_tools: Names of the domain tools selected by the router.
+            total_domain_tools: Total number of domain tools available.
+        """
+        if not self.enabled:
+            return
+
+        self._write_subsection("LLM TOOL ROUTING")
+        self._write(f"Query: {query}")
+        self._write(
+            f"Selected: {len(selected_tools)}/{total_domain_tools} domain tools"
+        )
+        if selected_tools:
+            self._write(f"Tools: {', '.join(selected_tools)}")
+        else:
+            self._write("Tools: (none matched)")
 
     def log_max_steps_reached(self, total_steps: int, max_steps: int) -> None:
         """Log when max steps limit is reached."""

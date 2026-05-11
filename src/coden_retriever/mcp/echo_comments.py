@@ -2,10 +2,7 @@
 
 This module provides MCP tools for detecting "echo comments" - redundant comments
 that merely restate what the identifier already conveys without adding value.
-Uses Model2Vec embeddings for language-agnostic semantic similarity analysis.
-
-Requires the 'semantic' extra:
-    pip install 'coden-retriever[semantic]'
+Uses MiniLM ONNX embeddings for language-agnostic semantic similarity analysis.
 """
 
 from __future__ import annotations
@@ -16,23 +13,35 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
+import numpy as np
 from pydantic import Field
+from tree_sitter import Parser as _TreeSitterParser
 
 from ..cache import CacheManager
-from ..config_loader import get_semantic_model_path
+from ..semantic_config import SemanticConfig
+from ._defaults import RESOLVED_DEFAULT_TOKEN_BUDGET
+from ..constants import (
+    DEFAULT_ECHO_COMMENT_THRESHOLD,
+    ECHO_SEVERITY_CRITICAL,
+    ECHO_SEVERITY_ELEVATED,
+    ECHO_SEVERITY_HIGH,
+    MAX_TOKEN_LIMIT,
+    MIN_TOKEN_LIMIT,
+)
+from .validation import validate_root_directory
 from ..language import LanguageLoader
-from ..search.semantic import get_cached_model
-from ..token_estimator import count_tokens
-from ..utils.optional_deps import get_numpy
+from ..cache.embedding_cache import encode_with_cache
+from ..graph_utils import apply_token_budget_filter
 from .flag_insertion import CODEN_MARKER
 
 if TYPE_CHECKING:
+    from ..cache.embedding_cache import EmbeddingCache
+    from ..cache.models import CachedIndices
     from ..models import CodeEntity
+    from ..utils.progress import ProgressCallback, ProgressHandle
 
 logger = logging.getLogger(__name__)
 
-# Module-level constants
-DEFAULT_ECHO_THRESHOLD = 0.85
 MIN_COMMENT_LENGTH = 3  # Filter out very short comments
 
 # Token budget constants for MCP
@@ -233,13 +242,6 @@ def _extract_all_comments_from_file(file_path: str, language: str) -> list[tuple
     except IOError:
         return []
 
-    # Parse with tree-sitter
-    try:
-        from tree_sitter import Parser
-    except ImportError:
-        logger.warning("tree-sitter not installed")
-        return []
-
     try:
         loader = LanguageLoader()
         ts_language = loader.load(language)
@@ -248,9 +250,9 @@ def _extract_all_comments_from_file(file_path: str, language: str) -> list[tuple
             return []
 
         try:
-            parser = Parser(ts_language)
+            parser = _TreeSitterParser(ts_language)
         except TypeError:
-            parser = Parser()
+            parser = _TreeSitterParser()
             parser.set_language(ts_language)  # type: ignore[attr-defined]
 
         tree = parser.parse(source_bytes)
@@ -286,20 +288,54 @@ def _extract_all_comments_from_file(file_path: str, language: str) -> list[tuple
     return comments
 
 
+def _classify_severity(similarity: float) -> str:
+    """Map a similarity score to a severity label."""
+    if similarity >= ECHO_SEVERITY_CRITICAL:
+        return "CRITICAL"
+    if similarity >= ECHO_SEVERITY_HIGH:
+        return "HIGH"
+    if similarity >= ECHO_SEVERITY_ELEVATED:
+        return "ELEVATED"
+    return "MODERATE"
+
+
+# Avoids reconstructing the same empty dict on every early-return path
+_EMPTY_ECHO_RESULT: dict[str, Any] = {
+    "echo_comments": [],
+    "summary": {
+        "total_files_analyzed": 0,
+        "total_comments_found": 0,
+        "echo_comments_count": 0,
+        "echo_ratio": 0.0,
+        "files_affected": 0,
+        "avg_similarity": 0.0,
+        "distribution": {},
+    },
+    "token_budget_exceeded": False,
+}
+
+
+def _empty_result(**summary_overrides: int) -> dict[str, Any]:
+    """Return a shallow copy of the empty result template with optional summary overrides."""
+    return {**_EMPTY_ECHO_RESULT, "summary": {**_EMPTY_ECHO_RESULT["summary"], **summary_overrides}}
+
+
 def compute_echo_comments(
     entities: dict[str, CodeEntity],
-    echo_threshold: float = DEFAULT_ECHO_THRESHOLD,
+    echo_threshold: float = DEFAULT_ECHO_COMMENT_THRESHOLD,
     token_limit: int | None = None,
     include_tests: bool = False,
     include_private: bool = False,
+    embedding_cache: "EmbeddingCache | None" = None,
+    on_encode_progress: "ProgressHandle | ProgressCallback | None" = None,
 ) -> dict[str, Any]:
     """Compute semantic similarity between ALL comments and their associated identifiers.
 
-    Uses model2vec embeddings and cosine similarity to detect "echo comments"
+    Uses MiniLM ONNX embeddings and cosine similarity to detect "echo comments"
     that merely restate the identifier without adding architectural value.
 
-    Performance: Uses batch encoding for all comments per file to minimize
-    model inference overhead on large codebases.
+    Performance: Collects all comments across all files first, then batch-encodes
+    in a single call to minimize ONNX session overhead.
 
     Args:
         entities: Dict of entity_id -> CodeEntity (used to get file paths and language)
@@ -307,42 +343,18 @@ def compute_echo_comments(
         token_limit: Max tokens for MCP context (None = unlimited)
         include_tests: Whether to analyze test files
         include_private: Whether to analyze private entities
+        embedding_cache: Optional cache to avoid re-encoding known texts
+        on_encode_progress: ProgressHandle (with set_total) or plain callback
 
     Returns:
-        {
-            "echo_comments": [
-                {
-                    "file_path": str,
-                    "line": int,
-                    "comment_text": str,
-                    "context_identifier": str,
-                    "similarity_score": float,
-                    "severity": str
-                }
-            ],
-            "summary": {
-                "total_files_analyzed": int,
-                "total_comments_found": int,
-                "echo_comments_count": int,
-                "echo_ratio": float,
-                "files_affected": int,
-                "avg_similarity": float,
-                "distribution": dict
-            },
-            "token_budget_exceeded": bool
-        }
+        Dict with echo_comments list, summary statistics, and token_budget_exceeded flag.
     """
-    # Load model (uses cache internally)
-    model_path = get_semantic_model_path()
-    model = get_cached_model(model_path)
-
-    echo_comments: list[dict] = []
-    total_comments = 0
-    files_affected: set[str] = set()
+    if not entities:
+        return _empty_result()
 
     # Get unique files to analyze
     files_to_analyze: dict[str, str] = {}  # file_path -> language
-    for entity_id, entity in entities.items():
+    for entity in entities.values():
         if not include_tests and entity.is_test:
             continue
         if not include_private and entity.is_private:
@@ -352,95 +364,74 @@ def compute_echo_comments(
 
     total_files = len(files_to_analyze)
 
-    # Process each file and extract ALL comments
+    # Pass 1: Extract all comments from all files (tree-sitter only, no encoding)
+    all_comments: list[tuple[str, int, str, str]] = []  # (file_path, line, comment, identifier)
     for file_path, language in files_to_analyze.items():
-        comments = _extract_all_comments_from_file(file_path, language)
-        if not comments:
-            continue
+        for line_num, comment_text, identifier in _extract_all_comments_from_file(file_path, language):
+            all_comments.append((file_path, line_num, comment_text, identifier))
 
-        total_comments += len(comments)
+    total_comments = len(all_comments)
+    if total_comments == 0:
+        return _empty_result(total_files_analyzed=total_files)
 
-        # === BATCH ENCODING FOR PERFORMANCE ===
-        # Encode all comments and identifiers in batch rather than one-by-one
-        # This significantly improves performance on large codebases
-        comment_texts = [c[1] for c in comments]  # Extract comment text
-        identifier_texts = [c[2] for c in comments]  # Extract identifier
+    # Pass 2: Batch-encode ALL texts in a single call (matches clone detection pattern)
+    comment_texts = [c[2] for c in all_comments]
+    identifier_texts = [c[3] for c in all_comments]
+    all_texts = comment_texts + identifier_texts
 
-        # Batch encode all texts at once
-        all_texts = comment_texts + identifier_texts
-        all_embeddings = model.encode(all_texts)
+    # Resolve the progress callback: ProgressHandle exposes set_total() to defer
+    # the bar total until we know the text count; plain callbacks are used as-is.
+    if hasattr(on_encode_progress, "set_total"):
+        on_encode_progress.set_total(len(all_texts))
+        progress_callback: "ProgressCallback | None" = on_encode_progress.advance
+    else:
+        progress_callback = on_encode_progress  # type: ignore[assignment]
 
-        # Split embeddings back into comments and identifiers
-        n_comments = len(comments)
-        comment_embeddings = all_embeddings[:n_comments]
-        identifier_embeddings = all_embeddings[n_comments:]
+    all_embeddings = encode_with_cache(all_texts, embedding_cache, on_batch_done=progress_callback)
 
-        # Lazy load numpy for norm computation
-        np = get_numpy()
-        norm = np.linalg.norm
+    comment_embeddings = all_embeddings[:total_comments]
+    identifier_embeddings = all_embeddings[total_comments:]
 
-        # Compute norms for all embeddings
-        comment_norms = norm(comment_embeddings, axis=1)
-        identifier_norms = norm(identifier_embeddings, axis=1)
+    # Pass 3: Compute similarities from pre-encoded embeddings
+    comment_norms = np.linalg.norm(comment_embeddings, axis=1)
+    identifier_norms = np.linalg.norm(identifier_embeddings, axis=1)
 
-        # Process each comment with its pre-computed embedding
-        for idx, (line_num, comment_text, identifier) in enumerate(comments):
-            c_norm = comment_norms[idx]
-            i_norm = identifier_norms[idx]
+    # Vectorized dot products for all pairs at once
+    dot_products = np.sum(comment_embeddings * identifier_embeddings, axis=1)
+    norm_products = comment_norms * identifier_norms
 
-            # Skip if either embedding has zero norm (empty/invalid text)
-            if c_norm == 0 or i_norm == 0:
-                continue
+    # Mask out zero-norm pairs to avoid division by zero
+    valid_mask = norm_products > 0
+    similarities = np.zeros(total_comments, dtype=np.float32)
+    similarities[valid_mask] = dot_products[valid_mask] / norm_products[valid_mask]
 
-            # Cosine similarity using pre-computed embeddings
-            similarity = float(
-                np.dot(comment_embeddings[idx], identifier_embeddings[idx])
-                / (c_norm * i_norm)
-            )
+    # Filter to those above threshold
+    above_threshold = similarities >= echo_threshold
 
-            if similarity >= echo_threshold:
-                # Determine severity
-                if similarity >= 0.95:
-                    severity = "CRITICAL"
-                elif similarity >= 0.90:
-                    severity = "HIGH"
-                elif similarity >= 0.85:
-                    severity = "ELEVATED"
-                else:
-                    severity = "MODERATE"
+    echo_comments: list[dict] = []
+    files_affected: set[str] = set()
+    for idx in np.where(above_threshold)[0]:
+        file_path, line_num, comment_text, identifier = all_comments[idx]
+        sim = float(similarities[idx])
+        echo_comments.append({
+            "file_path": file_path,
+            "line": line_num,
+            "comment_text": comment_text,
+            "context_identifier": identifier,
+            "similarity_score": sim,
+            "severity": _classify_severity(sim),
+        })
+        files_affected.add(file_path)
 
-                echo_comments.append(
-                    {
-                        "file_path": file_path,
-                        "line": line_num,
-                        "comment_text": comment_text,
-                        "context_identifier": identifier,
-                        "similarity_score": similarity,
-                        "severity": severity,
-                    }
-                )
-
-                files_affected.add(file_path)
-
-    # Sort by similarity (descending)
     echo_comments.sort(key=lambda x: x["similarity_score"], reverse=True)
 
-    # Apply token limit for MCP mode
-    token_budget_exceeded = False
-    if token_limit is not None:
-        used_tokens = _TOKEN_OVERHEAD_ECHO
-        filtered_comments = []
-
-        for comment in echo_comments:
-            comment_str = f"{comment['file_path']}:{comment['line']} {comment['comment_text']} {comment['context_identifier']}"
-            comment_tokens = count_tokens(comment_str, is_code=False) + _TOKEN_PER_ECHO_COMMENT
-            if used_tokens + comment_tokens > token_limit:
-                token_budget_exceeded = True
-                break
-            used_tokens += comment_tokens
-            filtered_comments.append(comment)
-
-        echo_comments = filtered_comments
+    echo_comments, _, token_budget_exceeded = apply_token_budget_filter(
+        echo_comments,
+        token_limit,
+        _TOKEN_OVERHEAD_ECHO,
+        _TOKEN_PER_ECHO_COMMENT,
+        ["file_path", "line", "comment_text", "context_identifier"],
+    )
 
     # Compute summary
     echo_count = len(echo_comments)
@@ -452,15 +443,17 @@ def compute_echo_comments(
     )
 
     distribution = {
-        "critical": sum(1 for c in echo_comments if c["similarity_score"] >= 0.95),
+        "critical": sum(1 for c in echo_comments if c["similarity_score"] >= ECHO_SEVERITY_CRITICAL),
         "high": sum(
-            1 for c in echo_comments if 0.90 <= c["similarity_score"] < 0.95
+            1 for c in echo_comments
+            if ECHO_SEVERITY_HIGH <= c["similarity_score"] < ECHO_SEVERITY_CRITICAL
         ),
         "elevated": sum(
-            1 for c in echo_comments if 0.85 <= c["similarity_score"] < 0.90
+            1 for c in echo_comments
+            if ECHO_SEVERITY_ELEVATED <= c["similarity_score"] < ECHO_SEVERITY_HIGH
         ),
         "moderate": sum(
-            1 for c in echo_comments if 0.75 <= c["similarity_score"] < 0.85
+            1 for c in echo_comments if c["similarity_score"] < ECHO_SEVERITY_ELEVATED
         ),
     }
 
@@ -479,21 +472,13 @@ def compute_echo_comments(
     }
 
 
-def _validate_root_directory(root_directory: str) -> dict[str, Any] | None:
-    """Validate that root_directory exists."""
-    if not root_directory:
-        return {"error": "root_directory is required"}
-    if not os.path.isdir(root_directory):
-        return {"error": f"Root directory not found: {root_directory}"}
-    return None
-
-
-async def _load_cached_indices(root_directory: str, model_path: str | None = None):
+async def _load_cached_indices(
+    root_directory: str,
+    semantic: SemanticConfig = SemanticConfig(),
+) -> "CachedIndices":
     """Load cached indices asynchronously."""
-    from ..cache.models import CachedIndices
-
-    def _load_sync() -> CachedIndices:
-        cache = CacheManager(Path(root_directory), enable_semantic=True, model_path=model_path)
+    def _load_sync() -> "CachedIndices":
+        cache = CacheManager(Path(root_directory), semantic=semantic)
         return cache.load_or_rebuild()
 
     return await asyncio.to_thread(_load_sync)
@@ -507,7 +492,7 @@ async def detect_echo_comments(
     echo_threshold: Annotated[
         float,
         Field(description="Minimum similarity to flag as echo (0.0-1.0)", ge=0.5, le=1.0),
-    ] = 0.85,
+    ] = DEFAULT_ECHO_COMMENT_THRESHOLD,
     include_tests: Annotated[
         bool,
         Field(description="Include test files in analysis"),
@@ -518,8 +503,8 @@ async def detect_echo_comments(
     ] = False,
     token_limit: Annotated[
         int | None,
-        Field(description="Soft limit on return size in tokens (None=no limit)", ge=100, le=100000),
-    ] = 4000,
+        Field(description="Soft limit on return size in tokens (None=no limit)", ge=MIN_TOKEN_LIMIT, le=MAX_TOKEN_LIMIT),
+    ] = RESOLVED_DEFAULT_TOKEN_BUDGET,
 ) -> dict[str, Any]:
     """Detect echo comments - redundant comments that merely restate the code.
 
@@ -540,14 +525,12 @@ async def detect_echo_comments(
     - Each comment includes: file, line, text, identifier, severity
     - summary: Statistics about echo comment distribution
     """
-    validation_error = _validate_root_directory(root_directory)
+    validation_error = validate_root_directory(root_directory)
     if validation_error:
         return validation_error
 
-    model_path = get_semantic_model_path()
-
     try:
-        indices = await _load_cached_indices(root_directory, model_path)
+        indices = await _load_cached_indices(root_directory)
     except Exception as e:
         logger.exception("Failed to load cache for echo comment detection")
         return {"error": f"Failed to load cache: {e}"}
@@ -558,6 +541,7 @@ async def detect_echo_comments(
         token_limit=token_limit,
         include_tests=include_tests,
         include_private=include_private,
+        embedding_cache=indices.embedding_cache,
     )
 
 

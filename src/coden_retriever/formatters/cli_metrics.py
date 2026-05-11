@@ -15,13 +15,48 @@ IMPORTANT CONTRACT RULES:
 4. Colors use SeverityTier enum - higher severity = red, lower = green
 5. All entity names MUST be clickable hyperlinks (vscode://file/...)
 """
+import json
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
+from ..constants import FORMATTER_WIDTH
 from .terminal_style import TerminalStyle, get_terminal_style
 
 FALSE_POSITIVE_WARNING = "Note: Results may contain false positives. Review before acting."
+
+# Shared result limit warning strings used by all parameter headers
+RESULT_LIMIT_ALL = "[!] Result Limit: ALL (may be slow for large repos)"
+RESULT_LIMIT_TOP_FMT = "[!] Result Limit: TOP {} -- more results may exist (use -n -1 for all)"
+
+
+def format_result_limit_line(limit: int | None) -> str:
+    """Format the result limit warning line for parameter headers."""
+    if limit is None:
+        return RESULT_LIMIT_ALL
+    return RESULT_LIMIT_TOP_FMT.format(limit)
+
+
+def format_parameter_header(title: str, param_lines: list[str], limit: int | None) -> str:
+    """Build a standard parameter header block used by all analysis formatters.
+
+    Args:
+        title: Header title (e.g. "DEAD CODE DETECTION PARAMETERS")
+        param_lines: Analysis-specific parameter lines (e.g. "Confidence Threshold: >= 80%")
+        limit: Result limit (None = unlimited)
+    """
+    sep = "=" * FORMATTER_WIDTH
+    lines = [sep, title, sep]
+    lines.extend(param_lines)
+    lines.append(format_result_limit_line(limit))
+    lines.append(FALSE_POSITIVE_WARNING)
+    lines.append(sep)
+    return "\n".join(lines)
+
+
+def extract_filename(file_path: str) -> str:
+    """Extract filename from a path, handling both Unix and Windows separators."""
+    return file_path.split("/")[-1].split("\\")[-1]
 
 
 class SeverityTier(Enum):
@@ -187,20 +222,44 @@ class BaseCLIMetricFormatter(ABC):
         """Get color tier for item. Must be implemented by subclasses."""
         pass
 
-    @abstractmethod
     def format_items(
         self,
         items: list[dict[str, Any]],
         output_format: str,
         reverse: bool,
     ) -> str:
-        """Format items for output. Must be implemented by subclasses."""
-        pass
+        """Render items as a pipe-separated table (the default CLI format).
+
+        This default works for any subclass that implements the table-builder
+        hooks (`_build_header`, `_format_row`, `_empty_message`,
+        `_table_width`, `_total_label`). Subclasses with non-table layouts
+        (e.g. tree views) should override this method directly.
+        """
+        if output_format == "json":
+            return json.dumps(items, indent=2)
+        if not items:
+            return self._empty_message()
+        display_items = self._order_for_display(items, reverse)
+        total = len(display_items)
+        lines = [self._build_header(), "-" * self._table_width()]
+        for i, item in enumerate(display_items, 1):
+            rank = self._rank_for_position(i, total, reverse)
+            lines.append(self._format_row(item, rank))
+        lines.append("-" * self._table_width())
+        lines.append(self._total_label(len(items)))
+        return "\n".join(lines)
 
     @abstractmethod
     def format_stats(self, summary: dict[str, Any]) -> str:
         """Format statistics. Must be implemented by subclasses."""
         pass
+
+    @staticmethod
+    def truncate_value(value: str, max_len: int) -> str:
+        """Truncate a string for table display, appending '...' when cut."""
+        if len(value) <= max_len:
+            return value
+        return value[: max_len - 3] + "..."
 
     def colorize(self, text: str, tier: SeverityTier) -> str:
         """Colorize text using the tier color."""
@@ -217,3 +276,59 @@ class BaseCLIMetricFormatter(ABC):
         tier_value = tier.value if tier else None
         link = self.style.make_link(text, file_path, line, tier=tier_value)
         return self.style.render_to_string(link)
+
+    def _order_for_display(
+        self,
+        items: list[dict[str, Any]],
+        reverse: bool,
+    ) -> list[dict[str, Any]]:
+        """Order items for display.
+
+        Default assumes items arrive sorted ASCENDING by severity, so the
+        default view (`reverse=False`) flips them to show the most severe
+        first. Subclasses whose inputs arrive sorted descending should
+        override.
+        """
+        return list(items) if reverse else list(reversed(items))
+
+    def _rank_for_position(self, position: int, total: int, reverse: bool) -> int:
+        """Compute the rank label for an item at `position` (1-based).
+
+        Default convention (used by sensitive_value, tramp_data, dead_code):
+        rank just numbers the displayed rows. Subclasses that want rank 1 to
+        always mean "most significant" (e.g. magic_constant) override.
+        """
+        return position if reverse else total - position + 1
+
+    # The following hooks have no sensible default; subclasses that use the
+    # default `format_items` MUST implement them. Subclasses that override
+    # `format_items` directly are free to ignore these.
+    def _build_header(self) -> str:
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _build_header() to use "
+            "the default format_items template"
+        )
+
+    def _format_row(self, item: dict[str, Any], rank: int) -> str:
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _format_row() to use "
+            "the default format_items template"
+        )
+
+    def _empty_message(self) -> str:
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _empty_message() to use "
+            "the default format_items template"
+        )
+
+    def _table_width(self) -> int:
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _table_width() to use "
+            "the default format_items template"
+        )
+
+    def _total_label(self, count: int) -> str:
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement _total_label() to use "
+            "the default format_items template"
+        )

@@ -54,9 +54,10 @@ def handle_propagation_command(args: argparse.Namespace, root_path: Path, config
         show_critical_paths=args.critical_paths,
         exclude_tests=exclude_tests,
         token_limit=args.tokens,
+        approximate=args.approximate,
     )
 
-    daemon_result = try_daemon_propagation_cost(params, host=config.daemon.host, port=config.daemon.port)
+    daemon_result = try_daemon_propagation_cost(params, address=config.daemon.address)
 
     if daemon_result is not None:
         if "error" in daemon_result:
@@ -83,6 +84,7 @@ def handle_propagation_command(args: argparse.Namespace, root_path: Path, config
             show_critical_paths=args.critical_paths,
             exclude_tests=exclude_tests,
             token_limit=args.tokens,
+            approximate=args.approximate,
         ))
 
         if "error" in result:

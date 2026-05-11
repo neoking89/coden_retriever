@@ -13,13 +13,24 @@ from pathlib import Path
 from typing import Optional, Any, Callable, Literal
 
 from .constants import (
-    OLLAMA_DEFAULT_URL,
-    LLAMACPP_DEFAULT_URL,
     DEFAULT_DAEMON_HOST,
     DEFAULT_DAEMON_PORT,
     DEFAULT_DAEMON_TIMEOUT,
+    DEFAULT_FULL_SERVER_INSTRUCTIONS_TEMPLATE,
     DEFAULT_MAX_PROJECTS,
     DEFAULT_MAX_RETRIES,
+    DEFAULT_MAX_STEPS,
+    DEFAULT_SEARCH_RESULT_LIMIT,
+    DEFAULT_STARTER_QUESTIONS,
+    DEFAULT_STUDY_PROMPT_TEMPLATE,
+    DEFAULT_STUDY_TOOL_INSTRUCTIONS_TEMPLATE,
+    DEFAULT_SYSTEM_PROMPT_TEMPLATE,
+    DEFAULT_TOKEN_BUDGET,
+    DEFAULT_TOOL_INSTRUCTIONS_TEMPLATE,
+    DEFAULT_TOOL_ROUTER_PROMPT_TEMPLATE,
+    FILE_PATH_PREFIX,
+    LLAMACPP_DEFAULT_URL,
+    OLLAMA_DEFAULT_URL,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,7 +77,7 @@ SETTING_METADATA: dict[str, SettingMeta] = {
     "max_retries": SettingMeta(
         "max_retries",
         "Retry attempts for errors",
-        "Retry attempts for tool calls and output validation",
+        "Retry attempts for MCP connections, agent validation, and malformed tool calls",
         "int",
     ),
     "debug": SettingMeta(
@@ -89,16 +100,16 @@ SETTING_METADATA: dict[str, SettingMeta] = {
     ),
     "dynamic_tool_filtering": SettingMeta(
         "dynamic_tool_filtering",
-        "Filter tools by query semantics",
-        "Filter tools based on query semantics (show relevant tools)",
+        "LLM-based tool routing",
+        "LLM-based tool routing (show only relevant tools per query)",
         "bool",
     ),
-    "tool_filter_threshold": SettingMeta(
-        "tool_filter_threshold",
-        "Tool filter similarity threshold",
-        "Threshold (0-1) for dynamic_tool_filtering. Lower=more tools, Higher=fewer tools",
-        "float",
-        "CODEN_RETRIEVER_TOOL_FILTER_THRESHOLD",
+    "tool_filter_model": SettingMeta(
+        "tool_filter_model",
+        "Model for tool routing",
+        "LLM for tool filtering ('model'=sync with /model, or specific model string)",
+        "str",
+        "CODEN_RETRIEVER_TOOL_FILTER_MODEL",
     ),
     "temperature": SettingMeta(
         "temperature",
@@ -168,10 +179,19 @@ SETTING_METADATA: dict[str, SettingMeta] = {
     ),
     "semantic_model_path": SettingMeta(
         "semantic_model_path",
-        "Semantic model path",
-        "Path to custom semantic search model (null for default)",
+        "Embedding model path",
+        "Path to custom embedding model directory. "
+        "Default: bundled all-MiniLM-L6-v2 (384-dim, INT8 ONNX).",
         "str",
         "CODEN_RETRIEVER_MODEL_PATH",
+    ),
+    "compaction_token_threshold": SettingMeta(
+        "compaction_token_threshold",
+        "Auto-compact history at N tokens",
+        "Drop old tool-call groups when retained context reaches N tokens. "
+        "0 disables compaction. Use /undo to recover the pre-compaction history.",
+        "int",
+        "CODEN_RETRIEVER_COMPACTION_THRESHOLD",
     ),
 }
 
@@ -190,7 +210,7 @@ SETTING_LOCATIONS: dict[str, tuple[str, str, Optional[str]]] = {
     "tool_instructions": ("agent", "tool_instructions", None),
     "ask_tool_permission": ("agent", "ask_tool_permission", None),
     "dynamic_tool_filtering": ("agent", "dynamic_tool_filtering", None),
-    "tool_filter_threshold": ("agent", "tool_filter_threshold", None),
+    "tool_filter_model": ("agent", "tool_filter_model", None),
     "host": ("daemon", "host", None),
     "port": ("daemon", "port", None),
     "daemon_timeout": ("daemon", "daemon_timeout", None),
@@ -198,12 +218,12 @@ SETTING_LOCATIONS: dict[str, tuple[str, str, Optional[str]]] = {
     "default_tokens": ("search", "default_tokens", None),
     "default_limit": ("search", "default_limit", None),
     "semantic_model_path": ("search", "semantic_model_path", None),
+    "compaction_token_threshold": ("agent", "compaction_token_threshold", None),
 }
 
 # Validation constraints for settings
 # Format: key -> (min_value, max_value, error_message) or None for no constraints
 SETTING_CONSTRAINTS: dict[str, tuple[float, float, str]] = {
-    "tool_filter_threshold": (0.0, 1.0, "must be between 0.0 and 1.0"),
     "temperature": (0.0, 2.0, "must be between 0.0 and 2.0"),
     "timeout": (0.001, float("inf"), "must be greater than 0"),
     "daemon_timeout": (0.001, float("inf"), "must be greater than 0"),
@@ -214,6 +234,50 @@ SETTING_CONSTRAINTS: dict[str, tuple[float, float, str]] = {
     "max_projects": (1, float("inf"), "must be at least 1"),
     "default_tokens": (1, float("inf"), "must be at least 1"),
     "default_limit": (1, float("inf"), "must be at least 1"),
+    "compaction_token_threshold": (0, float("inf"), "must be 0 or greater"),
+}
+
+# Per-setting step delta for <,> arrow-stepping in the /config picker.
+# WHY per-key: a uniform step of 1 makes temperature unusable (0-2 range) and
+# max_tokens tedious (typical values 2000-32000). Each delta is chosen so that
+# ~10-30 presses can sweep the realistic range of that setting.
+SETTING_STEPS: dict[str, float] = {
+    "temperature": 0.1,      # 0.0-2.0 range, one-decimal feel
+    "timeout": 5.0,          # seconds, typical 30-300
+    "daemon_timeout": 5.0,   # seconds, same family as timeout
+    "max_steps": 1,          # small integer knob
+    "max_retries": 1,        # small integer knob
+    "max_tokens": 500,       # typical 1000-32000, coarse but useful
+    "default_tokens": 500,   # same shape as max_tokens
+    "port": 1,               # 1-65535; user almost always wants ±1
+    "max_projects": 1,       # small integer knob
+    "default_limit": 1,      # search result count, small integer
+    "compaction_token_threshold": 1000,  # tokens, useful sweep range 0-50000+
+}
+
+# Fallback deltas when a setting has no entry in SETTING_STEPS.
+# WHY: chosen so "just works" defaults stay intuitive for any future setting.
+DEFAULT_INT_STEP: int = 1
+DEFAULT_FLOAT_STEP: float = 0.1
+
+# String settings that must not be empty when explicitly set.
+# api_key with empty string causes confusing downstream auth errors.
+NON_EMPTY_STRING_SETTINGS: frozenset[str] = frozenset({"api_key"})
+
+# Fields stored as line arrays in JSON for readability, keyed by config section.
+# Add a new template by appending its field name to the right section's tuple
+# (and adding the matching attribute on the corresponding dataclass).
+_TEMPLATE_FIELDS: dict[str, tuple[str, ...]] = {
+    "agent": (
+        "system_prompt_template",
+        "study_prompt_template",
+        "tool_instructions_template",
+        "study_tool_instructions_template",
+        "tool_router_prompt_template",
+    ),
+    "mcp": (
+        "full_server_instructions_template",
+    ),
 }
 
 # Type parsers dispatch table - maps value_type to parser function
@@ -223,6 +287,30 @@ _TYPE_PARSERS: dict[str, Callable[[str], Any]] = {
     "float": float,
     "str": lambda v: v if v.lower() != "null" else None,
 }
+
+
+def resolve_template(template: str) -> str:
+    """Return the template string, loading from disk if it starts with 'file:'.
+
+    Raises OSError/ValueError on file: paths that can't be read.
+    """
+    if not template.startswith(FILE_PATH_PREFIX):
+        return template
+
+    path_str = template[len(FILE_PATH_PREFIX):].strip()
+    if not path_str:
+        raise ValueError("file: prefix requires a path")
+
+    return Path(path_str).expanduser().resolve().read_text(encoding="utf-8")
+
+
+def resolve_or_default(template: str, default: str, field_name: str) -> str:
+    """Resolve template; on file:-load failure, log and fall back to default."""
+    try:
+        return resolve_template(template)
+    except (OSError, ValueError) as exc:
+        logger.warning("%s failed (%s), using default", field_name, exc)
+        return default
 
 
 def parse_config_value(key: str, value: str) -> tuple[bool, Any, str]:
@@ -250,21 +338,39 @@ def parse_config_value(key: str, value: str) -> tuple[bool, Any, str]:
         return False, None, f"Invalid {meta.value_type} value '{value}': {e}"
 
 
-def validate_config_value(key: str, value: Any) -> tuple[bool, str]:
+def validate_config_value(
+    key: str, value: Any, check_paths: bool = False,
+) -> tuple[bool, str]:
     """Validate a parsed config value against constraints.
 
     Args:
         key: The setting key.
         value: The parsed value to validate.
+        check_paths: When True, validate that file path settings point to
+            existing paths. Only enabled for interactive /config set, not
+            during config file loading (paths may not exist on this machine).
 
     Returns:
         Tuple of (is_valid, error_message). error_message is empty if valid.
     """
-    if key not in SETTING_CONSTRAINTS:
-        return True, ""
-
     if value is None:
         return True, ""  # None values skip constraint validation
+
+    # Reject empty strings for settings that require a value
+    if key in NON_EMPTY_STRING_SETTINGS and isinstance(value, str) and value == "":
+        return False, f"{key} must not be empty"
+
+    # Validate that file paths exist when explicitly set by user
+    if check_paths and key == "semantic_model_path" and isinstance(value, str):
+        if not Path(value).exists():
+            return False, f"semantic_model_path '{value}' does not exist"
+        from .utils.embedding_validation import validate_embedding_model_dir
+        ok, err = validate_embedding_model_dir(Path(value))
+        if not ok:
+            return False, err
+
+    if key not in SETTING_CONSTRAINTS:
+        return True, ""
 
     # Constraints require numeric comparison - reject non-numeric types
     if not isinstance(value, (int, float)):
@@ -275,6 +381,24 @@ def validate_config_value(key: str, value: Any) -> tuple[bool, str]:
         return False, f"{key} {error_msg}"
 
     return True, ""
+
+
+def read_config_value(config: "AppConfig", key: str) -> Any:
+    """Read a value from the config at the appropriate location.
+
+    Args:
+        config: The AppConfig instance to read from.
+        key: The setting key (must exist in SETTING_LOCATIONS).
+
+    Returns:
+        The current value of the setting.
+    """
+    section_name, attr_name, sub_attr = SETTING_LOCATIONS[key]
+    section = getattr(config, section_name)
+
+    if sub_attr:
+        return getattr(getattr(section, attr_name), sub_attr)
+    return getattr(section, attr_name)
 
 
 def assign_config_value(config: "AppConfig", key: str, value: Any) -> None:
@@ -300,7 +424,7 @@ def set_config_value(config: "AppConfig", key: str, value: str) -> tuple[bool, s
 
     Args:
         config: The AppConfig instance to modify.
-        key: The setting key (e.g., "tool_filter_threshold").
+        key: The setting key (e.g., "temperature").
         value: The string value to set.
 
     Returns:
@@ -325,29 +449,6 @@ def set_config_value(config: "AppConfig", key: str, value: str) -> tuple[bool, s
     # Assign
     assign_config_value(config, key, parsed_value)
     return True, ""
-
-
-def get_config_value(config: "AppConfig", key: str) -> tuple[bool, Any, str]:
-    """Get a config value by key.
-
-    Args:
-        config: The AppConfig instance.
-        key: The setting key.
-
-    Returns:
-        Tuple of (success, value, error_message).
-    """
-    if key not in SETTING_LOCATIONS:
-        return False, None, f"Unknown key: {key}"
-
-    section_name, attr_name, sub_attr = SETTING_LOCATIONS[key]
-    section = getattr(config, section_name)
-
-    if sub_attr:
-        sub_obj = getattr(section, attr_name)
-        return True, getattr(sub_obj, sub_attr), ""
-    else:
-        return True, getattr(section, attr_name), ""
 
 
 def get_config_dir() -> Path:
@@ -386,27 +487,6 @@ class GenerationSettings:
     api_key: Optional[str] = None
 
 
-def get_model_settings(generation: GenerationSettings) -> dict:
-    """Convert GenerationSettings to pydantic-ai ModelSettings dict.
-
-    This creates a dictionary compatible with pydantic-ai's ModelSettings TypedDict.
-    Only includes non-None values to avoid overriding defaults.
-
-    Args:
-        generation: GenerationSettings instance.
-
-    Returns:
-        Dictionary suitable for Agent's model_settings parameter.
-    """
-    settings: dict = {
-        "temperature": generation.temperature,
-        "timeout": generation.timeout,
-    }
-    if generation.max_tokens is not None:
-        settings["max_tokens"] = generation.max_tokens
-    return settings
-
-
 @dataclass
 class ModelConfig:
     """Model and provider configuration.
@@ -438,7 +518,7 @@ DEFAULT_DISABLED_TOOLS: list[str] = [
 class AgentConfig:
     """Agent behavior configuration."""
 
-    max_steps: int = 15
+    max_steps: int = DEFAULT_MAX_STEPS
     max_retries: int = DEFAULT_MAX_RETRIES
     debug: bool = False
     disabled_tools: list[str] = field(default_factory=lambda: DEFAULT_DISABLED_TOOLS.copy())
@@ -446,7 +526,16 @@ class AgentConfig:
     tool_instructions: bool = False
     ask_tool_permission: bool = True
     dynamic_tool_filtering: bool = False
-    tool_filter_threshold: float = 0.5
+    tool_filter_model: Optional[str] = None
+    system_prompt_template: str = DEFAULT_SYSTEM_PROMPT_TEMPLATE
+    study_prompt_template: str = DEFAULT_STUDY_PROMPT_TEMPLATE
+    tool_instructions_template: str = DEFAULT_TOOL_INSTRUCTIONS_TEMPLATE
+    study_tool_instructions_template: str = DEFAULT_STUDY_TOOL_INSTRUCTIONS_TEMPLATE
+    tool_router_prompt_template: str = DEFAULT_TOOL_ROUTER_PROMPT_TEMPLATE
+    starter_questions: list[str] = field(
+        default_factory=lambda: DEFAULT_STARTER_QUESTIONS.copy()
+    )
+    compaction_token_threshold: int = 0
 
 
 @dataclass
@@ -458,6 +547,11 @@ class DaemonConfig:
     daemon_timeout: float = DEFAULT_DAEMON_TIMEOUT
     max_projects: int = DEFAULT_MAX_PROJECTS
 
+    @property
+    def address(self) -> "DaemonAddress":
+        from .daemon.address import DaemonAddress
+        return DaemonAddress(host=self.host, port=self.port)
+
 
 @dataclass
 class SearchDefaults:
@@ -467,9 +561,20 @@ class SearchDefaults:
     the parameters for a single search execution.
     """
 
-    default_tokens: int = 4000
-    default_limit: int = 20
+    default_tokens: int = DEFAULT_TOKEN_BUDGET
+    default_limit: int = DEFAULT_SEARCH_RESULT_LIMIT
     semantic_model_path: Optional[str] = None
+
+
+@dataclass
+class MCPConfig:
+    """MCP server protocol-level instruction string.
+
+    Surfaced to MCP clients (Claude Code, etc.) at server handshake —
+    not to the local agent's LLM.
+    """
+
+    full_server_instructions_template: str = DEFAULT_FULL_SERVER_INSTRUCTIONS_TEMPLATE
 
 
 @dataclass
@@ -481,6 +586,7 @@ class AppConfig:
     agent: AgentConfig = field(default_factory=AgentConfig)
     daemon: DaemonConfig = field(default_factory=DaemonConfig)
     search: SearchDefaults = field(default_factory=SearchDefaults)
+    mcp: MCPConfig = field(default_factory=MCPConfig)
 
 
 def _config_to_dict(config: AppConfig) -> dict[str, Any]:
@@ -488,6 +594,7 @@ def _config_to_dict(config: AppConfig) -> dict[str, Any]:
 
     Uses dataclasses.asdict for automatic serialization, then flattens
     the 'generation' sub-struct into 'model' to match the existing JSON schema.
+    Multi-line prompt templates are split into line arrays for readability.
     """
     data = asdict(config)
 
@@ -496,6 +603,16 @@ def _config_to_dict(config: AppConfig) -> dict[str, Any]:
     if "model" in data and "generation" in data["model"]:
         gen_data = data["model"].pop("generation")
         data["model"].update(gen_data)
+
+    # Split prompt templates into line arrays for readable JSON
+    for section_name, fields in _TEMPLATE_FIELDS.items():
+        section = data.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        for field_name in fields:
+            val = section.get(field_name)
+            if isinstance(val, str) and not val.startswith(FILE_PATH_PREFIX):
+                section[field_name] = val.split("\n")
 
     return data
 
@@ -562,6 +679,24 @@ def _dict_to_config(data: dict[str, Any]) -> AppConfig:
 
         if "mcp_server_timeout" in agent_data:
             config.agent.mcp_server_timeout = agent_data["mcp_server_timeout"]
+
+        # starter_questions: None/missing means use defaults, list overrides
+        saved_questions = agent_data.get("starter_questions")
+        if saved_questions is not None and isinstance(saved_questions, list):
+            config.agent.starter_questions = saved_questions
+
+    # Prompt templates: stored as line arrays in JSON, joined to strings
+    for section_name, fields in _TEMPLATE_FIELDS.items():
+        section_data = data.get(section_name)
+        if not isinstance(section_data, dict):
+            continue
+        section_obj = getattr(config, section_name)
+        for field_name in fields:
+            raw = section_data.get(field_name)
+            if isinstance(raw, list):
+                setattr(section_obj, field_name, "\n".join(raw))
+            elif isinstance(raw, str):
+                setattr(section_obj, field_name, raw)
 
     return config
 
@@ -709,11 +844,19 @@ def get_semantic_model_path() -> str:
         Path to the semantic model directory.
     """
     default_model_path = str(
-        Path(__file__).parent / "models" / "embeddings" / "model2vec_embed_distill"
+        Path(__file__).parent / "models" / "embeddings" / "minilm_onnx"
     )
     try:
-        config = load_config()
+        config = get_config()
         return config.search.semantic_model_path or default_model_path
     except Exception as e:
         logger.debug(f"Config load failed, using default model path: {e}")
         return default_model_path
+
+
+def get_default_token_budget() -> int:
+    try:
+        return get_config().search.default_tokens
+    except Exception as e:
+        logger.debug(f"Config load failed, using DEFAULT_TOKEN_BUDGET: {e}")
+        return DEFAULT_TOKEN_BUDGET

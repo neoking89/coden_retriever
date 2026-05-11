@@ -21,12 +21,16 @@ from pydantic_ai.settings import ModelSettings
 
 from ..config_loader import GenerationSettings, get_config, load_config
 from ..daemon import start_daemon_async, stop_daemon
-from ..mcp.tool_filter import ToolFilter, ToolMetadata
+from ..mcp.llm_tool_router import LLMToolRouter
+from ..mcp.tool_filter import TOOL_QUERY_DESCRIPTIONS, ToolMetadata
 from .debug_logger import DebugLogger, create_debug_logger
+from .file_reference import expand_file_references, find_file_references
+from .commands import FILTER_MODEL_SYNC_SENTINEL
 from .filtering_toolset import create_filtered_toolset
 from .interactive_loop import CommandContext, InteractiveLoop
 from .mcp_server import create_mcp_server
 from .model_factory import ModelFactory
+from pydantic_ai.models.openai import OpenAIChatModel
 from .models import AgentMode, AgentResponse, ReActStep, SessionTrigger
 from .permission_toolset import wrap_toolset_with_permission
 from .prompt_builder import PromptBuilder
@@ -101,7 +105,7 @@ class CodingAgent:
         model: str = "ollama:",
         base_url: Optional[str] = None,
         max_steps: int = 10,
-        tool_instructions: bool = True,
+        tool_instructions: bool = False,
         generation: Optional[GenerationSettings] = None,
     ):
         """Initialize the coding agent.
@@ -114,7 +118,7 @@ class CodingAgent:
                 - "model_name" - OpenAI-compatible endpoint (requires base_url)
             base_url: Base URL for OpenAI-compatible API (not needed for openai: prefix).
             max_steps: Maximum number of tool calls per query (default: 10).
-            tool_instructions: Include detailed tool workflow instructions in prompt (default: True).
+            tool_instructions: Include detailed tool workflow instructions in prompt (default: False).
             generation: Generation settings (temperature, max_tokens, timeout, api_key).
         """
         self.model_str = model
@@ -137,6 +141,8 @@ class CodingAgent:
         """
         config = get_config()
         gen = config.model.generation
+        # Timeout enforcement is delegated to pydantic-ai, which passes it to
+        # the underlying httpx client. Validated by SETTING_CONSTRAINTS in config_loader.
         settings: ModelSettings = {
             "temperature": gen.temperature,
             "timeout": gen.timeout,
@@ -153,6 +159,32 @@ class CodingAgent:
     def _create_model(self):
         """Create a new model instance. For backwards compatibility with tests."""
         return self._model_factory._create_model()
+
+    def _resolve_filter_model(self, tool_filter_model: Optional[str]) -> OpenAIChatModel:
+        """Resolve the model instance for the tool filter router.
+
+        Args:
+            tool_filter_model: Config value — None, "model" sentinel, or model string.
+
+        Returns:
+            Model instance for the router.
+        """
+        if not tool_filter_model or tool_filter_model == FILTER_MODEL_SYNC_SENTINEL:
+            return self._get_model()
+
+        filter_factory = ModelFactory(
+            tool_filter_model, self.base_url, self.generation,
+        )
+        return filter_factory.get_model()
+
+    @staticmethod
+    def _should_sync_router_on_model_switch(tool_filter_model: Optional[str]) -> bool:
+        """Whether router model should follow the main model switch.
+
+        Only syncs when no dedicated filter model is configured, or the
+        sentinel "model" value is set (explicit auto-sync).
+        """
+        return not tool_filter_model or tool_filter_model == FILTER_MODEL_SYNC_SENTINEL
 
     def _get_directory_tree(self, root_directory: str, refresh: bool = False) -> str:
         """Get cached directory tree."""
@@ -432,11 +464,13 @@ class CodingAgent:
             print_goodbye()
             # Stop daemon when exiting agent mode
             if daemon_started:
-                stop_daemon()
+                try:
+                    stop_daemon()
+                except KeyboardInterrupt:
+                    pass
 
     def _load_config(self):
         """Load configuration settings."""
-        from ..config_loader import get_config
         return get_config()
 
     async def _run_interactive_session(
@@ -459,27 +493,38 @@ class CodingAgent:
             max_steps=self.max_steps,
         )
 
-        # Create tool filter if dynamic filtering is enabled
-        tool_filter = None
+        # Create LLM tool router if dynamic filtering is enabled
+        tool_router = None
         filtering_toolset = None
+        tool_filter_model_str = config.agent.tool_filter_model
         if config.agent.dynamic_tool_filtering:
+            if not tool_filter_model_str:
+                console.print(
+                    "[yellow]Tool filtering is ON but no filter model is set.\n"
+                    "  Use /filter-model <model> or /config set tool_filter_model model[/yellow]"
+                )
             try:
                 tool_metadata_list = [
-                    ToolMetadata(name=tool.name, description=tool.description or "")
+                    ToolMetadata(
+                        name=tool.name,
+                        description=tool.description or "",
+                        query_description=TOOL_QUERY_DESCRIPTIONS.get(tool.name, ""),
+                    )
                     for tool in available_tools
                 ]
-                tool_filter = ToolFilter(tool_metadata_list)
-                console.print("[dim]Dynamic tool filtering enabled[/dim]")
+                router_model = self._resolve_filter_model(tool_filter_model_str)
+                tool_router = LLMToolRouter(tool_metadata_list, model=router_model)
+                console.print("[dim]LLM tool routing enabled[/dim]")
             except Exception as e:
-                console.print(f"[yellow]Warning: Could not initialize tool filter: {e}[/yellow]")
+                escaped_msg = str(e).replace("[", "\\[")
+                console.print(f"[yellow]Warning: Could not initialize tool router: {escaped_msg}[/yellow]")
 
-        # Wrap toolset with filtering if tool_filter is available
-        semantic_filter = None
-        if tool_filter is not None:
-            filtering_toolset, semantic_filter = create_filtered_toolset(
+        # Wrap toolset with filtering if tool_router is available
+        llm_filter = None
+        if tool_router is not None:
+            filtering_toolset, llm_filter = create_filtered_toolset(
                 toolset=server,
-                tool_filter=tool_filter,
-                threshold=config.agent.tool_filter_threshold,
+                tool_router=tool_router,
             )
             base_toolset = filtering_toolset
         else:
@@ -501,14 +546,14 @@ class CodingAgent:
             server=server,
             toolset=toolset,
             ask_tool_permission=ask_tool_permission,
-            dynamic_tool_filtering=tool_filter is not None,
-            tool_filter=tool_filter,
-            tool_filter_threshold=config.agent.tool_filter_threshold,
+            dynamic_tool_filtering=tool_router is not None,
+            tool_filter_model=tool_filter_model_str,
+            tool_router=tool_router,
         )
 
-        # Store filtering toolset and semantic filter in context for per-query updates
+        # Store filtering toolset and LLM filter in context for per-query updates
         context.filtering_toolset = filtering_toolset
-        context.semantic_filter = semantic_filter
+        context.llm_filter = llm_filter
 
         # Build initial system prompt and agent (uses instance caching)
         system_prompt = self._build_system_prompt(root_directory)
@@ -527,13 +572,20 @@ class CodingAgent:
             self.model_str = new_model
             self._model_factory.model_str = new_model
             self._model_factory.clear_cache()
+            new_model_instance = self._get_model()
             agent = Agent(
-                self._get_model(),
+                new_model_instance,
                 system_prompt=system_prompt,
                 toolsets=[toolset],
                 retries=context.max_retries,
                 model_settings=self._build_model_settings(),
             )
+            # Sync router model: re-resolve so dedicated filter models are
+            # not overwritten on main model switch; sentinel/None follow the switch.
+            if (context.tool_router is not None
+                    and self._should_sync_router_on_model_switch(context.tool_filter_model)):
+                router_model = self._resolve_filter_model(context.tool_filter_model)
+                context.tool_router.update_model(router_model)
 
         loop = InteractiveLoop(context, on_model_switch=on_model_switch)
         pending_input = first_input
@@ -573,13 +625,18 @@ class CodingAgent:
                             refresh_tree=cmd_result.directory_changed,
                         )
                         debug_logger.log_system_prompt(system_prompt)
+                        new_model_instance = self._get_model()
                         agent = Agent(
-                            self._get_model(),
+                            new_model_instance,
                             system_prompt=system_prompt,
                             toolsets=[toolset],
                             retries=context.max_retries,
                             model_settings=self._build_model_settings(),
                         )
+                        # Sync router model: resolve from config (may be dedicated or main)
+                        if context.tool_router is not None:
+                            router_model = self._resolve_filter_model(context.tool_filter_model)
+                            context.tool_router.update_model(router_model)
                         # Auto-start study session when entering study mode
                         if context.study_mode:
                             try:
@@ -595,8 +652,24 @@ class CodingAgent:
                                 console.print("\n[dim]Response interrupted.[/dim]")
                     continue
 
+                # Shell pipe-to-LLM: `! cmd @@ query` builds a synthetic
+                # prompt with the captured output and drives one LLM turn.
+                # Track whether this turn originated from shell output so that
+                # @file expansion is skipped — command output may contain
+                # @-prefixed tokens that must not be treated as file references.
+                is_shell_prompt = cmd_result.shell_to_llm is not None
+                if is_shell_prompt:
+                    user_input = cmd_result.shell_to_llm
+
                 if not user_input:
                     continue
+
+                # Expand @file references, but never on shell-generated content
+                # (the captured output is already fenced and self-contained).
+                if not is_shell_prompt and find_file_references(user_input):
+                    user_input = expand_file_references(
+                        user_input, context.root_directory,
+                    )
 
                 try:
                     await self._run_query(
@@ -653,7 +726,8 @@ class CodingAgent:
         topic = context.study_topic if context else None
         prompt = build_query_prompt(user_input, root_directory, mode, topic)
 
-        executor = QueryExecutor(self.max_steps, self.model_str)
+        max_retries = context.max_retries if context else DEFAULT_MAX_RETRIES
+        executor = QueryExecutor(self.max_steps, self.model_str, max_retries=max_retries)
         await executor.execute(agent, prompt, debug_logger, loop, context)
 
     def _handle_model_error(self, e: ModelHTTPError, debug_logger: DebugLogger) -> None:

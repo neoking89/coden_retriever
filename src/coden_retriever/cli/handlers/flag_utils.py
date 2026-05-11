@@ -13,7 +13,6 @@ from ...constants import (
 )
 from ...daemon.protocol import FlagParams
 from ...formatters.flag_formatter import FlagFormatter
-from ...utils.optional_deps import MissingDependencyError, require_feature
 from ..utils import get_clone_mode
 
 # Centralized flag mapping enables consistent validation and formatting
@@ -25,6 +24,7 @@ FLAG_ATTR_TO_SHORT: list[tuple[str, str]] = [
     ("dead_code", "-D"),
     ("tramp_data", "-T"),
     ("sensitive_values", "-S"),
+    ("magic_constants", "-K"),
 ]
 
 
@@ -51,19 +51,11 @@ def validate_flag_args(args: argparse.Namespace, root_path: Path) -> int:
         dead_code=args.dead_code,
         tramp_data=args.tramp_data,
         sensitive_values=args.sensitive_values,
+        magic_constants=args.magic_constants,
     )
     if error := temp_params.validate():
         print(f"Error: {error}", file=sys.stderr)
         return 1
-
-    clone_mode = get_clone_mode(args)
-    needs_semantic = args.echo_comments or (args.clones and clone_mode in ("semantic", "combined"))
-    if needs_semantic:
-        try:
-            require_feature("semantic")
-        except MissingDependencyError as e:
-            print(str(e), file=sys.stderr)
-            return 1
 
     return 0
 
@@ -100,6 +92,9 @@ def build_flag_params(args: argparse.Namespace, root_path: Path) -> FlagParams:
         sensitive_threshold=args.sensitive_threshold,
         replace_value=getattr(args, "replace", None),
         sensitive_whitelist=getattr(args, "whitelist", None),
+        magic_constants=args.magic_constants,
+        magic_constant_min_occurrences=args.min_constant_occurrences,
+        magic_constant_min_files=args.min_constant_files,
     )
 
 

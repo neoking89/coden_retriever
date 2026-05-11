@@ -7,9 +7,11 @@ for graph analysis operations like symbol lookup, caller traversal, and hotspot 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
+from .constants import DEFAULT_TOKEN_BUDGET
 from .token_estimator import count_tokens
 
 if TYPE_CHECKING:
@@ -49,6 +51,21 @@ def calculate_risk_score(fan_in: int, fan_out: int, complexity: int | None) -> f
     coupling = fan_in + fan_out
     cc = complexity if complexity is not None else 1
     return coupling * math.log1p(cc)
+
+
+def calculate_dispatcher_score(fan_out: int, complexity: int | None) -> float:
+    """Calculate dispatcher score: downstream-only complexity weight.
+
+    Formula: Dispatcher Score = Fan_Out * log(Cyclomatic_Complexity + 1)
+
+    Drops fan_in deliberately: PageRank and Betweenness already reward fan_in,
+    so a third fan_in-aware signal would be redundant. This rewards functions
+    that orchestrate many callees with branching logic — the textbook dispatcher
+    shape (e.g. processCommand, beginWork) — which the fan_in-correlated signals
+    bury under leaf utilities.
+    """
+    cc = complexity if complexity is not None else 1
+    return fan_out * math.log1p(cc)
 
 
 def categorize_risk(fan_in: int, fan_out: int, complexity: int | None) -> str:
@@ -306,28 +323,27 @@ def apply_token_budget_filter(
     used_tokens: int,
     tokens_per_item: int,
     text_fields: list[str],
-) -> tuple[list[dict[str, Any]], bool]:
+    text_builder: Callable[[dict[str, Any]], str] | None = None,
+) -> tuple[list[dict[str, Any]], int, bool]:
     """Filter a list of items to fit within a token budget.
 
-    Args:
-        items: List of dictionaries to filter.
-        token_limit: Maximum tokens allowed (None = unlimited, for CLI mode).
-        used_tokens: Tokens already used.
-        tokens_per_item: Base token overhead per item.
-        text_fields: List of field names to include in token estimation.
+    When ``text_builder`` is provided, it produces the per-item text used for
+    token estimation. Otherwise the named ``text_fields`` are space-joined.
 
     Returns:
-        Tuple of (filtered_items, token_budget_exceeded).
+        Tuple of (filtered_items, used_tokens, token_budget_exceeded).
     """
     if token_limit is None:
-        return items, False
+        return items, used_tokens, False
 
     filtered = []
     budget_exceeded = False
 
     for item in items:
-        text_parts = [str(item.get(field, "")) for field in text_fields]
-        text = " ".join(text_parts)
+        if text_builder is not None:
+            text = text_builder(item)
+        else:
+            text = " ".join(str(item.get(field, "")) for field in text_fields)
         tokens = count_tokens(text, is_code=False) + tokens_per_item
         if used_tokens + tokens > token_limit:
             budget_exceeded = True
@@ -335,7 +351,7 @@ def apply_token_budget_filter(
         used_tokens += tokens
         filtered.append(item)
 
-    return filtered, budget_exceeded
+    return filtered, used_tokens, budget_exceeded
 
 
 def compute_percentile_scores(
@@ -368,7 +384,7 @@ def compute_coupling_hotspots(
     min_coupling_score: int = 10,
     exclude_tests: bool = True,
     exclude_private: bool = False,
-    token_limit: int = 4000,
+    token_limit: int = DEFAULT_TOKEN_BUDGET,
 ) -> dict[str, Any]:
     """Compute coupling hotspots from a code dependency graph.
 
@@ -431,7 +447,7 @@ def compute_coupling_hotspots(
     hotspots = hotspots[:limit]
 
     # Apply token budget filtering
-    filtered_hotspots, token_budget_exceeded = apply_token_budget_filter(
+    filtered_hotspots, _, token_budget_exceeded = apply_token_budget_filter(
         hotspots,
         token_limit,
         _TOKEN_OVERHEAD_HOTSPOTS,
@@ -476,3 +492,101 @@ def compute_coupling_hotspots(
             "token_budget_exceeded": token_budget_exceeded,
         },
     }
+
+
+@dataclass
+class BfsContext:
+    """Read-only inputs for an upstream-caller BFS over the call graph.
+
+    Carried unchanged through every level of the traversal; the per-traversal
+    mutable state lives in `BfsAccumulator`.
+    """
+
+    graph: Any
+    entities: dict[str, Any]
+    pagerank: dict[str, float]
+    min_importance: float
+
+
+@dataclass
+class BfsAccumulator:
+    """Mutable BFS state that grows as the upstream traversal proceeds.
+
+    `expand_callers_one_level` adds to `visited`, `affected_files`, and
+    `root_callers`. `trace_impact_bfs` additionally tracks the per-depth
+    callers map and token-budget bookkeeping.
+    """
+
+    visited: set[str] = field(default_factory=set)
+    affected_files: set[str] = field(default_factory=set)
+    root_callers: list[dict[str, Any]] = field(default_factory=list)
+    callers_by_depth: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
+    used_tokens: int = 0
+    token_budget_exceeded: bool = False
+
+
+def expand_callers_one_level(
+    current_level: set[str],
+    ctx: BfsContext,
+    acc: BfsAccumulator,
+) -> tuple[set[str], list[dict[str, Any]]]:
+    """Walk one BFS step upstream. Returns (next_level, callers_at_this_depth).
+
+    Mutates `acc` (visited, affected_files, root_callers) as the traversal
+    accumulates across depth levels.
+    """
+    next_level: set[str] = set()
+    depth_callers: list[dict[str, Any]] = []
+
+    for node in current_level:
+        if node not in ctx.graph:
+            continue
+        for caller_node in ctx.graph.predecessors(node):
+            if caller_node in acc.visited:
+                continue
+            acc.visited.add(caller_node)
+            next_level.add(caller_node)
+            caller_entity = ctx.entities.get(caller_node)
+            if not caller_entity:
+                continue
+            importance = ctx.pagerank.get(caller_node, 0.0)
+            if importance < ctx.min_importance:
+                continue
+            caller_info = build_caller_info(caller_entity, importance)
+            depth_callers.append(caller_info)
+            acc.affected_files.add(caller_entity.file_path)
+            if ctx.graph.in_degree(caller_node) == 0:
+                acc.root_callers.append(caller_info)
+    return next_level, depth_callers
+
+
+def trace_impact_bfs(
+    target_node: str,
+    ctx: BfsContext,
+    max_depth: int,
+    token_limit: int,
+) -> BfsAccumulator:
+    """BFS upstream from `target_node`, respecting token budget."""
+    acc = BfsAccumulator(
+        visited={target_node},
+        used_tokens=_TOKEN_OVERHEAD_CHANGE_IMPACT,
+    )
+    current_level: set[str] = {target_node}
+
+    for depth in range(1, max_depth + 1):
+        next_level, depth_callers = expand_callers_one_level(current_level, ctx, acc)
+        if depth_callers:
+            depth_callers.sort(key=lambda x: x["importance"], reverse=True)
+            kept, acc.used_tokens, acc.token_budget_exceeded = apply_token_budget_filter(
+                depth_callers,
+                token_limit,
+                acc.used_tokens,
+                _TOKEN_PER_CALLER,
+                ["name", "file", "type"],
+            )
+            acc.callers_by_depth[depth] = kept
+        if not next_level or acc.token_budget_exceeded:
+            break
+        current_level = next_level
+
+    return acc

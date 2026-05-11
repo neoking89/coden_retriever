@@ -10,11 +10,12 @@ from pathlib import Path
 from typing import Optional
 
 from .cache.manager import CacheManager
-from .config import OutputFormat
+from .config import MapMode, OutputFormat
 from .constants import DEFAULT_SEARCH_RESULT_LIMIT
 from .formatters import get_formatter
 from .formatters.base import OutputFormatter
-from .search.engine import SearchEngine
+from .search.engine import SearchEngine, strategy_for
+from .semantic_config import SemanticConfig
 from .token_estimator import count_tokens
 
 
@@ -30,12 +31,13 @@ class SearchConfig:
     model_path: Optional[str] = None
     show_deps: bool = False
     dir_tree: bool = False
-    map_mode: bool = False
+    show_map: bool = False
     find_mode: Optional[str] = None
     limit: int | None = 20
     verbose: bool = False
     show_stats: bool = False
     reverse: bool = False
+    map_mode: MapMode = MapMode.STATIC
 
     @classmethod
     def from_cli_args(cls, args, root_path: Path) -> "SearchConfig":
@@ -49,13 +51,27 @@ class SearchConfig:
             model_path=getattr(args, "model_path", None),
             show_deps=getattr(args, "show_deps", False),
             dir_tree=getattr(args, "dir_tree", False),
-            map_mode=getattr(args, "map", False),
+            show_map=getattr(args, "map", False),
             find_mode=getattr(args, "find", None),
             limit=getattr(args, "limit", 20),
             verbose=getattr(args, "verbose", False),
             show_stats=getattr(args, "stats", False),
             reverse=getattr(args, "reverse", False),
+            map_mode=MapMode(getattr(args, "map_mode", MapMode.STATIC.value)),
         )
+
+
+def check_semantic_used(results: list) -> bool:
+    """Check whether semantic scoring actually contributed to search results.
+
+    Prevents misleading 'SEMANTIC SEARCH MODE' banners when semantic
+    was requested but silently fell back to BM25.
+    """
+    return bool(
+        results
+        and hasattr(results[0], "components")
+        and "semantic" in results[0].components
+    )
 
 
 @dataclass
@@ -68,6 +84,7 @@ class SearchResult:
     formatted_output: str
     tree_output: Optional[str] = None
     stats: Optional[str] = None
+    semantic_used: bool = False
 
 
 class SearchPipeline:
@@ -112,19 +129,30 @@ class SearchPipeline:
         if self._engine is not None:
             return self._engine
 
-        if self._cache is None:
-            self._cache = CacheManager(
-                self.config.root_path,
-                enable_semantic=self.config.enable_semantic,
-                model_path=self.config.model_path,
-                verbose=self.config.verbose,
-            )
-
-        cached_indices = self._cache.load_or_rebuild()
-        self._engine = SearchEngine.from_cached_indices(
-            cached_indices, verbose=self.config.verbose
+        # Map context is the only place `--map-mode simple` is honored — a real
+        # query or find call needs the full graph regardless of the user's
+        # map_mode preference, so we pin to STATIC outside the map context.
+        in_map_context = (
+            (self.config.show_map or not self.config.query)
+            and not self.config.find_mode
+        )
+        strategy = strategy_for(
+            self.config.map_mode if in_map_context else MapMode.STATIC
         )
 
+        if self._cache is None or self._cache._layout is not strategy.layout:
+            semantic = strategy.semantic_override or SemanticConfig(
+                enabled=self.config.enable_semantic,
+                model_path=self.config.model_path,
+            )
+            self._cache = CacheManager(
+                self.config.root_path,
+                semantic=semantic,
+                verbose=self.config.verbose,
+                layout=strategy.layout,
+            )
+
+        self._engine = strategy.build_engine(self._cache, self.config.verbose)
         return self._engine
 
     def run_search(self, engine: Optional[SearchEngine] = None) -> list:
@@ -151,13 +179,14 @@ class SearchPipeline:
                 limit=limit,
                 include_deps=config.show_deps,
             )
-        elif config.map_mode or not config.query:
+        elif config.show_map or not config.query:
             # Map mode (architecture overview)
             return engine.search(
                 query="",
                 use_architecture=True,
                 include_deps=config.show_deps,
                 limit=limit,
+                map_mode=config.map_mode,
             )
         else:
             # Regular search mode
@@ -236,6 +265,8 @@ class SearchPipeline:
         # Apply token budget
         filtered_results, used_tokens = self.filter_results(raw_results)
 
+        semantic_used = check_semantic_used(raw_results)
+
         # Get stats BEFORE reversing (stats always show normal order 1, 2, 3...)
         # Show stats for all filtered results (matching the actual output)
         stats = None
@@ -257,6 +288,7 @@ class SearchPipeline:
             formatted_output=formatted_output,
             tree_output=tree_output,
             stats=stats,
+            semantic_used=semantic_used,
         )
 
 
@@ -269,7 +301,7 @@ def execute_search_pipeline(
     model_path: Optional[str] = None,
     show_deps: bool = False,
     dir_tree: bool = False,
-    map_mode: bool = False,
+    show_map: bool = False,
     find_mode: Optional[str] = None,
     limit: int = 20,
     verbose: bool = False,
@@ -289,7 +321,7 @@ def execute_search_pipeline(
         model_path: Path to semantic model
         show_deps: Show dependency context
         dir_tree: Generate directory tree
-        map_mode: Use architecture map mode
+        show_map: Force map output even with a query (auto-on when no query)
         find_mode: Identifier to find (enables find mode)
         limit: Maximum results to return
         verbose: Enable verbose output
@@ -307,7 +339,7 @@ def execute_search_pipeline(
         model_path=model_path,
         show_deps=show_deps,
         dir_tree=dir_tree,
-        map_mode=map_mode,
+        show_map=show_map,
         find_mode=find_mode,
         limit=limit,
         verbose=verbose,
@@ -324,4 +356,5 @@ def execute_search_pipeline(
         "result_count": len(result.filtered_results),
         "total_count": len(result.results),
         "used_tokens": result.used_tokens,
+        "semantic_used": result.semantic_used,
     }

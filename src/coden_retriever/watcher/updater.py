@@ -23,6 +23,7 @@ from ..constants import AMBIGUOUS_METHOD_NAMES
 from ..models import CodeEntity
 from ..parsers import RepoParser
 from ..search.bm25 import BM25Index
+from ..semantic_config import SemanticConfig
 from .debouncer import BatchedChanges
 
 logger = logging.getLogger(__name__)
@@ -51,8 +52,7 @@ class IncrementalUpdater:
         self,
         source_dir: Path,
         indices: CachedIndices,
-        enable_semantic: bool = False,
-        model_path: str | None = None,
+        semantic: SemanticConfig = SemanticConfig(),
     ):
         """
         Initialize the incremental updater.
@@ -60,13 +60,12 @@ class IncrementalUpdater:
         Args:
             source_dir: Root directory of the project
             indices: Current cached indices to update
-            enable_semantic: Whether semantic search is enabled
-            model_path: Path to semantic model
+            semantic: Semantic search configuration
         """
         self.source_dir = Path(source_dir).resolve()
         self.indices = indices
-        self.enable_semantic = enable_semantic
-        self.model_path = model_path
+        self.enable_semantic = semantic.enabled
+        self.model_path = semantic.model_path
         self._parser = RepoParser()
         self._lock = threading.Lock()
         self._semantic_dirty = False
@@ -109,8 +108,7 @@ class IncrementalUpdater:
         """Perform a full cache rebuild."""
         cache_manager = CacheManager(
             source_dir=self.source_dir,
-            enable_semantic=self.enable_semantic,
-            model_path=self.model_path,
+            semantic=SemanticConfig(enabled=self.enable_semantic, model_path=self.model_path),
         )
         return cache_manager.load_or_rebuild()
 
@@ -140,19 +138,28 @@ class IncrementalUpdater:
             rel_path = self._get_rel_path(path)
             if rel_path:
                 affected_files.add(rel_path)
-                files_to_parse.append(path)
+                files_to_parse.append(path.resolve())
 
         for path in changes.created:
             rel_path = self._get_rel_path(path)
             if rel_path:
                 affected_files.add(rel_path)
-                files_to_parse.append(path)
+                files_to_parse.append(path.resolve())
 
         logger.debug(f"Affected files: {affected_files}")
 
-        # Step 2: Remove old entities for affected files
+        # Step 2: Remove old entities AND drop each affected file's
+        # used_names contribution. Without the drop, a deleted callback
+        # reference would keep suppressing the target's dead-code flag.
         entities_removed = self._remove_entities_for_files(affected_files)
         logger.debug(f"Removed {entities_removed} entities")
+
+        # Resolve before keying — the full build keys used_names_by_file
+        # under (source_dir.resolve() / rel_path); the OS watcher can emit
+        # non-canonical paths, so without this both the pop and the write
+        # below would silently miss the existing entry.
+        for path in (*changes.deleted, *changes.modified, *changes.created):
+            self.indices.used_names_by_file.pop(str(path.resolve()), None)
 
         # Step 3: Parse new/modified files
         new_entities: dict[str, CodeEntity] = {}
@@ -162,12 +169,14 @@ class IncrementalUpdater:
             if not file_path.exists():
                 continue
 
-            entities, refs = self._parse_file(file_path)
+            entities, refs, used_names = self._parse_file(file_path)
             for entity in entities:
                 new_entities[entity.node_id] = entity
 
             for ref in refs:
                 all_references.append((str(file_path), *ref))
+
+            self.indices.used_names_by_file[str(file_path)] = used_names
 
         logger.debug(f"Parsed {len(new_entities)} new entities")
 
@@ -213,26 +222,28 @@ class IncrementalUpdater:
 
         for node_id in entities_to_remove:
             del self.indices.entities[node_id]
-            # Also remove from graph
-            if self.indices.graph.has_node(node_id):
-                self.indices.graph.remove_node(node_id)
+            
+            for graph in [self.indices.graph, self.indices.type_graph]:
+                if graph.has_node(node_id):
+                    graph.remove_node(node_id)
 
         return len(entities_to_remove)
 
-    def _parse_file(self, file_path: Path) -> tuple[list[CodeEntity], list[tuple[int, str, str, str | None]]]:
-        """Parse a single file and return entities and references.
+    def _parse_file(
+        self, file_path: Path
+    ) -> tuple[list[CodeEntity], list[tuple[int, str, str, str | None]], set[str]]:
+        """Parse a single file and return entities, references, and used identifiers.
 
         Returns:
-            Tuple of (entities, references) where references are
+            Tuple of (entities, references, used_names). references are
             (line, target_name, ref_type, receiver) tuples.
         """
         try:
             source_code = file_path.read_text(encoding="utf-8", errors="ignore")
-            entities, references = self._parser.parse_file(str(file_path), source_code)
-            return entities, references
+            return self._parser.parse_file(str(file_path), source_code)
         except Exception as e:
             logger.debug(f"Failed to parse {file_path}: {e}")
-            return [], []
+            return [], [], set()
 
     def _rebuild_bm25_index(self) -> None:
         """Rebuild the BM25 index from current entities."""
@@ -260,6 +271,7 @@ class IncrementalUpdater:
             affected_files: Set of relative file paths that were changed
         """
         graph = self.indices.graph
+        type_graph = self.indices.type_graph
 
         # Add new entity nodes
         for node_id in new_entities:
@@ -342,21 +354,21 @@ class IncrementalUpdater:
                 else:
                     graph.add_edge(source_id, target_id, weight=weight, types={ref_type})
 
+                if ref_type == "type":
+                    if type_graph.has_edge(source_id, target_id):
+                        type_graph[source_id][target_id]["weight"] += weight
+                        type_graph[source_id][target_id]["types"].add(ref_type)
+                    else:
+                        type_graph.add_edge(source_id, target_id, weight=weight, types={ref_type})
+
     def _recalculate_centrality(self) -> None:
-        """Recalculate PageRank and betweenness centrality."""
-        pagerank, betweenness = compute_centrality(self.indices.graph)
-        self.indices.pagerank = pagerank
-        self.indices.betweenness = betweenness
+        """Recalculate PageRank, betweenness, and type-graph PageRank."""
+        self.indices.centrality = compute_centrality(
+            self.indices.graph, self.indices.type_graph
+        )
 
     def _rebuild_lookup_structures(self) -> None:
-        """Rebuild name_to_nodes, file_scopes, file_to_entities, and qualified_name_to_nodes."""
-        name_to_nodes, file_scopes, file_to_entities, qualified_name_to_nodes = build_lookup_structures(
-            self.indices.entities
-        )
-        self.indices.name_to_nodes = name_to_nodes
-        self.indices.file_scopes = file_scopes
-        self.indices.file_to_entities = file_to_entities
-        self.indices.qualified_name_to_nodes = qualified_name_to_nodes
+        self.indices.lookups = build_lookup_structures(self.indices.entities)
 
     def _update_manifest(self, affected_files: set[str]) -> None:
         """Update manifest with new file metadata."""

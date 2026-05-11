@@ -2,6 +2,15 @@
 import argparse
 from dataclasses import dataclass
 
+from ..constants import (
+    DEFAULT_CLONE_SEMANTIC_THRESHOLD,
+    DEFAULT_DEAD_CODE_CONFIDENCE_THRESHOLD,
+    DEFAULT_ECHO_COMMENT_THRESHOLD,
+    DEFAULT_HOTSPOT_RISK_THRESHOLD,
+    DEFAULT_PROPAGATION_COST_THRESHOLD,
+    SENSITIVE_VALUE_DEFAULT_THRESHOLD,
+)
+
 
 @dataclass(frozen=True)
 class ThresholdConfig:
@@ -17,42 +26,29 @@ class ThresholdConfig:
     validate_0_1: bool = True  # If True, validate range 0.0-1.0
 
 
-# Risk score baseline for hotspot flagging (raw score, typically 50-200+)
-_DEFAULT_RISK_SCORE = 50.0
-# Propagation coupling percentage threshold (25% internal coupling)
-_DEFAULT_PROPAGATION = 0.25
-# Clone similarity threshold (very similar functions)
-_DEFAULT_CLONE = 0.95
-# Echo comment similarity threshold (comment restates code)
-_DEFAULT_ECHO = 0.85
-# Dead code confidence threshold (medium confidence)
-_DEFAULT_DEAD_CODE = 0.5
-# Sensitive value confidence threshold (balanced recall/precision)
-_DEFAULT_SENSITIVE = 0.35
-
 THRESHOLD_CONFIGS: dict[str, ThresholdConfig] = {
     "risk": ThresholdConfig(
         name="risk-threshold",
-        default=_DEFAULT_RISK_SCORE,
+        default=DEFAULT_HOTSPOT_RISK_THRESHOLD,
         analysis_flag="-H",
         analysis_name="Hotspots",
         short_help="(-H) Hotspot min risk score (raw score, typically 50-200+)",
         detailed_help="Hotspots (-H): min risk score for flagging. Raw score = coupling * log(complexity). Default: 50",
-        example_value=_DEFAULT_RISK_SCORE,
+        example_value=DEFAULT_HOTSPOT_RISK_THRESHOLD,
         validate_0_1=False,
     ),
     "propagation": ThresholdConfig(
         name="propagation-threshold",
-        default=_DEFAULT_PROPAGATION,
+        default=DEFAULT_PROPAGATION_COST_THRESHOLD,
         analysis_flag="-P",
         analysis_name="Propagation Cost",
         short_help="(-P) Propagation cost threshold (0.0-1.0)",
         detailed_help="Propagation (-P): min internal coupling %% for flagging modules. Range: 0-1. Default: 0.25 (25%%)",
-        example_value=_DEFAULT_PROPAGATION,
+        example_value=DEFAULT_PROPAGATION_COST_THRESHOLD,
     ),
     "clone": ThresholdConfig(
         name="clone-threshold",
-        default=_DEFAULT_CLONE,
+        default=DEFAULT_CLONE_SEMANTIC_THRESHOLD,
         analysis_flag="-C",
         analysis_name="Code Clones",
         short_help="(-C) Clone similarity threshold (0.0-1.0)",
@@ -61,16 +57,16 @@ THRESHOLD_CONFIGS: dict[str, ThresholdConfig] = {
     ),
     "echo": ThresholdConfig(
         name="echo-threshold",
-        default=_DEFAULT_ECHO,
+        default=DEFAULT_ECHO_COMMENT_THRESHOLD,
         analysis_flag="-E",
         analysis_name="Echo Comments",
         short_help="(-E) Echo comment similarity threshold (0.0-1.0)",
-        detailed_help="Echo Comments (-E): semantic similarity threshold. Range: 0-1. Default: 0.85. Stricter (0.95) = near-identical only, Looser (0.75) = more detections",
-        example_value=_DEFAULT_ECHO,
+        detailed_help="Echo Comments (-E): semantic similarity threshold. Range: 0-1. Default: 0.80. Stricter (0.95) = near-identical only, Looser (0.75) = more detections",
+        example_value=DEFAULT_ECHO_COMMENT_THRESHOLD,
     ),
     "dead_code": ThresholdConfig(
         name="dead-code-threshold",
-        default=_DEFAULT_DEAD_CODE,
+        default=DEFAULT_DEAD_CODE_CONFIDENCE_THRESHOLD,
         analysis_flag="-D",
         analysis_name="Dead Code",
         short_help="(-D) Dead code confidence threshold (0.0-1.0)",
@@ -79,7 +75,7 @@ THRESHOLD_CONFIGS: dict[str, ThresholdConfig] = {
     ),
     "sensitive_value": ThresholdConfig(
         name="sensitive-threshold",
-        default=_DEFAULT_SENSITIVE,
+        default=SENSITIVE_VALUE_DEFAULT_THRESHOLD,
         analysis_flag="-S",
         analysis_name="Sensitive Values",
         short_help="(-S) Sensitive value confidence threshold (0.0-1.0)",

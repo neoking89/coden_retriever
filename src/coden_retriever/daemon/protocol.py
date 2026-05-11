@@ -8,10 +8,30 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Literal
 
 from ..constants import (
+    DEFAULT_CLONE_RESULT_LIMIT,
+    DEFAULT_CLONE_SEMANTIC_THRESHOLD,
+    DEFAULT_CLONE_SEMANTIC_WEIGHT,
+    DEFAULT_CLONE_SYNTACTIC_WEIGHT,
     DEFAULT_DAEMON_HOST,
     DEFAULT_DAEMON_PORT,
-    DEFAULT_MAX_PROJECTS,
     DEFAULT_DAEMON_TIMEOUT,
+    DEFAULT_DEAD_CODE_CONFIDENCE_THRESHOLD,
+    DEFAULT_DEAD_CODE_RESULT_LIMIT,
+    DEFAULT_ECHO_COMMENT_THRESHOLD,
+    DEFAULT_HOTSPOT_RISK_THRESHOLD,
+    DEFAULT_MAX_PROJECTS,
+    DEFAULT_PROPAGATION_COST_THRESHOLD,
+    DEFAULT_SYNTACTIC_FUNC_THRESHOLD,
+    DEFAULT_SYNTACTIC_LINE_THRESHOLD,
+    SENSITIVE_VALUE_DEFAULT_LIMIT,
+    SENSITIVE_VALUE_DEFAULT_THRESHOLD,
+    MAGIC_CONSTANT_DEFAULT_MIN_FILES,
+    MAGIC_CONSTANT_DEFAULT_MIN_OCCURRENCES,
+    MAGIC_CONSTANT_DEFAULT_RESULT_LIMIT,
+    TRAMP_DATA_DEFAULT_MIN_OCCURRENCES,
+    TRAMP_DATA_DEFAULT_RESULT_LIMIT,
+    TRAMP_DATA_MIN_GROUP_SIZE,
+    DEFAULT_TOKEN_BUDGET,
 )
 
 PROTOCOL_VERSION = "1.0"
@@ -61,10 +81,14 @@ class SearchParams:
     show_deps: bool = False
     output_format: str = "tree"
     find_identifier: str | None = None
-    map_mode: bool = False
+    show_map: bool = False
     dir_tree: bool = True
     stats: bool = False
     reverse: bool = False
+    # JSON-serialisable string ("static" | "simple"). Parsed to MapMode at the
+    # consumer (handlers / SearchEngine.search) — the wire stays plain strings
+    # to keep the protocol dict-friendly.
+    map_mode: str = "static"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -81,7 +105,7 @@ class GraphAnalysisParams:
     source_dir: str
     limit: int = 20
     exclude_tests: bool = True
-    token_limit: int = 4000
+    token_limit: int = DEFAULT_TOKEN_BUDGET
 
     # For architectural_bottlenecks
     min_betweenness: float = 0.001
@@ -155,22 +179,22 @@ class CloneDetectionParams:
     mode: Literal["combined", "semantic", "syntactic"] = "combined"
 
     # Semantic parameters
-    similarity_threshold: float = 0.95
+    similarity_threshold: float = DEFAULT_CLONE_SEMANTIC_THRESHOLD
 
     # Syntactic parameters
-    line_threshold: float = 0.70  # Jaccard threshold for line match
-    func_threshold: float = 0.50  # Percentage of lines that must match
-    min_shared_lines: int = 2  # Minimum shared unique lines for candidates
+    line_threshold: float = DEFAULT_SYNTACTIC_LINE_THRESHOLD
+    func_threshold: float = DEFAULT_SYNTACTIC_FUNC_THRESHOLD
+    min_shared_lines: int = 2
 
     # Shared parameters
-    limit: int = 50
+    limit: int = DEFAULT_CLONE_RESULT_LIMIT
     exclude_tests: bool = True
     min_lines: int = 3
-    token_limit: int | None = None  # None = no limit (CLI), int = limit (MCP)
+    token_limit: int | None = None
 
     # Score fusion weights (for combined mode harmonic mean)
-    semantic_weight: float = 0.6
-    syntactic_weight: float = 0.4
+    semantic_weight: float = DEFAULT_CLONE_SEMANTIC_WEIGHT
+    syntactic_weight: float = DEFAULT_CLONE_SYNTACTIC_WEIGHT
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -196,6 +220,7 @@ class PropagationCostParams:
     show_critical_paths: bool = True
     exclude_tests: bool = True
     token_limit: int | None = None
+    approximate: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -220,11 +245,11 @@ class FlagParams:
     echo_comments: bool = False
     dead_code: bool = False
     tramp_data: bool = False
-    risk_threshold: float = 0.5
-    propagation_threshold: float = 0.25
-    clone_threshold: float = 0.95
-    echo_threshold: float = 0.85
-    dead_code_threshold: float = 0.5
+    risk_threshold: float = DEFAULT_HOTSPOT_RISK_THRESHOLD
+    propagation_threshold: float = DEFAULT_PROPAGATION_COST_THRESHOLD
+    clone_threshold: float = DEFAULT_CLONE_SEMANTIC_THRESHOLD
+    echo_threshold: float = DEFAULT_ECHO_COMMENT_THRESHOLD
+    dead_code_threshold: float = DEFAULT_DEAD_CODE_CONFIDENCE_THRESHOLD
     dry_run: bool = False
     limit: int | None = None
     backup: bool = False
@@ -236,18 +261,23 @@ class FlagParams:
 
     clone_mode: Literal["combined", "semantic", "syntactic"] = "combined"
     # Syntactic clone parameters
-    line_threshold: float = 0.70
-    func_threshold: float = 0.50
+    line_threshold: float = DEFAULT_SYNTACTIC_LINE_THRESHOLD
+    func_threshold: float = DEFAULT_SYNTACTIC_FUNC_THRESHOLD
 
     # Tramp data parameters
-    min_occurrences: int = 3
-    min_group_size: int = 2
+    min_occurrences: int = TRAMP_DATA_DEFAULT_MIN_OCCURRENCES
+    min_group_size: int = TRAMP_DATA_MIN_GROUP_SIZE
 
     # Sensitive value parameters
     sensitive_values: bool = False
-    sensitive_threshold: float = 0.35
+    sensitive_threshold: float = SENSITIVE_VALUE_DEFAULT_THRESHOLD
     replace_value: str | None = None
     sensitive_whitelist: list[str] | None = None
+
+    # Magic constant parameters
+    magic_constants: bool = False
+    magic_constant_min_occurrences: int = MAGIC_CONSTANT_DEFAULT_MIN_OCCURRENCES
+    magic_constant_min_files: int = MAGIC_CONSTANT_DEFAULT_MIN_FILES
 
     def has_any_flag_enabled(self) -> bool:
         """Check if at least one analysis flag is enabled.
@@ -257,7 +287,7 @@ class FlagParams:
         return (
             self.hotspots or self.propagation or self.clones
             or self.echo_comments or self.dead_code or self.tramp_data
-            or self.sensitive_values
+            or self.sensitive_values or self.magic_constants
         )
 
     def validate(self) -> str | None:
@@ -267,7 +297,7 @@ class FlagParams:
             Error message if validation fails, None if valid.
         """
         if not self.has_any_flag_enabled():
-            return "At least one analysis flag (-H, -P, -C, -E, -D, -T, or -S) is required"
+            return "At least one analysis flag (-H, -P, -C, -E, -D, -T, -S, or -K) is required"
         return None
 
     def to_dict(self) -> dict:
@@ -306,12 +336,12 @@ class DeadCodeParams:
     """
 
     source_dir: str
-    confidence_threshold: float = 0.5
-    limit: int | None = 50
+    confidence_threshold: float = DEFAULT_DEAD_CODE_CONFIDENCE_THRESHOLD
+    limit: int | None = DEFAULT_DEAD_CODE_RESULT_LIMIT
     exclude_tests: bool = True
     include_private: bool = False
     min_lines: int = 3
-    token_limit: int | None = None  # None = no limit (CLI), int = limit (MCP)
+    token_limit: int | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -329,11 +359,11 @@ class TrampDataParams:
     """
 
     source_dir: str
-    min_occurrences: int = 3  # Import from constants avoided to prevent circular dependency
-    limit: int | None = 50  # Matches TRAMP_DATA_DEFAULT_RESULT_LIMIT
+    min_occurrences: int = TRAMP_DATA_DEFAULT_MIN_OCCURRENCES
+    limit: int | None = TRAMP_DATA_DEFAULT_RESULT_LIMIT
     exclude_tests: bool = True
     token_limit: int | None = None
-    min_group_size: int = 2  # Matches TRAMP_DATA_MIN_GROUP_SIZE
+    min_group_size: int = TRAMP_DATA_MIN_GROUP_SIZE
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -351,8 +381,8 @@ class SensitiveValueParams:
     """
 
     source_dir: str
-    confidence_threshold: float = 0.35  # Matches SENSITIVE_VALUE_DEFAULT_THRESHOLD
-    limit: int | None = 50  # Matches SENSITIVE_VALUE_DEFAULT_LIMIT
+    confidence_threshold: float = SENSITIVE_VALUE_DEFAULT_THRESHOLD
+    limit: int | None = SENSITIVE_VALUE_DEFAULT_LIMIT
     exclude_tests: bool = True
     token_limit: int | None = None
     replace_value: str | None = None
@@ -363,6 +393,27 @@ class SensitiveValueParams:
 
     @classmethod
     def from_dict(cls, data: dict) -> "SensitiveValueParams":
+        return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class MagicConstantParams:
+    """Parameters for magic constant detection requests.
+
+    Used to find repeated literal values (magic numbers/strings) across files.
+    """
+
+    source_dir: str
+    min_occurrences: int = MAGIC_CONSTANT_DEFAULT_MIN_OCCURRENCES
+    min_files: int = MAGIC_CONSTANT_DEFAULT_MIN_FILES
+    limit: int | None = MAGIC_CONSTANT_DEFAULT_RESULT_LIMIT
+    exclude_tests: bool = True
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "MagicConstantParams":
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
 

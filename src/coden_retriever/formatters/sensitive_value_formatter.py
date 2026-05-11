@@ -8,29 +8,22 @@ Provides consistent formatting for sensitive value detection results with:
 - Summary statistics
 """
 
-import json
 from typing import Any
 
 from ..constants import (
+    FORMATTER_WIDTH,
     SENSITIVE_VALUE_TABLE_DISPLAY_LENGTH,
     SENSITIVE_VALUE_TABLE_WIDTH,
     SENSITIVE_VALUE_TIER_HIGH,
     SENSITIVE_VALUE_TIER_MODERATE,
     SENSITIVE_VALUE_VALUE_COLUMN_WIDTH,
 )
-from .cli_metrics import BaseCLIMetricFormatter, FALSE_POSITIVE_WARNING, SeverityTier
-
-
-def _extract_filename(file_path: str) -> str:
-    """Extract filename from a path, handling both Unix and Windows separators."""
-    return file_path.split("/")[-1].split("\\")[-1]
-
-
-def _truncate_value(value: str, max_len: int = SENSITIVE_VALUE_TABLE_DISPLAY_LENGTH) -> str:
-    """Truncate a value for preview, masking the middle portion."""
-    if len(value) <= max_len:
-        return value
-    return value[:max_len - 3] + "..."
+from .cli_metrics import (
+    BaseCLIMetricFormatter,
+    SeverityTier,
+    extract_filename,
+    format_parameter_header,
+)
 
 
 def format_sensitive_value_parameters_header(
@@ -41,29 +34,19 @@ def format_sensitive_value_parameters_header(
     whitelist: list[str] | None = None,
 ) -> str:
     """Format parameter summary header for sensitive value detection."""
-    lines = []
-    lines.append("=" * 80)
-    lines.append("SENSITIVE VALUE DETECTION PARAMETERS")
-    lines.append("=" * 80)
-    lines.append(f"Confidence Threshold: >= {confidence_threshold * 100:.0f}%")
-    lines.append(f"Exclude Tests: {exclude_tests}")
-
+    param_lines = [
+        f"Confidence Threshold: >= {confidence_threshold * 100:.0f}%",
+        f"Exclude Tests: {exclude_tests}",
+    ]
     if replace_value is not None:
-        lines.append(f"Replace Mode: ON (replacement: \"{replace_value}\")")
+        param_lines.append(f'Replace Mode: ON (replacement: "{replace_value}")')
     else:
-        lines.append("Replace Mode: OFF (detection only)")
-
+        param_lines.append("Replace Mode: OFF (detection only)")
     if whitelist:
-        lines.append(f"Whitelist Patterns: {', '.join(whitelist)}")
-
-    if limit is None:
-        lines.append("[!] Result Limit: ALL (may be slow for large repos)")
-    else:
-        lines.append(f"[!] Result Limit: TOP {limit} -- more results may exist (use -n -1 for all)")
-
-    lines.append(FALSE_POSITIVE_WARNING)
-    lines.append("=" * 80)
-    return "\n".join(lines)
+        param_lines.append(f"Whitelist Patterns: {', '.join(whitelist)}")
+    return format_parameter_header(
+        "SENSITIVE VALUE DETECTION PARAMETERS", param_lines, limit
+    )
 
 
 class SensitiveValueFormatter(BaseCLIMetricFormatter):
@@ -85,31 +68,14 @@ class SensitiveValueFormatter(BaseCLIMetricFormatter):
             return SeverityTier.MODERATE
         return SeverityTier.LOW
 
-    def format_items(
-        self,
-        items: list[dict[str, Any]],
-        output_format: str,
-        reverse: bool,
-    ) -> str:
-        """Format sensitive value results as pipe-separated table."""
-        if output_format == "json":
-            return json.dumps(items, indent=2)
+    def _empty_message(self) -> str:
+        return "No sensitive values detected at the specified threshold."
 
-        if not items:
-            return "No sensitive values detected at the specified threshold."
+    def _table_width(self) -> int:
+        return SENSITIVE_VALUE_TABLE_WIDTH
 
-        display_items = items if reverse else list(reversed(items))
-
-        lines = [self._build_header(), "-" * SENSITIVE_VALUE_TABLE_WIDTH]
-
-        for i, item in enumerate(display_items, 1):
-            rank = i if reverse else len(display_items) - i + 1
-            lines.append(self._format_row(item, rank))
-
-        lines.append("-" * SENSITIVE_VALUE_TABLE_WIDTH)
-        lines.append(f"Total: {len(items)} sensitive values detected")
-
-        return "\n".join(lines)
+    def _total_label(self, count: int) -> str:
+        return f"Total: {count} sensitive values detected"
 
     def _build_header(self) -> str:
         """Build table header row."""
@@ -130,9 +96,9 @@ class SensitiveValueFormatter(BaseCLIMetricFormatter):
         tier = self.get_tier(item)
 
         colored_conf = self.colorize(f"{confidence * 100:.0f}%  ", tier)
-        truncated_value = _truncate_value(value_preview, SENSITIVE_VALUE_TABLE_DISPLAY_LENGTH)
+        truncated_value = self.truncate_value(value_preview, SENSITIVE_VALUE_TABLE_DISPLAY_LENGTH)
 
-        file_short = _extract_filename(file_path)
+        file_short = extract_filename(file_path)
         name_link = self.make_hyperlink(name, file_path, line, tier)
         location = f"{name_link} ({file_short}:{line})"
 
@@ -154,18 +120,18 @@ class SensitiveValueFormatter(BaseCLIMetricFormatter):
 
         lines = [
             "",
-            "=" * 80,
+            "=" * FORMATTER_WIDTH,
             f"Sensitive Value Analysis | {total_entities:,} entities"
             f" | {total_strings:,} strings scanned"
             f" | {values_found:,} sensitive values",
-            "-" * 80,
+            "-" * FORMATTER_WIDTH,
             "Confidence Distribution:",
             f"  HIGH (80%+):     {high_count:>4}  (very likely a real secret)",
             f"  MODERATE (50%+): {moderate_count:>4}  (worth investigating)",
             f"  LOW (<50%):      {low_count:>4}  (possible false positive)",
-            "-" * 80,
+            "-" * FORMATTER_WIDTH,
             "Tip: Move secrets to environment variables or a secrets manager.",
-            "=" * 80,
+            "=" * FORMATTER_WIDTH,
         ]
 
         return "\n".join(lines)

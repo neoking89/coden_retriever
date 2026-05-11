@@ -4,7 +4,6 @@ Configuration module for coden-retriever.
 Contains enums, tuning parameters, and configuration settings.
 """
 import hashlib
-import os
 from enum import Enum
 from pathlib import Path
 
@@ -77,6 +76,16 @@ class OutputFormat(Enum):
     JSON = "json"
 
 
+class MapMode(str, Enum):
+    """Ranking strategy for code-map output.
+
+    `str` mixin makes values JSON-serialisable for the daemon protocol and
+    interchangeable with bare strings (`mode == "simple"` works).
+    """
+    STATIC = "static"   # Combined-signal score (PageRank + Betweenness + BM25 + ...)
+    SIMPLE = "simple"   # Per-file git change_count + per-object blame
+
+
 class Config:
     """Centralized configuration for the search engine."""
 
@@ -86,6 +95,7 @@ class Config:
         "call": 1.5,      # Function/method calls
         "import": 0.5,    # Module imports (loose coupling)
         "usage": 1.0,     # Variable/type usage
+        "type": 1.0,      # Type annotations — between import (0.5) and call (1.5); "X parameterizes Y" is structural but weaker than "X calls Y"
     }
 
     # Functions that are utility sinks (high in-degree, low informational value)
@@ -132,15 +142,21 @@ class Config:
     WEIGHT_BM25: float = 4.0              # Lexical match priority (leading signal in query mode)
     WEIGHT_PAGERANK_BM25: float = 0.5     # Structural importance (BM25 mode)
     WEIGHT_BETWEENNESS_BM25: float = 0.5  # Architectural bridges
+    WEIGHT_TYPE_REF_BM25: float = 0.3     # Type-annotation centrality (lower in query mode — query already constrains)
 
     # Ranking weights for semantic search mode (separate to allow semantic to dominate)
     WEIGHT_SEMANTIC: float = 6.0      # Semantic similarity
     WEIGHT_PAGERANK_SEMANTIC: float = 0.3   # Lower PR weight when semantic active
     WEIGHT_BETWEENNESS_SEMANTIC: float = 0.5  # Lower betweenness when semantic active
+    WEIGHT_TYPE_REF_SEMANTIC: float = 0.3
 
     # Ranking weights for map mode (no query)
     MAP_WEIGHT_PAGERANK: float = 0.5
     MAP_WEIGHT_BETWEENNESS: float = 0.5
+    MAP_WEIGHT_DISPATCHER: float = 0.5      # Hotspots-style risk score; surfaces high-CC, high-fan_out dispatchers
+    MAP_WEIGHT_ENTRY: float = 1.5           # Reverse-PageRank; surfaces entry-point roots (e.g. main, serverCron) that PR/BT/Disp systematically bury — needs more weight than Disp on class-heavy codebases (Python) where class aggregation otherwise dominates BT/PR-light functions
+    MAP_WEIGHT_BM25: float = 0.3            # Static IDF distinctiveness in map mode; lower than structural signals because lexical alone over-rewards verbose docstrings
+    MAP_WEIGHT_TYPE_REF: float = 1.0        # Type-annotation centrality; surfaces dataclasses/configs/DTOs. Stronger than baseline structural signals because passive data classes get ~0 contribution from method aggregation
     MAP_AGGREGATION_DAMPENING: float = 0.3  # How much method scores boost parent classes (0=none, 1=full)
     MAP_PENALTY_METHOD: int = 5             # Mild penalty for methods/functions in map mode (lower = more balanced)
 
@@ -187,33 +203,3 @@ class Config:
     # Semantic search settings
     SEMANTIC_SCORE_THRESHOLD: float = 0.1  # Minimum similarity score to include
     SEMANTIC_IRRELEVANT_PENALTY: float = 0.4  # Score multiplier for entities with no semantic match
-
-    @staticmethod
-    def get_semantic_model_path(custom_path: str | None = None) -> str | None:
-        """
-        Get the semantic model path with the following priority:
-        1. custom_path parameter (from CLI flag)
-        2. CODEN_RETRIEVER_MODEL_PATH environment variable
-        3. Installed package model (bundled with coden-retriever)
-
-        Args:
-            custom_path: Optional custom path from CLI flag
-
-        Returns:
-            Path to the semantic model directory, or None if not found
-        """
-        if custom_path:
-            return custom_path
-
-        env_path = os.environ.get("CODEN_RETRIEVER_MODEL_PATH")
-        if env_path:
-            return env_path
-
-        # Check for installed package model
-        import coden_retriever
-        package_dir = Path(coden_retriever.__file__).parent
-        package_model_path = package_dir / "models" / "embeddings" / "model2vec_embed_distill"
-        if package_model_path.exists():
-            return str(package_model_path)
-
-        return None
