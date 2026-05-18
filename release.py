@@ -1,56 +1,94 @@
 #!/usr/bin/env python3
-"""
-Automated release script for coden-retriever.
+"""End-to-end automated release script for coden-retriever.
 
-This script automates the process of releasing a new version to PyPI.
-It reads configuration from .env file and executes each step with user confirmation.
+Drives the full release from local source to live PyPI + GitHub release:
+
+  0.  pre_release_sync.py        copy private repo changes into public
+  1.  create release branch      release/vX.Y.Z
+  2.  pytest                     full test suite on the synced source
+  3.  bump pyproject.toml        version line in [project]
+  4.  commit                     "Update version to X.Y.Z"
+  5.  tag                        vX.Y.Z annotated
+  6.  push                       branch + tags
+  7.  build                      wheel + sdist via `python -m build`
+  8.  twine check + upload       PyPI (point of no return)
+  9.  poll PyPI                  wait until the index has the new version
+ 10.  fresh-venv smoke           install + version + import + CLI in a temp venv
+ 11.  merge → main + delete      fast-forward, push, drop the release branch
+ 12.  GitHub release             gh release create with wheel + sdist + notes
+ 13.  final verification         re-check PyPI JSON API
 
 Usage:
-    python release.py [--skip-tests] [--skip-docker] [--dry-run]
+    python release.py [--yes] [--dry-run]
+                      [--skip-sync] [--skip-tests] [--skip-docker]
+                      [--skip-smoke] [--skip-merge] [--skip-gh-release]
+                      [--notes-file PATH] [--force]
 
-Options:
-    --skip-tests    Skip running pytest
-    --skip-docker   Skip running Docker tests
-    --dry-run       Run without making actual changes (for testing the script)
+Flags:
+    --yes              Auto-confirm every prompt with its default (default = Y).
+                       Removes the stdin-pipe foot-gun that broke 2.1.0.
+    --dry-run          Skip all side-effecting commands.
+    --skip-sync        Don't run pre_release_sync.py at the start.
+    --skip-tests       Don't run pytest.
+    --skip-docker      Don't run Docker tests.
+    --skip-smoke       Don't run the post-upload fresh-venv smoke test.
+    --skip-merge       Leave release branch in place; don't merge to main.
+    --skip-gh-release  Don't create the GitHub release.
+    --notes-file PATH  Use these release notes instead of auto-generating from git log.
+    --force            Skip the preflight check that PyPI doesn't already have this
+                       version. Use only when retrying after a partial failure.
 """
 
+import argparse
+import json
 import os
 import re
-import sys
 import subprocess
-import argparse
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import venv as venv_module
 from pathlib import Path
+
+
+PACKAGE = "coden-retriever"
+REPO_SLUG = "neoking89/coden_retriever"
+
+AUTO_YES = False
+DRY_RUN = False
 
 
 def load_env(env_path: Path) -> dict[str, str]:
     """Load environment variables from .env file."""
-    env_vars = {}
     if not env_path.exists():
         print(f"Error: .env file not found at {env_path}")
-        print("Please create a .env file with CODEN_RETRIEVER_VERSION and PYPI_API_TOKEN")
+        print("Create one with CODEN_RETRIEVER_VERSION and PYPI_API_TOKEN")
         sys.exit(1)
 
-    with open(env_path, "r") as f:
+    env_vars: dict[str, str] = {}
+    with env_path.open() as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, value = line.split("=", 1)
                 env_vars[key.strip()] = value.strip()
-
     return env_vars
 
 
-def run_command(cmd: str | list[str], dry_run: bool = False, check: bool = True,
-                capture_output: bool = False, env: dict | None = None) -> subprocess.CompletedProcess | None:
-    """Run a shell command with optional dry-run mode."""
-    if isinstance(cmd, str):
-        cmd_str = cmd
-    else:
-        cmd_str = " ".join(cmd)
-
+def run_command(
+    cmd: str | list[str],
+    check: bool = True,
+    capture_output: bool = False,
+    env: dict | None = None,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess | None:
+    """Run a shell command. Honors module-level DRY_RUN."""
+    cmd_str = cmd if isinstance(cmd, str) else " ".join(cmd)
     print(f"\n>>> Running: {cmd_str}")
 
-    if dry_run:
+    if DRY_RUN:
         print("    [DRY-RUN] Skipping actual execution")
         return None
 
@@ -58,19 +96,29 @@ def run_command(cmd: str | list[str], dry_run: bool = False, check: bool = True,
     if env:
         merged_env.update(env)
 
-    result = subprocess.run(
+    return subprocess.run(
         cmd,
         shell=isinstance(cmd, str),
         check=check,
         capture_output=capture_output,
         text=True,
-        env=merged_env
+        env=merged_env,
+        input=input_text,
     )
-    return result
 
 
 def confirm(message: str, default: bool = True) -> bool:
-    """Ask user for confirmation."""
+    """Ask user for confirmation. In AUTO_YES mode, returns default without reading stdin.
+
+    This is the single source of truth for prompts. The 2.1.0 release broke when a
+    piped stdin was consumed by a child subprocess (pytest -vvv) and the next
+    input() call hit EOFError. AUTO_YES sidesteps that entirely.
+    """
+    if AUTO_YES:
+        ans = "Y" if default else "N"
+        print(f"\n{message} [{'Y/n' if default else 'y/N'}]: {ans} (auto)")
+        return default
+
     suffix = " [Y/n]: " if default else " [y/N]: "
     response = input(f"\n{message}{suffix}").strip().lower()
     if not response:
@@ -78,33 +126,29 @@ def confirm(message: str, default: bool = True) -> bool:
     return response in ("y", "yes")
 
 
-def update_pyproject_version(pyproject_path: Path, new_version: str, dry_run: bool = False) -> None:
-    """Update the version in pyproject.toml."""
+def update_pyproject_version(pyproject_path: Path, new_version: str) -> None:
+    """Rewrite the [project] version line in pyproject.toml."""
     print(f"\n>>> Updating version in pyproject.toml to {new_version}")
-
-    if dry_run:
+    if DRY_RUN:
         print("    [DRY-RUN] Skipping actual update")
         return
 
     content = pyproject_path.read_text()
-    updated_content = re.sub(
+    updated = re.sub(
         r'^version\s*=\s*"[^"]*"',
         f'version = "{new_version}"',
         content,
-        flags=re.MULTILINE
+        flags=re.MULTILINE,
     )
-    pyproject_path.write_text(updated_content)
+    pyproject_path.write_text(updated)
     print(f"    Updated version to {new_version}")
 
 
-def clean_dist(dist_path: Path, dry_run: bool = False) -> None:
-    """Clean the dist directory before building."""
-    print(f"\n>>> Cleaning dist directory")
-
-    if dry_run:
+def clean_dist(dist_path: Path) -> None:
+    print("\n>>> Cleaning dist directory")
+    if DRY_RUN:
         print("    [DRY-RUN] Skipping cleanup")
         return
-
     if dist_path.exists():
         import shutil
         shutil.rmtree(dist_path)
@@ -113,14 +157,244 @@ def clean_dist(dist_path: Path, dry_run: bool = False) -> None:
         print(f"    {dist_path} does not exist, nothing to clean")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Automated release script for coden-retriever")
-    parser.add_argument("--skip-tests", action="store_true", help="Skip running pytest")
-    parser.add_argument("--skip-docker", action="store_true", help="Skip running Docker tests")
-    parser.add_argument("--dry-run", action="store_true", help="Run without making actual changes")
+def check_pypi_version_exists(version: str) -> bool:
+    """Return True if PACKAGE==version is already on PyPI."""
+    url = f"https://pypi.org/pypi/{PACKAGE}/{version}/json"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            return r.status == 200
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+        raise
+
+
+def poll_pypi_propagation(version: str, max_wait: int = 180) -> dict:
+    """Block until PyPI index has the new version. Returns the JSON metadata."""
+    url = f"https://pypi.org/pypi/{PACKAGE}/{version}/json"
+    print(f"\n>>> Polling {url} (max {max_wait}s)")
+    start = time.time()
+    while time.time() - start < max_wait:
+        try:
+            with urllib.request.urlopen(url, timeout=10) as r:
+                if r.status == 200:
+                    elapsed = int(time.time() - start)
+                    print(f"    Indexed after {elapsed}s")
+                    return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+        time.sleep(5)
+    raise TimeoutError(f"PyPI did not index {PACKAGE}=={version} within {max_wait}s")
+
+
+def fresh_venv_smoke(version: str) -> None:
+    """Install PACKAGE in a fresh temp venv and run a minimal smoke test.
+
+    Verifies the published wheel resolves, declares the right version, imports
+    the new architecture surface, and the `coden` CLI launches.
+    """
+    with tempfile.TemporaryDirectory(prefix=f"{PACKAGE}_smoke_") as tmp:
+        venv_dir = Path(tmp) / "venv"
+        print(f"\n>>> Creating fresh venv at {venv_dir}")
+        venv_module.create(venv_dir, with_pip=True)
+
+        if sys.platform == "win32":
+            py = venv_dir / "Scripts" / "python.exe"
+            cli = venv_dir / "Scripts" / "coden.exe"
+        else:
+            py = venv_dir / "bin" / "python"
+            cli = venv_dir / "bin" / "coden"
+
+        print(f">>> pip install {PACKAGE}=={version}")
+        subprocess.run(
+            [str(py), "-m", "pip", "install", "--quiet", f"{PACKAGE}=={version}"],
+            check=True,
+        )
+
+        check_version = subprocess.run(
+            [str(py), "-c",
+             f"import importlib.metadata as m;"
+             f"v=m.version('{PACKAGE}');"
+             f"assert v=='{version}', f'expected {version}, got {{v}}';"
+             f"print(v)"],
+            check=True, capture_output=True, text=True,
+        )
+        print(f"    version: {check_version.stdout.strip()}")
+
+        subprocess.run(
+            [str(py), "-c",
+             "import coden_retriever.architecture.adapters as a;"
+             "names=sorted(x for x in dir(a) if not x.startswith('_'));"
+             "print('adapters:', names)"],
+            check=True,
+        )
+
+        subprocess.run([str(cli), "--help"], check=True, capture_output=True)
+        print("    CLI: OK")
+
+
+def merge_release_branch_to_main(branch_name: str) -> None:
+    """Fast-forward main to the release branch, push, and delete the branch."""
+    run_command("git checkout main")
+    run_command(f"git merge --ff-only {branch_name}")
+    run_command("git push origin main")
+    run_command(f"git branch -d {branch_name}", check=False)
+    run_command(f"git push origin --delete {branch_name}", check=False)
+
+
+PRIVATE_REPO = Path(r"C:\Users\Vincent\OneDrive\Bureaublad\test_projects\code_retriever")
+
+
+def previous_tag(current_tag: str) -> str | None:
+    """Return the most recently-created v-tag that isn't current_tag."""
+    result = subprocess.run(
+        ["git", "tag", "--sort=-creatordate"],
+        capture_output=True, text=True, check=True,
+    )
+    for line in result.stdout.splitlines():
+        t = line.strip()
+        if t.startswith("v") and t != current_tag:
+            return t
+    return None
+
+
+def _commits_in_public_since(prev_tag: str) -> str:
+    return subprocess.run(
+        ["git", "log", f"{prev_tag}..HEAD", "--pretty=format:- %s", "--no-merges"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def _commits_in_private_since_prev_release(prev_tag: str | None) -> str | None:
+    """Pull private-repo commits landed since the previous public release.
+
+    The public repo only carries bulk-synced commits, so its log is sparse.
+    Private holds the granular `feat(...)` / `fix(...)` history. We anchor by
+    the previous public tag's commit date and grab everything in private since.
+    """
+    if not PRIVATE_REPO.exists() or not prev_tag:
+        return None
+
+    prev_date = subprocess.run(
+        ["git", "log", "-1", "--format=%aI", prev_tag],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    if not prev_date:
+        return None
+
+    result = subprocess.run(
+        ["git", "-C", str(PRIVATE_REPO), "log",
+         f"--since={prev_date}", "--pretty=format:- %s", "--no-merges"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def generate_release_notes(version: str) -> str:
+    """Build release notes from commit log since the previous release.
+
+    Prefers the richer private-repo history (granular feat/fix commits).
+    Falls back to public's log, then to the last 50 commits.
+    """
+    current_tag = f"v{version}"
+    prev = previous_tag(current_tag)
+
+    private_log = _commits_in_private_since_prev_release(prev)
+    if private_log:
+        body = private_log
+        header = f"## Changes since {prev}" if prev else "## Changes"
+        source = "(from private repo log)"
+    elif prev:
+        body = _commits_in_public_since(prev) or "_No commits since previous tag._"
+        header = f"## Changes since {prev}"
+        source = "(from public repo log)"
+    else:
+        body = subprocess.run(
+            ["git", "log", "--pretty=format:- %s", "--no-merges", "-50"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip() or "_No commit log available._"
+        header = "## Changes"
+        source = "(from public repo log, last 50 commits)"
+
+    return (
+        f"{header} {source}\n\n"
+        f"{body}\n\n"
+        f"## Install\n\n"
+        f"```bash\n"
+        f"pip install -U {PACKAGE}\n"
+        f"```\n\n"
+        f"PyPI: https://pypi.org/project/{PACKAGE}/{version}/\n"
+    )
+
+
+def create_github_release(version: str, notes_path: Path, wheel: Path, sdist: Path) -> None:
+    """Invoke `gh release create` with the wheel + sdist + notes file."""
+    cmd = [
+        "gh", "release", "create", f"v{version}",
+        str(wheel), str(sdist),
+        "--title", f"v{version}",
+        "--notes-file", str(notes_path),
+    ]
+    print(f"\n>>> Running: {' '.join(cmd)}")
+    if DRY_RUN:
+        print("    [DRY-RUN] Skipping actual gh call")
+        return
+    subprocess.run(cmd, check=True)
+
+
+def run_pre_release_sync(script_dir: Path) -> None:
+    """Spawn pre_release_sync.py with `y\\n` piped to its confirmation prompt."""
+    sync_script = script_dir / "pre_release_sync.py"
+    if not sync_script.exists():
+        print("    pre_release_sync.py not found in script dir; skipping")
+        return
+    print(f"\n>>> Running {sync_script.name} (auto-confirm)")
+    if DRY_RUN:
+        print("    [DRY-RUN] Skipping actual sync")
+        return
+    subprocess.run(
+        [sys.executable, str(sync_script)],
+        input="y\n",
+        text=True,
+        check=True,
+    )
+
+
+def main() -> None:
+    global AUTO_YES, DRY_RUN
+
+    parser = argparse.ArgumentParser(
+        description="End-to-end release script for coden-retriever",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--yes", action="store_true",
+                        help="Auto-confirm every prompt with its default")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Skip all side-effecting commands")
+    parser.add_argument("--skip-sync", action="store_true",
+                        help="Don't run pre_release_sync.py at the start")
+    parser.add_argument("--skip-tests", action="store_true",
+                        help="Don't run pytest")
+    parser.add_argument("--skip-docker", action="store_true",
+                        help="Don't run Docker tests")
+    parser.add_argument("--skip-smoke", action="store_true",
+                        help="Don't run the post-upload fresh-venv smoke test")
+    parser.add_argument("--skip-merge", action="store_true",
+                        help="Leave the release branch in place")
+    parser.add_argument("--skip-gh-release", action="store_true",
+                        help="Don't create the GitHub release")
+    parser.add_argument("--notes-file", type=Path, default=None,
+                        help="Path to a release-notes file (otherwise auto-generated)")
+    parser.add_argument("--force", action="store_true",
+                        help="Skip the preflight check that PyPI lacks this version")
     args = parser.parse_args()
 
-    # Determine paths
+    AUTO_YES = args.yes
+    DRY_RUN = args.dry_run
+
     script_dir = Path(__file__).parent.resolve()
     env_path = script_dir / ".env"
     pyproject_path = script_dir / "pyproject.toml"
@@ -128,159 +402,260 @@ def main():
     docker_test_script = script_dir / "docker" / "run_tests.ps1"
 
     print("=" * 60)
-    print("  Coden Retriever - Automated Release Script")
+    print("  Coden Retriever - End-to-End Release Script")
     print("=" * 60)
+    if DRY_RUN:
+        print("\n*** DRY-RUN MODE — no side effects ***")
+    if AUTO_YES:
+        print("\n*** AUTO-YES — prompts default-confirm; no stdin reads ***")
 
-    if args.dry_run:
-        print("\n*** DRY-RUN MODE - No actual changes will be made ***")
-
-    # Load environment variables
     env_vars = load_env(env_path)
     version = env_vars.get("CODEN_RETRIEVER_VERSION")
     pypi_token = env_vars.get("PYPI_API_TOKEN")
 
     if not version:
-        print("Error: CODEN_RETRIEVER_VERSION not set in .env file")
+        print("Error: CODEN_RETRIEVER_VERSION not set in .env")
         sys.exit(1)
-
     if not pypi_token or pypi_token == "pypi-YOUR_API_TOKEN_HERE":
-        print("Error: PYPI_API_TOKEN not set or is still placeholder in .env file")
-        print("Please get your API token from https://pypi.org/manage/account/token/")
+        print("Error: PYPI_API_TOKEN not set in .env")
+        print("Get one at https://pypi.org/manage/account/token/")
         sys.exit(1)
 
     print(f"\nRelease Configuration:")
+    print(f"  Package: {PACKAGE}")
     print(f"  Version: {version}")
     print(f"  PyPI Token: {'*' * 10}...{pypi_token[-4:]}")
+
+    # Preflight: ensure PyPI doesn't already have this version (immutable).
+    print("\n" + "=" * 60)
+    print("  Preflight")
+    print("=" * 60)
+    if not args.force:
+        if check_pypi_version_exists(version):
+            print(f"\n  ERROR: {PACKAGE} {version} is already on PyPI.")
+            print("  PyPI versions are immutable. Bump CODEN_RETRIEVER_VERSION in .env")
+            print("  to a fresh version and retry. Use --force only when retrying after")
+            print("  a partial-failure recovery (rarely correct).")
+            sys.exit(1)
+        print(f"    PyPI does not yet have {PACKAGE}=={version} - OK to proceed.")
+    else:
+        print("    Preflight skipped via --force")
 
     if not confirm("Proceed with release?"):
         print("Release cancelled.")
         sys.exit(0)
 
-    # Step 0: Create release branch
-    print("\n" + "=" * 60)
-    print("  Step 0: Create release branch")
-    print("=" * 60)
+    # Step 0: Sync from private repo (NEW: auto by default)
+    if not args.skip_sync:
+        print("\n" + "=" * 60)
+        print("  Step 0: Sync from private repo")
+        print("=" * 60)
+        run_pre_release_sync(script_dir)
+    else:
+        print("\n[Step 0 skipped via --skip-sync]")
 
+    # Step 1: Create release branch
+    print("\n" + "=" * 60)
+    print("  Step 1: Create release branch")
+    print("=" * 60)
     branch_name = f"release/v{version}"
-    run_command(f"git checkout -b {branch_name}", dry_run=args.dry_run, check=False)
+    run_command(f"git checkout -b {branch_name}", check=False)
 
-    # Step 1: Run tests
-    print("\n" + "=" * 60)
-    print("  Step 1: Run tests")
-    print("=" * 60)
-
+    # Step 2: Tests
     if not args.skip_tests:
-        if confirm("Run pytest locally?"):
+        print("\n" + "=" * 60)
+        print("  Step 2: Run pytest")
+        print("=" * 60)
+        try:
+            run_command("pytest -vvv")
+            print("    Tests passed!")
+        except subprocess.CalledProcessError:
+            print("    Tests FAILED!")
+            if not confirm("Tests failed. Continue anyway?", default=False):
+                print("Aborting.")
+                sys.exit(1)
+    else:
+        print("\n[Step 2 skipped via --skip-tests]")
+
+    # Step 2b: Docker tests (kept optional, not auto-confirmed if interactive)
+    if not args.skip_docker and docker_test_script.exists():
+        print("\n" + "=" * 60)
+        print("  Step 2b: Run Docker tests")
+        print("=" * 60)
+        if confirm("Run Docker tests?"):
             try:
-                run_command("pytest -vvv", dry_run=args.dry_run)
-                print("    Tests passed!")
+                run_command(
+                    f'powershell -ExecutionPolicy Bypass -File "{docker_test_script}"'
+                )
+                print("    Docker tests passed!")
             except subprocess.CalledProcessError:
-                print("    Tests FAILED!")
-                if not confirm("Tests failed. Continue anyway?", default=False):
+                print("    Docker tests FAILED!")
+                if not confirm("Docker tests failed. Continue anyway?", default=False):
                     sys.exit(1)
-    else:
-        print("    Skipping pytest (--skip-tests)")
 
-    if not args.skip_docker:
-        if docker_test_script.exists():
-            if confirm("Run Docker tests (docker/run_tests.ps1)?"):
-                try:
-                    run_command(f"powershell -ExecutionPolicy Bypass -File \"{docker_test_script}\"",
-                               dry_run=args.dry_run)
-                    print("    Docker tests passed!")
-                except subprocess.CalledProcessError:
-                    print("    Docker tests FAILED!")
-                    if not confirm("Docker tests failed. Continue anyway?", default=False):
-                        sys.exit(1)
-        else:
-            print(f"    Docker test script not found at {docker_test_script}, skipping")
-    else:
-        print("    Skipping Docker tests (--skip-docker)")
-
-    # Step 2: Update version in pyproject.toml
+    # Step 3: Bump pyproject.toml
     print("\n" + "=" * 60)
-    print("  Step 2: Update version")
+    print("  Step 3: Bump pyproject.toml")
     print("=" * 60)
+    update_pyproject_version(pyproject_path, version)
 
-    update_pyproject_version(pyproject_path, version, dry_run=args.dry_run)
-
-    # Step 3: Commit changes
+    # Step 4: Commit
     print("\n" + "=" * 60)
-    print("  Step 3: Commit changes")
+    print("  Step 4: Commit")
     print("=" * 60)
+    run_command("git add -A")
+    run_command(f'git commit -am "Update version to {version}"', check=False)
 
-    run_command("git add -A", dry_run=args.dry_run)
-    run_command(f'git commit -am "Update version to {version}"', dry_run=args.dry_run, check=False)
-
-    # Step 4: Create git tag
+    # Step 5: Tag
     print("\n" + "=" * 60)
-    print("  Step 4: Create git tag")
+    print("  Step 5: Create git tag")
     print("=" * 60)
-
     tag_name = f"v{version}"
-    # Check if tag already exists
-    tag_check = subprocess.run(f"git tag -l {tag_name}", shell=True, capture_output=True, text=True)
+    tag_check = subprocess.run(
+        f"git tag -l {tag_name}", shell=True, capture_output=True, text=True,
+    )
     if tag_check.stdout.strip() == tag_name:
-        if confirm(f"Tag {tag_name} already exists. Delete and recreate it?", default=False):
-            run_command(f"git tag -d {tag_name}", dry_run=args.dry_run)
-            # Also delete from remote if it exists there
-            run_command(f"git push origin --delete {tag_name}", dry_run=args.dry_run, check=False)
+        if confirm(f"Tag {tag_name} already exists. Delete and recreate?", default=False):
+            run_command(f"git tag -d {tag_name}")
+            run_command(f"git push origin --delete {tag_name}", check=False)
+            run_command(f'git tag -a {tag_name} -m "Release {version}"')
         else:
             print(f"    Keeping existing tag {tag_name}")
-            tag_name = None  # Skip tag creation
+    else:
+        run_command(f'git tag -a {tag_name} -m "Release {version}"')
 
-    if tag_name:
-        run_command(f'git tag -a {tag_name} -m "New release version {version}"', dry_run=args.dry_run)
-
-    # Step 5: Push changes and tags
+    # Step 6: Push branch + tags
     print("\n" + "=" * 60)
-    print("  Step 5: Push to remote")
+    print("  Step 6: Push to remote")
     print("=" * 60)
+    if confirm("Push branch + tags to remote?"):
+        run_command(f"git push -u origin {branch_name}", check=False)
+        run_command("git push --tags")
 
-    if confirm("Push changes and tags to remote?"):
-        run_command("git push", dry_run=args.dry_run, check=False)
-        run_command("git push --tags", dry_run=args.dry_run)
-
-    # Step 6: Build distribution packages
+    # Step 7: Build
     print("\n" + "=" * 60)
-    print("  Step 6: Build distribution packages")
+    print("  Step 7: Build distribution")
     print("=" * 60)
+    clean_dist(dist_path)
+    run_command("python -m build")
 
-    clean_dist(dist_path, dry_run=args.dry_run)
-    run_command("python -m build", dry_run=args.dry_run)
-
-    # Step 7: Upload to PyPI
+    # Step 8: Upload (point of no return)
     print("\n" + "=" * 60)
-    print("  Step 7: Upload to PyPI")
+    print("  Step 8: Upload to PyPI (IRREVERSIBLE)")
     print("=" * 60)
+    run_command("twine check dist/*")
+    if not confirm("Upload to PyPI?"):
+        print("\nSkipped upload. Stopping here. Dist artifacts left in dist/.")
+        sys.exit(0)
+    upload_env = {"TWINE_USERNAME": "__token__", "TWINE_PASSWORD": pypi_token}
+    run_command("twine upload dist/* --verbose", env=upload_env)
+    print("\n    Uploaded to PyPI.")
 
-    # Check distribution files
-    run_command("twine check dist/*", dry_run=args.dry_run)
+    # Step 9: Poll PyPI for index propagation
+    if not DRY_RUN:
+        print("\n" + "=" * 60)
+        print("  Step 9: Poll PyPI for propagation")
+        print("=" * 60)
+        try:
+            poll_pypi_propagation(version)
+        except TimeoutError as e:
+            print(f"    {e}")
+            if not confirm("Continue without confirmed propagation?", default=False):
+                sys.exit(1)
+    else:
+        print("\n[Step 9 skipped in dry-run]")
 
-    if confirm("Upload to PyPI?"):
-        # Pass the token via environment variable for security
-        upload_env = {"TWINE_USERNAME": "__token__", "TWINE_PASSWORD": pypi_token}
-        run_command("twine upload dist/* --verbose", dry_run=args.dry_run, env=upload_env)
-        print("\n    Package uploaded successfully!")
+    # Step 10: Fresh-venv smoke
+    if not args.skip_smoke and not DRY_RUN:
+        print("\n" + "=" * 60)
+        print("  Step 10: Fresh-venv smoke test")
+        print("=" * 60)
+        try:
+            fresh_venv_smoke(version)
+            print("    Smoke test passed.")
+        except (subprocess.CalledProcessError, AssertionError, Exception) as e:
+            print(f"\n    SMOKE TEST FAILED: {type(e).__name__}: {e}")
+            if not confirm("Continue with merge + GitHub release anyway?", default=False):
+                print("Aborting before merge. Release is already on PyPI.")
+                sys.exit(1)
+    else:
+        print("\n[Step 10 skipped]")
 
-    # Step 8: Merge instructions
+    # Step 11: Merge to main + delete release branch
+    if not args.skip_merge:
+        print("\n" + "=" * 60)
+        print("  Step 11: Merge release branch -> main")
+        print("=" * 60)
+        if confirm("Fast-forward main and delete the release branch?"):
+            try:
+                merge_release_branch_to_main(branch_name)
+            except subprocess.CalledProcessError as e:
+                print(f"\n    Merge failed: {e}")
+                if not confirm("Continue?", default=False):
+                    sys.exit(1)
+    else:
+        print("\n[Step 11 skipped via --skip-merge]")
+
+    # Step 12: GitHub release
+    if not args.skip_gh_release:
+        print("\n" + "=" * 60)
+        print("  Step 12: GitHub release")
+        print("=" * 60)
+        if args.notes_file:
+            notes = args.notes_file.read_text(encoding="utf-8")
+            print(f"    Using notes from {args.notes_file}")
+        else:
+            notes = generate_release_notes(version)
+            print("    Generated notes from commit log")
+
+        if confirm("Create GitHub release with wheel + sdist?"):
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".md", delete=False, encoding="utf-8",
+            ) as f:
+                f.write(notes)
+                notes_path = Path(f.name)
+            try:
+                wheel = next(dist_path.glob("*.whl"))
+                sdist = next(dist_path.glob("*.tar.gz"))
+                create_github_release(version, notes_path, wheel, sdist)
+            except StopIteration:
+                print("    ERROR: wheel or sdist not found in dist/")
+            except subprocess.CalledProcessError as e:
+                print(f"    gh release create failed: {e}")
+            finally:
+                notes_path.unlink(missing_ok=True)
+    else:
+        print("\n[Step 12 skipped via --skip-gh-release]")
+
+    # Step 13: Final verification
     print("\n" + "=" * 60)
-    print("  Step 8: Merge release branch")
+    print("  Step 13: Final verification")
     print("=" * 60)
-    print(f"""
-    If everything went well, merge the release branch:
-
-    git checkout main
-    git merge {branch_name}
-    git push
-    git branch -d {branch_name}
-    """)
+    if not DRY_RUN:
+        try:
+            data = poll_pypi_propagation(version, max_wait=30)
+            info = data["info"]
+            urls = data["urls"]
+            print(f"    PyPI version: {info['version']}")
+            for u in urls:
+                print(f"    {u['packagetype']:>12s}: {u['size']:>10d}  {u['filename']}")
+            extras = info.get("provides_extra") or []
+            stale = set(extras) & {"semantic", "mcp", "agent", "all"}
+            if stale:
+                print(f"    WARNING: stale extras present: {sorted(stale)}")
+            else:
+                print(f"    Extras: {extras} (clean)")
+        except Exception as e:
+            print(f"    Verification failed: {e}")
+    else:
+        print("[Step 13 skipped in dry-run]")
 
     print("\n" + "=" * 60)
     print("  Release complete!")
     print("=" * 60)
-    print(f"\n  Package: coden-retriever v{version}")
-    print(f"  PyPI: https://pypi.org/project/coden-retriever/{version}/")
+    print(f"\n  PyPI:    https://pypi.org/project/{PACKAGE}/{version}/")
+    print(f"  GitHub:  https://github.com/{REPO_SLUG}/releases/tag/v{version}")
+    print(f"  Install: pip install -U {PACKAGE}")
 
 
 if __name__ == "__main__":
