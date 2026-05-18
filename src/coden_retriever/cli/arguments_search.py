@@ -45,10 +45,10 @@ _SEARCH_EPILOG = """\
 [bold red]Found issues? Flag them in your source code, or fix them directly:[/] 
 
   coden flag -HPCEDTSK --dry-run         preview all flags before writing
-  coden flag -HPCEDTSK --backup          write \[CODEN] comments (with backup)
+  coden flag -HPCEDTSK --backup          write \\[CODEN] comments (with backup)
   coden flag -E --remove-comments --backup  remove echo comments entirely
   coden flag -S --replace --backup       redact secrets with ***REDACTED***
-  coden flag clear                       clean up all \[CODEN] markers
+  coden flag clear                       clean up all \\[CODEN] markers
 
 [bold magenta]For repeated queries, the daemon keeps indices in memory so you skip startup:[/]
 
@@ -139,9 +139,9 @@ def add_flag_arguments(parser: argparse.ArgumentParser, config: AppConfig) -> No
     parser.add_argument("--backup", action="store_true",
                         help="Create .coden-backup files before modifying")
     parser.add_argument("--remove-comments", action="store_true",
-                        help="Delete detected echo comments entirely instead of flagging with \[CODEN] markers (use with -E)")
+                        help="Delete detected echo comments entirely instead of flagging with \\[CODEN] markers (use with -E)")
     parser.add_argument("--remove-dead-code", action="store_true",
-                        help="Delete dead code functions entirely instead of flagging with \[CODEN] markers (DESTRUCTIVE - use with --backup)")
+                        help="Delete dead code functions entirely instead of flagging with \\[CODEN] markers (DESTRUCTIVE - use with --backup)")
     parser.add_argument("--replace", nargs="?", const="***REDACTED***", default=None,
                         help="Replace detected sensitive values with placeholder (default: ***REDACTED***, or specify custom value)")
     parser.add_argument("--whitelist", nargs="*", default=None, metavar="PATTERN",

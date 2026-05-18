@@ -1,4 +1,4 @@
-"""PHP adapter: tree-sitter only.
+r"""PHP adapter: tree-sitter only.
 
 PHP projects are anchored by `composer.json` rather than the JVM
 `src/main/<lang>/` convention. The effective root is computed by descending
@@ -357,7 +357,7 @@ def _package_name_for_dir(
     entries: list[Path],
     get_parser: Any,
 ) -> str | None:
-    """Pick the dominant namespace across `.php` files in `entries`.
+    r"""Pick the dominant namespace across `.php` files in `entries`.
 
     Returns the dotted package name most frequently declared by files in
     this directory, with alphabetical filename as the tiebreaker. Returns
