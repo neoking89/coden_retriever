@@ -5,14 +5,15 @@ Drives the full release from local source to live PyPI + GitHub release:
 
   0.  pre_release_sync.py        copy private repo changes into public
   1.  create release branch      release/vX.Y.Z
-  2.  pytest                     full test suite on the synced source
+  2.  pytest                     SKIPPED by default (tests live in private repo);
+                                 use --run-tests to opt in (pytest runs in PRIVATE_REPO)
   3.  bump pyproject.toml        version line in [project]
   4.  commit                     "Update version to X.Y.Z"
   5.  tag                        vX.Y.Z annotated
   6.  push                       branch + tags
   7.  build                      wheel + sdist via `python -m build`
   8.  twine check + upload       PyPI (point of no return)
-  9.  poll PyPI                  wait until the index has the new version
+  9.  poll PyPI                  JSON API (fast) + /simple/ index (what pip uses)
  10.  fresh-venv smoke           install + version + import + CLI in a temp venv
  11.  merge → main + delete      fast-forward, push, drop the release branch
  12.  GitHub release             gh release create with wheel + sdist + notes
@@ -20,7 +21,7 @@ Drives the full release from local source to live PyPI + GitHub release:
 
 Usage:
     python release.py [--yes] [--dry-run]
-                      [--skip-sync] [--skip-tests] [--skip-docker]
+                      [--skip-sync] [--run-tests] [--skip-docker]
                       [--skip-smoke] [--skip-merge] [--skip-gh-release]
                       [--notes-file PATH] [--force]
 
@@ -29,7 +30,8 @@ Flags:
                        Removes the stdin-pipe foot-gun that broke 2.1.0.
     --dry-run          Skip all side-effecting commands.
     --skip-sync        Don't run pre_release_sync.py at the start.
-    --skip-tests       Don't run pytest.
+    --skip-tests       Don't run pytest. ON by default — tests are private-repo only.
+    --run-tests        Opt-in: run pytest from PRIVATE_REPO. Overrides --skip-tests.
     --skip-docker      Don't run Docker tests.
     --skip-smoke       Don't run the post-upload fresh-venv smoke test.
     --skip-merge       Leave release branch in place; don't merge to main.
@@ -83,10 +85,12 @@ def run_command(
     capture_output: bool = False,
     env: dict | None = None,
     input_text: str | None = None,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess | None:
     """Run a shell command. Honors module-level DRY_RUN."""
     cmd_str = cmd if isinstance(cmd, str) else " ".join(cmd)
-    print(f"\n>>> Running: {cmd_str}")
+    cwd_note = f"  (cwd={cwd})" if cwd else ""
+    print(f"\n>>> Running: {cmd_str}{cwd_note}")
 
     if DRY_RUN:
         print("    [DRY-RUN] Skipping actual execution")
@@ -104,6 +108,7 @@ def run_command(
         text=True,
         env=merged_env,
         input=input_text,
+        cwd=str(cwd) if cwd else None,
     )
 
 
@@ -169,23 +174,53 @@ def check_pypi_version_exists(version: str) -> bool:
         raise
 
 
-def poll_pypi_propagation(version: str, max_wait: int = 180) -> dict:
-    """Block until PyPI index has the new version. Returns the JSON metadata."""
+def poll_pypi_json(version: str, max_wait: int = 180) -> dict:
+    """Block until PyPI's JSON API has the new version. Returns the metadata."""
     url = f"https://pypi.org/pypi/{PACKAGE}/{version}/json"
-    print(f"\n>>> Polling {url} (max {max_wait}s)")
+    print(f"\n>>> Polling JSON API: {url} (max {max_wait}s)")
     start = time.time()
     while time.time() - start < max_wait:
         try:
             with urllib.request.urlopen(url, timeout=10) as r:
                 if r.status == 200:
                     elapsed = int(time.time() - start)
-                    print(f"    Indexed after {elapsed}s")
+                    print(f"    JSON API indexed after {elapsed}s")
                     return json.loads(r.read())
         except urllib.error.HTTPError as e:
             if e.code != 404:
                 raise
         time.sleep(5)
-    raise TimeoutError(f"PyPI did not index {PACKAGE}=={version} within {max_wait}s")
+    raise TimeoutError(f"PyPI JSON API did not index {PACKAGE}=={version} within {max_wait}s")
+
+
+def poll_pypi_simple_index(version: str, max_wait: int = 240) -> None:
+    """Block until PyPI's /simple/ index lists the new wheel.
+
+    PyPI's JSON API updates within ~30-45 s of upload, but the /simple/ HTML
+    index (which `pip install` resolves against) lags an additional 1-2 minutes
+    on average. Smoke tests using `pip install` need this to be ready, not just
+    the JSON API.
+    """
+    url = f"https://pypi.org/simple/{PACKAGE}/"
+    needle = f"{PACKAGE.replace('-', '_')}-{version}-"
+    print(f">>> Polling simple index: {url} for {needle}* (max {max_wait}s)")
+    start = time.time()
+    while time.time() - start < max_wait:
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "text/html"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                html = r.read().decode("utf-8", errors="ignore")
+                if needle in html:
+                    elapsed = int(time.time() - start)
+                    print(f"    Simple index updated after {elapsed}s")
+                    return
+        except urllib.error.URLError:
+            pass
+        time.sleep(5)
+    raise TimeoutError(
+        f"PyPI simple index did not list {PACKAGE}=={version} within {max_wait}s "
+        f"(JSON was indexed, but pip can't resolve it yet)"
+    )
 
 
 def fresh_venv_smoke(version: str) -> None:
@@ -376,8 +411,11 @@ def main() -> None:
                         help="Skip all side-effecting commands")
     parser.add_argument("--skip-sync", action="store_true",
                         help="Don't run pre_release_sync.py at the start")
-    parser.add_argument("--skip-tests", action="store_true",
-                        help="Don't run pytest")
+    parser.add_argument("--skip-tests", dest="skip_tests", action="store_true",
+                        default=True,
+                        help="Skip pytest (default: on — tests live in private repo only)")
+    parser.add_argument("--run-tests", dest="skip_tests", action="store_false",
+                        help="Run pytest from the private repo (opt-in; overrides default)")
     parser.add_argument("--skip-docker", action="store_true",
                         help="Don't run Docker tests")
     parser.add_argument("--skip-smoke", action="store_true",
@@ -461,21 +499,24 @@ def main() -> None:
     branch_name = f"release/v{version}"
     run_command(f"git checkout -b {branch_name}", check=False)
 
-    # Step 2: Tests
+    # Step 2: Tests (default skipped — tests live in the private repo only)
     if not args.skip_tests:
         print("\n" + "=" * 60)
-        print("  Step 2: Run pytest")
+        print("  Step 2: Run pytest (in private repo)")
         print("=" * 60)
-        try:
-            run_command("pytest -vvv")
-            print("    Tests passed!")
-        except subprocess.CalledProcessError:
-            print("    Tests FAILED!")
-            if not confirm("Tests failed. Continue anyway?", default=False):
-                print("Aborting.")
-                sys.exit(1)
+        if not PRIVATE_REPO.exists() or not (PRIVATE_REPO / "tests").exists():
+            print(f"    No tests/ found at {PRIVATE_REPO}; skipping.")
+        else:
+            try:
+                run_command(["pytest", "-vvv"], cwd=PRIVATE_REPO)
+                print("    Tests passed!")
+            except subprocess.CalledProcessError:
+                print("    Tests FAILED!")
+                if not confirm("Tests failed. Continue anyway?", default=False):
+                    print("Aborting.")
+                    sys.exit(1)
     else:
-        print("\n[Step 2 skipped via --skip-tests]")
+        print("\n[Step 2 skipped — tests are private-repo dev-only; use --run-tests to opt in]")
 
     # Step 2b: Docker tests (kept optional, not auto-confirmed if interactive)
     if not args.skip_docker and docker_test_script.exists():
@@ -551,13 +592,14 @@ def main() -> None:
     run_command("twine upload dist/* --verbose", env=upload_env)
     print("\n    Uploaded to PyPI.")
 
-    # Step 9: Poll PyPI for index propagation
+    # Step 9: Poll PyPI for index propagation (JSON + simple index)
     if not DRY_RUN:
         print("\n" + "=" * 60)
         print("  Step 9: Poll PyPI for propagation")
         print("=" * 60)
         try:
-            poll_pypi_propagation(version)
+            poll_pypi_json(version)
+            poll_pypi_simple_index(version)
         except TimeoutError as e:
             print(f"    {e}")
             if not confirm("Continue without confirmed propagation?", default=False):
@@ -633,7 +675,7 @@ def main() -> None:
     print("=" * 60)
     if not DRY_RUN:
         try:
-            data = poll_pypi_propagation(version, max_wait=30)
+            data = poll_pypi_json(version, max_wait=30)
             info = data["info"]
             urls = data["urls"]
             print(f"    PyPI version: {info['version']}")
