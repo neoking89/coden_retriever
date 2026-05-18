@@ -156,7 +156,14 @@ def _daemon_clear_cache(address: DaemonAddress, clear_path: str | None, clear_al
     client = DaemonClient(address=address, timeout=DAEMON_CACHE_TIMEOUT_SECONDS)
     try:
         result = client.invalidate(source_dir=clear_path, all=clear_all)
-        print(f"Cache cleared: {result.get('invalidated', 'none')}")
+        payload = result or {}
+        invalidated = payload.get("invalidated")
+        if invalidated == "all":
+            print("Cache cleared (all projects)")
+        elif invalidated:
+            print(f"Cache cleared for: {invalidated}")
+        else:
+            print(payload.get("message", "No cache cleared"))
         return 0
     except Exception as e:
         print(f"Failed to clear cache: {e}", file=sys.stderr)

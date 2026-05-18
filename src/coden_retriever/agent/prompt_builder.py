@@ -17,12 +17,12 @@ from ..constants import (
 from ..formatters import generate_shallow_tree
 from .tool_instructions import get_tool_instructions
 
-from .models import AgentMode
+from .coden_models import AgentMode
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from .models import AgentDeps
+    from .coden_models import AgentDeps
 
 
 def _build_coding_prompt(config: AppConfig, abs_root: str, directory_tree: str) -> str:

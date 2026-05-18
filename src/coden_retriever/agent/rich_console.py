@@ -24,7 +24,7 @@ from rich.rule import Rule
 from rich.text import Text
 from rich.theme import Theme
 
-from ..constants import WALL_CLOCK_FORMAT
+from ._constants import WALL_CLOCK_FORMAT
 from .models import ReActStep
 
 if TYPE_CHECKING:
@@ -221,6 +221,9 @@ def print_steps_rich(steps: list[ReActStep]) -> None:
     for step in steps:
         print_step_rich(step)
     console.print()  # Add spacing after steps
+
+
+print_steps = print_steps_rich
 
 
 def print_agent_response(response_text: str) -> None:

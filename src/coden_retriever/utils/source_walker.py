@@ -6,6 +6,10 @@ identical filesystem walks: os.walk from a root, prune SKIP_DIRS + hidden
 and whose size is under the per-file cap. The two callers only differ in
 how they consume the result (CacheManager wants mtime+size dicts;
 SearchEngine wants a Path list), so both go through this single walker.
+
+`path_hits_excludes` is the matching helper for the user-supplied
+`--exclude` set — same semantics in every caller (architecture adapters,
+runner-level layout check).
 """
 from __future__ import annotations
 
@@ -60,3 +64,14 @@ def iter_source_files(root: Path) -> Iterator[tuple[Path, os.stat_result]]:
             if stat.st_size > _MAX_SOURCE_FILE_BYTES:
                 continue
             yield path, stat
+
+
+def path_hits_excludes(path: Path, root: Path, excludes: set[str]) -> bool:
+    """True if any path segment under `root` matches a caller-supplied exclude name."""
+    if not excludes:
+        return False
+    try:
+        rel_parts = path.relative_to(root).parts
+    except ValueError:
+        return False
+    return any(part in excludes for part in rel_parts)

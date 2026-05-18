@@ -32,6 +32,7 @@ def create_mcp_server() -> FastMCP:
     Respects CODEN_RETRIEVER_DISABLED_TOOLS env var to filter out specific tools.
     """
     # Lazy imports to avoid heavy dependencies at module load time
+    from .architecture import register_architecture_tools
     from .clone_detection import register_clone_detection_tools
     from .code_search import register_code_search_tools
     from .dead_code import register_dead_code_tools
@@ -49,6 +50,7 @@ def create_mcp_server() -> FastMCP:
     disabled_tools = get_disabled_tools()
 
     register_functions = [
+        lambda mcp: register_architecture_tools(mcp, disabled_tools),
         lambda mcp: register_clone_detection_tools(mcp, disabled_tools),
         lambda mcp: register_code_search_tools(mcp, disabled_tools),
         lambda mcp: register_dead_code_tools(mcp, disabled_tools),

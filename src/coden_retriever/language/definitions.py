@@ -10,7 +10,7 @@ from typing import Dict
 LANGUAGE_MAP: Dict[str, str] = {
     ".py": "python", ".pyw": "python",
     ".js": "javascript", ".jsx": "javascript", ".mjs": "javascript", ".cjs": "javascript",
-    ".ts": "typescript", ".tsx": "typescript", ".mts": "typescript",
+    ".ts": "typescript", ".tsx": "typescript", ".cts": "typescript", ".mts": "typescript",
     ".go": "go",
     ".rs": "rust",
     ".java": "java",
@@ -141,7 +141,7 @@ LANGUAGE_QUERIES: Dict[str, str] = {
         (function_definition name: (name) @def.function body: (compound_statement) @body.function)
         (method_declaration name: (name) @def.method body: (compound_statement) @body.method)
         (function_call_expression function: (name) @ref.call)
-        (member_call_expression name: (name) @ref.call)
+        (member_call_expression name: (name)) @ref.method_call
         (namespace_use_clause (qualified_name) @ref.import)
     """,
     "c_sharp": """
@@ -151,6 +151,7 @@ LANGUAGE_QUERIES: Dict[str, str] = {
         (method_declaration name: (identifier) @def.method body: (block) @body.method)
         (constructor_declaration name: (identifier) @def.method body: (block) @body.method)
         (invocation_expression function: (identifier) @ref.call)
+        (invocation_expression function: (member_access_expression) @ref.method_call)
         (using_directive (qualified_name) @ref.import)
         (parameter type: (_) @ref.type)
         (method_declaration type: (_) @ref.type)
@@ -162,6 +163,7 @@ LANGUAGE_QUERIES: Dict[str, str] = {
         (object_declaration (type_identifier) @def.class (class_body) @body.class)
         (function_declaration (simple_identifier) @def.function (function_body) @body.function)
         (call_expression (simple_identifier) @ref.call)
+        (call_expression (navigation_expression) @ref.method_call)
         (import_header (identifier) @ref.import)
         (parameter (user_type) @ref.type)
         (function_declaration (user_type) @ref.type)
@@ -175,6 +177,7 @@ LANGUAGE_QUERIES: Dict[str, str] = {
         (function_definition (identifier) @def.function body: (_) @body.function)
         (function_declaration (identifier) @def.function)
         (call_expression function: (identifier) @ref.call)
+        (call_expression function: (field_expression) @ref.method_call)
         (import_declaration (identifier) @ref.import)
         (parameter type: (_) @ref.type)
         (class_parameter type: (_) @ref.type)

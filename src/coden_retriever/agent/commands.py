@@ -16,7 +16,7 @@ from rich.text import Text
 
 from ..cache import CacheManager
 from ..config import get_central_cache_root, get_project_cache_dir
-from ..constants import DEFAULT_MAX_STEPS
+from ._constants import DEFAULT_MAX_STEPS
 from ..config_loader import (
     SETTING_LOCATIONS,
     SETTING_METADATA,
@@ -32,7 +32,7 @@ from ..config_loader import (
     validate_config_value,
 )
 from .debug_logger import create_debug_logger
-from .response_renderer import copy_last_response
+from .response_renderer.clipboard import ClipboardStatus, copy_last_response
 from .rich_console import Panel, console
 
 if TYPE_CHECKING:
@@ -718,16 +718,16 @@ def cmd_undo(args: list[str], context: "CommandContext") -> str:
 )
 def cmd_copy(args: list[str], context: "CommandContext") -> str:
     """Copy the last agent response to the system clipboard."""
-    result = copy_last_response()
+    status = copy_last_response()
     console.print()
-    if result == "copied":
+    if status is ClipboardStatus.COPIED:
         console.print("[green]\U0001f4cb Copied to clipboard[/green]")
-    elif result == "no_response":
+    elif status is ClipboardStatus.NO_RESPONSE:
         console.print("[yellow]No response to copy yet[/yellow]")
     else:
         console.print("[red]Failed to access clipboard[/red]")
     console.print()
-    return result
+    return status.value
 
 
 @registry.register("exit", "Exit the agent", usage="/exit", aliases=["quit", "q"])

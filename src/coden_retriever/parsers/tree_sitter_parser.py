@@ -168,9 +168,11 @@ THIS_REBINDING_NODE_TYPES: dict[str, frozenset[str]] = {
 
 # AST node types that introduce a class scope across the languages we parse.
 CLASS_DEFINITION_NODE_TYPES: frozenset[str] = frozenset({
-    "class_definition",   # Python
+    "class_definition",   # Python, Scala (also covers Scala `case class`)
     "class_declaration",  # JS/TS, Java, C#, Kotlin
     "class_specifier",    # C++
+    "object_definition",  # Scala singleton object
+    "trait_definition",   # Scala trait
 })
 
 
@@ -218,6 +220,149 @@ def _extract_python_method_call(node: Any) -> tuple[str | None, str | None]:
         receiver_text = obj_node.text.decode("utf-8", errors="replace")
         receiver = receiver_text.split('.')[-1] if '.' in receiver_text else receiver_text
 
+    return receiver, method
+
+
+def _kotlin_receiver_text(node: Any) -> str | None:
+    """Return the identifier text most suitable as the *receiver* for a Kotlin
+    navigation-call whose left-hand subtree is `node`.
+
+    Walks the AST shapes tree-sitter-kotlin emits as the LHS of
+    `navigation_expression`: bare identifiers, `this`, chained property
+    accesses, fluent call chains (including trailing-lambda double-nesting),
+    indexing (`arr[i].foo()`), and postfix unary (`x++.foo()`). For nested
+    forms, returns the *immediate* receiver — matching the convention on
+    `_extract_method_call_parts` ("a.b.c() → ('b', 'c')").
+    """
+    if node.type == "simple_identifier" and node.text:
+        return node.text.decode("utf-8", errors="replace")
+    if node.type == "this_expression":
+        # surface the literal token so the self/this/cls post-processing
+        # in _extract_method_call_parts swaps it to enclosing class
+        return "this"
+    if node.type == "navigation_expression":
+        for sub in node.children:
+            if sub.type == "navigation_suffix":
+                for ssub in sub.children:
+                    if ssub.type == "simple_identifier" and ssub.text:
+                        return ssub.text.decode("utf-8", errors="replace")
+                return None
+        return None
+    if node.type in ("call_expression", "indexing_expression", "postfix_expression"):
+        # Recurse on the underlying expression. Trailing-lambda syntax
+        # `f() { … }.g()` double-nests as call_expression(call_expression(...),
+        # call_suffix), so we may peel more than one call_expression layer.
+        if node.children:
+            return _kotlin_receiver_text(node.children[0])
+    return None
+
+
+def _extract_kotlin_method_call(node: Any) -> tuple[str | None, str | None]:
+    """Extract receiver and method from a Kotlin navigation_expression.
+
+    `navigation_expression` always has two children: the LHS expression
+    (any of the shapes handled by `_kotlin_receiver_text`) and a
+    `navigation_suffix` whose inner `simple_identifier` is the method name.
+    tree-sitter-kotlin exposes no field labels on these nodes; positional
+    iteration is the only path.
+    """
+    receiver: str | None = None
+    method: str | None = None
+    for child in node.children:
+        if child.type == "navigation_suffix":
+            for sub in child.children:
+                if sub.type == "simple_identifier" and sub.text:
+                    method = sub.text.decode("utf-8", errors="replace")
+                    break
+        else:
+            receiver = _kotlin_receiver_text(child)
+    return receiver, method
+
+
+@dataclass(frozen=True)
+class _NamedFieldShape:
+    """Shape parameters for receiver/method extraction over a member-access AST
+    node whose grammar exposes named field labels.
+
+    Shared by C# (member_access_expression / invocation_expression), Scala
+    (field_expression / call_expression), and PHP (member_call_expression
+    collapses both wrap and member-access into one node type). Kotlin cannot
+    use this shape: tree-sitter-kotlin exposes no field labels on
+    navigation_expression.
+    """
+    receiver_field: str                       # named-field child holding the receiver expression
+    method_field: str                         # named-field child holding the method name
+    member_access_types: tuple[str, ...]      # types peeled via method_field (PHP needs both call + access)
+    call_type: str | None = None              # type peeled via function-field; None when the call wrapper IS a member-access type (PHP)
+    receiver_strip_prefix: str | None = None  # PHP variable_name "$" stripping; None for C#/Scala
+
+
+_NAMED_FIELD_SHAPES: dict[str, _NamedFieldShape] = {
+    "c_sharp": _NamedFieldShape(
+        receiver_field="expression",
+        method_field="name",
+        member_access_types=("member_access_expression",),
+        call_type="invocation_expression",
+    ),
+    "scala": _NamedFieldShape(
+        receiver_field="value",
+        method_field="field",
+        member_access_types=("field_expression",),
+        call_type="call_expression",
+    ),
+    "php": _NamedFieldShape(
+        receiver_field="object",
+        method_field="name",
+        member_access_types=("member_call_expression", "member_access_expression"),
+        call_type=None,
+        receiver_strip_prefix="$",
+    ),
+}
+
+
+def _extract_named_field_method_call(
+    node: Any, shape: _NamedFieldShape
+) -> tuple[str | None, str | None]:
+    """Extract receiver and method from a member-access node with named fields.
+
+    Three receiver shapes resolve:
+      direct member access (`a.b.c()`)  -> peel inner member-access's method_field
+      direct chained call (`a.b().c()`) -> peel the call's function field, then
+                                           its member-access's method_field
+      bare token (identifier, `this`, `self`, `$this`) -> use receiver text
+                                           verbatim (with optional prefix strip)
+    PHP collapses the call wrapper into the member-access node itself, so
+    `member_access_types` may contain more than one type and `call_type`
+    may be None. `receiver_strip_prefix` strips a leading sigil (PHP `$`)
+    so `$this` enters the dispatcher's self/this/cls swap as `this`.
+    The dispatcher in `_extract_method_call_parts` swaps `this`/`self`/`cls`
+    for the enclosing class name after this helper returns.
+    """
+    expression = node.child_by_field_name(shape.receiver_field)
+    name_node = node.child_by_field_name(shape.method_field)
+    method = (
+        name_node.text.decode("utf-8", errors="replace")
+        if name_node and name_node.text
+        else None
+    )
+    receiver: str | None = None
+    if expression:
+        if expression.type in shape.member_access_types:
+            inner = expression.child_by_field_name(shape.method_field)
+            if inner and inner.text:
+                receiver = inner.text.decode("utf-8", errors="replace")
+        elif shape.call_type is not None and expression.type == shape.call_type:
+            inner_func = expression.child_by_field_name("function")
+            if inner_func and inner_func.type in shape.member_access_types:
+                inner_name = inner_func.child_by_field_name(shape.method_field)
+                if inner_name and inner_name.text:
+                    receiver = inner_name.text.decode("utf-8", errors="replace")
+            elif inner_func and inner_func.text:
+                receiver = inner_func.text.decode("utf-8", errors="replace")
+        elif expression.text:
+            receiver = expression.text.decode("utf-8", errors="replace")
+    if receiver and shape.receiver_strip_prefix:
+        receiver = receiver.removeprefix(shape.receiver_strip_prefix)
     return receiver, method
 
 
@@ -692,6 +837,12 @@ class RepoParser:
         try:
             if lang_name == "python":
                 receiver, method = _extract_python_method_call(node)
+            elif lang_name == "kotlin":
+                receiver, method = _extract_kotlin_method_call(node)
+            elif lang_name in _NAMED_FIELD_SHAPES:
+                receiver, method = _extract_named_field_method_call(
+                    node, _NAMED_FIELD_SHAPES[lang_name]
+                )
             elif lang_name in _MEMBER_CALL_SHAPES:
                 method_type, nested_parent_type = _MEMBER_CALL_SHAPES[lang_name]
                 receiver, method = _extract_member_method_call(

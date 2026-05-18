@@ -13,6 +13,7 @@ from .cli.arguments import (
     create_serve_parser,
 )
 from .cli.arguments_search import add_flag_arguments, create_search_parser
+from .cli.handlers.architecture import handle_architecture_command
 from .cli.handlers.cache import handle_cache_command
 from .cli.handlers.daemon import handle_daemon_command
 from .cli.handlers.debug_availability import handle_debug_availability_command
@@ -24,6 +25,11 @@ from .cli.utils import DefaultValueHelpFormatter
 from .config_loader import get_config, get_config_file, save_config
 
 logger = logging.getLogger(__name__)
+
+KNOWN_SUBCOMMANDS = frozenset({
+    "serve", "agent", "daemon", "flag", "config", "cache",
+    "debug-availability", "reset", "architecture",
+})
 
 
 def main() -> int:
@@ -97,7 +103,27 @@ def main() -> int:
             return handle_debug_availability_command(sys.argv[2:])
 
         if cmd == "reset":
+            reset_parser = argparse.ArgumentParser(
+                prog="coden reset",
+                description="Clear all caches, stop daemon, and reset config to defaults.",
+                formatter_class=DefaultValueHelpFormatter,
+            )
+            reset_parser.parse_args(sys.argv[2:])
             return handle_reset_command()
+
+        if cmd == "architecture":
+            return handle_architecture_command(sys.argv[2:])
+
+        if (
+            cmd not in KNOWN_SUBCOMMANDS
+            and not cmd.startswith("-")
+            and not any(sep in cmd for sep in ("/", "\\", "."))
+            and not Path(cmd).exists()
+        ):
+            print(f"Error: unknown subcommand '{cmd}'", file=sys.stderr)
+            print(f"Available subcommands: {', '.join(sorted(KNOWN_SUBCOMMANDS))}", file=sys.stderr)
+            print("Run 'coden --help' for usage.", file=sys.stderr)
+            return 2
 
     parser = create_search_parser(config)
     args = parser.parse_args()

@@ -17,7 +17,7 @@ from typing import AsyncIterator, Optional
 
 from pydantic_ai.mcp import MCPServerStdio
 
-from ..constants import DEFAULT_MAX_RETRIES
+from ._constants import DEFAULT_MAX_RETRIES
 
 
 def create_mcp_server(

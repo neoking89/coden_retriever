@@ -1,228 +1,145 @@
-"""Permission-gating wrapper for pydantic-ai toolsets.
+"""Permission-gating capability for pydantic-ai toolsets.
 
-Provides a wrapper that asks for user permission before executing tools,
-using an arrow-key based selection UI.
+`PermissionCapability` wraps the agent's toolset with the native
+`ApprovalRequiredToolset` (which raises `ApprovalRequired` when a tool is
+unapproved), and implements `handle_deferred_tool_calls` so the framework
+resumes the run automatically — no manual deferral loop in callers.
 
-This extends pydantic-ai's WrapperToolset to maintain inline approval behavior
-while leveraging the framework's patterns.
+The gate, the picker, and the user notification are all injected via
+callables. Wire whatever picker UI you prefer (stdin prompt, GUI, deny-all,
+auto-approve, ...) by satisfying the `PickerCallback` shape.
 """
 
-import asyncio
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from typing import Any, Callable, Optional
 
 from pydantic_ai import RunContext
-from pydantic_ai.toolsets import WrapperToolset, AbstractToolset
-from pydantic_ai.toolsets.abstract import ToolsetTool
-
-from .tool_permission_picker import (
-    PermissionChoice,
-    ToolPermissionRequest,
-    run_tool_permission_picker,
+from pydantic_ai.capabilities import AbstractCapability
+from pydantic_ai.toolsets import AbstractToolset
+from pydantic_ai.toolsets.approval_required import ApprovalRequiredToolset
+from pydantic_ai.tools import (
+    DeferredToolRequests,
+    DeferredToolResults,
+    ToolApproved,
+    ToolDefinition,
+    ToolDenied,
 )
-from .rich_console import console, get_active_live
 
-# Generic type var for deps - we don't require specific deps type
-DepsT = TypeVar("DepsT")
+from .protocols import PermissionChoice, PickerCallback
 
 
 @dataclass
 class _SessionPermissionState:
     """Mutable container for session-level permission state.
 
-    Survives dataclasses.replace() copies because replace() does a
-    shallow copy — every copy shares the same _SessionPermissionState
-    reference, so setting always_allow on any copy is visible to all.
-
-    This is necessary because pydantic-ai's Agent.run() calls
-    visit_and_replace() on every invocation, which creates new
-    WrapperToolset copies via dataclasses.replace(). A plain bool
-    field would be copied by value and mutations would be lost.
+    Lives on the capability instance and is shared across runs — the agent
+    that owns this capability is long-lived, so the always-allow flag
+    persists across turns naturally.
     """
 
     always_allow: bool = False
 
 
-def _get_ask_permission_setting() -> bool:
-    """Get the current ask_tool_permission setting from config.
+def _deny_picker(_tool_name: str, _tool_args: dict[str, Any]) -> Any:
+    """Safe default picker: deny every call."""
 
-    Uses get_config() which returns the cached config. Changes via
-    /config set command update the cache, so this is always up-to-date
-    without needing to read from disk on every tool call.
-    """
-    from ..config_loader import get_config
-    return get_config().agent.ask_tool_permission
+    async def _coro() -> Optional[PermissionChoice]:
+        return PermissionChoice.DENY
+
+    return _coro()
+
+
+def _always_enabled() -> bool:
+    """Safe default `is_enabled`: permission gate is on."""
+    return True
 
 
 @dataclass
-class PermissionToolsetWrapper(WrapperToolset[DepsT]):
-    """A toolset wrapper that asks for permission before executing tools.
+class PermissionCapability(AbstractCapability[Any]):
+    """Permission-gating capability built on `ApprovalRequiredToolset`.
 
-    This wrapper intercepts call_tool and presents a permission dialog.
-    When permission is denied, it returns an error message to the agent
-    instead of executing the tool.
+    On each tool call, `ApprovalRequiredToolset.approval_required_func` runs.
+    If it returns True, the toolset raises `ApprovalRequired` and the
+    framework defers the call. `handle_deferred_tool_calls` then fires the
+    picker (3-way ALLOW / ALWAYS_ALLOW / DENY) and resolves the deferral —
+    the run continues automatically.
 
-    The permission setting is checked dynamically from config, so changes
-    via /config set take effect immediately without restart.
-
-    Supports a session-based "Always Allow" mode that bypasses permission
-    prompts for the duration of the session.
-
-    Extends pydantic-ai's WrapperToolset for proper framework integration.
+    The `is_enabled()` callable is consulted dynamically so consumers can
+    flip the gate at runtime (e.g. via a config-toggle slash command)
+    without rebuilding the capability or the agent. `on_message`, if set,
+    fires for state-change notifications.
     """
 
-    _permission_state: _SessionPermissionState = field(
-        default_factory=_SessionPermissionState
-    )
+    is_enabled: Callable[[], bool] = field(default=_always_enabled)
+    picker: PickerCallback = field(default=_deny_picker)
+    on_message: Optional[Callable[[str], None]] = field(default=None)
+    _state: _SessionPermissionState = field(default_factory=_SessionPermissionState)
 
     @property
     def session_always_allow(self) -> bool:
         """Whether the user has selected 'Always Allow' for this session."""
-        return self._permission_state.always_allow
+        return self._state.always_allow
 
     @session_always_allow.setter
     def session_always_allow(self, value: bool) -> None:
-        self._permission_state.always_allow = value
+        self._state.always_allow = value
 
-    async def check_permission(self, tool_name: str, args: dict[str, Any]) -> bool:
-        """Check if permission is granted to execute a tool.
+    def _notify(self, message: str) -> None:
+        if self.on_message is not None:
+            self.on_message(message)
 
-        This is the central permission checking method used by both:
-        - call_tool() for normal pydantic-ai tool execution
-        - Fallback tool execution via ask_permission_for_fallback callback
-
-        Permission checking is bypassed if:
-        - ask_tool_permission config setting is False
-        - session_always_allow is True (user selected "Always Allow" for session)
-
-        Args:
-            tool_name: Name of the tool to execute.
-            args: Tool arguments.
-
-        Returns:
-            True if permission granted (including when permission not required).
-            False if permission denied.
-        """
-        if not _get_ask_permission_setting():
-            return True
-
-        if self.session_always_allow:
-            return True
-
-        result = await self._prompt_user_permission(tool_name, args)
-
-        if result is None:
-            self.session_always_allow = True
-            console.print("[green]Auto-allowing tools for this session[/green]")
-            return True
-
-        return result
-
-    async def _prompt_user_permission(self, tool_name: str, args: dict) -> bool | None:
-        """Prompt user for permission using the arrow-key picker UI.
-
-        Runs in a thread pool to avoid blocking the async event loop.
-        Pauses Rich Live display to prevent rendering conflicts with prompt_toolkit.
-
-        Returns:
-            True if user allows this tool.
-            False if user denies or cancels.
-            None if user selected "Always Allow" for session.
-        """
-        request = ToolPermissionRequest(
-            tool_name=tool_name,
-            tool_args=args,
+    def get_wrapper_toolset(
+        self, toolset: AbstractToolset[Any]
+    ) -> AbstractToolset[Any] | None:
+        return ApprovalRequiredToolset(
+            wrapped=toolset,
+            approval_required_func=self._approval_required,
         )
 
-        # Pause Rich Live display if active to prevent rendering conflicts
-        # (Rich runs in a refresh thread, prompt_toolkit takes over stdout)
-        live = get_active_live()
-        live_was_stopped = False
-        if live is not None:
-            try:
-                live.stop()
-                live_was_stopped = True
-            except Exception:
-                # If stop fails, don't try to restart later
-                live = None
-
-        loop = asyncio.get_running_loop()
-        try:
-            result = await loop.run_in_executor(
-                None,
-                run_tool_permission_picker,
-                request,
-            )
-        finally:
-            # Resume Live display after picker closes
-            if live is not None and live_was_stopped:
-                try:
-                    live.start()
-                except Exception:
-                    # Best effort restart - if it fails, the display is gone
-                    pass
-
-        if result is None:
-            console.print("[yellow]Tool execution cancelled[/yellow]")
-            return False
-
-        if result == PermissionChoice.ALLOW:
-            return True
-        elif result == PermissionChoice.ALWAYS_ALLOW:
-            return None
-        else:
-            console.print(f"[yellow]Tool '{tool_name}' execution denied[/yellow]")
-            return False
-
-    async def call_tool(
+    def _approval_required(
         self,
-        name: str,
-        tool_args: dict[str, Any],
-        ctx: RunContext[DepsT],
-        tool: ToolsetTool[DepsT],
-    ) -> Any:
-        """Call a tool with permission checking.
-
-        If permission is denied, returns an error message to the agent.
-        """
-        if not await self.check_permission(name, tool_args):
-            return (
-                f"[TOOL DENIED] The user denied permission to execute tool '{name}'. "
-                "Please acknowledge this and continue without using this tool, "
-                "or try a different approach."
-            )
-
-        return await self.wrapped.call_tool(name, tool_args, ctx, tool)
-
-    async def ask_permission_for_fallback(
-        self, tool_name: str, args: dict[str, Any]
+        _ctx: RunContext[Any],
+        _tool_def: ToolDefinition,
+        _tool_args: dict[str, Any],
     ) -> bool:
-        """Check permission for fallback tool calls.
+        if not self.is_enabled():
+            return False
+        if self._state.always_allow:
+            return False
+        return True
 
-        This method can be passed as a callback to execute_fallback_tool_calls()
-        to ensure fallback tool execution respects permission settings.
+    async def handle_deferred_tool_calls(
+        self,
+        _ctx: RunContext[Any],
+        *,
+        requests: DeferredToolRequests,
+    ) -> DeferredToolResults | None:
+        if not requests.approvals:
+            return None
 
-        Uses the same check_permission logic as call_tool for consistency.
+        resolved: dict[str, Any] = {}
+        for call in requests.approvals:
+            args = call.args_as_dict()
+            choice = await self.picker(call.tool_name, args)
 
-        Returns:
-            True if allowed, False if denied.
-        """
-        return await self.check_permission(tool_name, args)
-
-
-def wrap_toolset_with_permission(
-    toolset: AbstractToolset[DepsT],
-) -> PermissionToolsetWrapper[DepsT]:
-    """Wrap a toolset with permission checking.
-
-    Creates a wrapper that asks for user permission before each tool call.
-    The permission setting is checked dynamically from config via
-    _get_ask_permission_setting().
-
-    Args:
-        toolset: The toolset to wrap.
-
-    Returns:
-        A wrapped toolset that checks permission before tool calls.
-    """
-    return PermissionToolsetWrapper(wrapped=toolset)
+            if choice is PermissionChoice.ALLOW:
+                resolved[call.tool_call_id] = ToolApproved()
+            elif choice is PermissionChoice.ALWAYS_ALLOW:
+                self._state.always_allow = True
+                self._notify("Auto-allowing tools for this session")
+                resolved[call.tool_call_id] = ToolApproved()
+            else:
+                if choice is None:
+                    self._notify(f"Tool '{call.tool_name}' execution cancelled")
+                else:
+                    self._notify(f"Tool '{call.tool_name}' execution denied")
+                resolved[call.tool_call_id] = ToolDenied(
+                    message=(
+                        f"[TOOL DENIED] The user denied permission to execute tool "
+                        f"'{call.tool_name}'. Please acknowledge this and continue "
+                        "without using this tool, or try a different approach."
+                    )
+                )
+        return DeferredToolResults(approvals=resolved)

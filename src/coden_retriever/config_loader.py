@@ -12,14 +12,19 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional, Any, Callable, Literal
 
+from .agent._constants import (
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_MAX_STEPS,
+    LLAMACPP_DEFAULT_URL,
+    OLLAMA_DEFAULT_URL,
+)
+from .agent.settings import GenerationSettings
 from .constants import (
     DEFAULT_DAEMON_HOST,
     DEFAULT_DAEMON_PORT,
     DEFAULT_DAEMON_TIMEOUT,
     DEFAULT_FULL_SERVER_INSTRUCTIONS_TEMPLATE,
     DEFAULT_MAX_PROJECTS,
-    DEFAULT_MAX_RETRIES,
-    DEFAULT_MAX_STEPS,
     DEFAULT_SEARCH_RESULT_LIMIT,
     DEFAULT_STARTER_QUESTIONS,
     DEFAULT_STUDY_PROMPT_TEMPLATE,
@@ -29,8 +34,6 @@ from .constants import (
     DEFAULT_TOOL_INSTRUCTIONS_TEMPLATE,
     DEFAULT_TOOL_ROUTER_PROMPT_TEMPLATE,
     FILE_PATH_PREFIX,
-    LLAMACPP_DEFAULT_URL,
-    OLLAMA_DEFAULT_URL,
 )
 
 logger = logging.getLogger(__name__)
@@ -466,25 +469,6 @@ def get_config_dir() -> Path:
 def get_config_file() -> Path:
     """Get the path to the settings.json file."""
     return get_config_dir() / "settings.json"
-
-
-@dataclass
-class GenerationSettings:
-    """Model generation parameters passed to pydantic-ai's ModelSettings.
-
-    These settings control LLM behavior and are separate from provider config.
-
-    Attributes:
-        temperature: Controls randomness (0.0=deterministic, 1.0+=creative).
-        max_tokens: Maximum response length (None=model default).
-        timeout: Request timeout in seconds.
-        api_key: API key override (used at provider level, not ModelSettings).
-    """
-
-    temperature: float = 0.1
-    max_tokens: Optional[int] = None
-    timeout: float = 120.0
-    api_key: Optional[str] = None
 
 
 @dataclass

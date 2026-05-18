@@ -1,48 +1,14 @@
-"""Pydantic models for ReAct agent framework.
+"""Pydantic models for the ReAct agent.
 
-Defines structured output types for reasoning steps, actions, and observations.
-Also includes dependency injection types for pydantic-ai agent integration.
+Structured Thought / Action / Observation / ReActStep types plus their
+aggregated `AgentResponse`. Returned by `CodingAgent.run`; consumed by
+callers that want to inspect each step of the reasoning chain.
 """
 
-from dataclasses import dataclass
-from enum import Enum
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
-
-
-class AgentMode(Enum):
-    """Agent operating modes for dependency injection."""
-    CODING = "coding"
-    STUDY = "study"
-
-
-class SessionTrigger(str, Enum):
-    """Special input values that trigger study session start."""
-    EMPTY = ""
-    START = "start"
-    BEGIN = "begin"
-
-
-@dataclass
-class AgentDeps:
-    """Dependencies injected into agent tools and instructions via RunContext.
-
-    This dataclass is used with pydantic-ai's deps_type parameter to provide
-    context-aware information to tools and instruction generators.
-
-    Attributes:
-        root_directory: Absolute path to the project root directory.
-        mode: Current agent mode (CODING for code analysis, STUDY for tutoring).
-        include_tool_instructions: Whether to include detailed tool workflow guidance.
-        debug: Whether debug logging is enabled.
-        study_topic: Optional focus topic for STUDY mode sessions.
-    """
-    root_directory: str
-    mode: AgentMode = AgentMode.CODING
-    include_tool_instructions: bool = False
-    debug: bool = False
-    study_topic: Optional[str] = None
+from pydantic import BaseModel, ConfigDict, Field
+from pydantic_ai.messages import ModelMessage
 
 
 class Thought(BaseModel):
@@ -88,6 +54,8 @@ class ReActStep(BaseModel):
 class AgentResponse(BaseModel):
     """Final structured response from the agent."""
 
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     answer: str = Field(description="Final answer to the user's query")
     steps: list[ReActStep] = Field(
         default_factory=list, description="ReAct steps taken to reach the answer"
@@ -98,26 +66,6 @@ class AgentResponse(BaseModel):
     reached_max_steps: bool = Field(
         default=False, description="Whether max steps limit was reached"
     )
-    messages: list[Any] = Field(
+    messages: list[ModelMessage] = Field(
         default_factory=list, description="Message history for multi-turn conversations"
-    )
-
-
-class FallbackIterationResult(BaseModel):
-    """Result of checking and handling text-based tool call fallback."""
-
-    should_continue: bool = Field(
-        default=False, description="Whether to continue the fallback loop"
-    )
-    updated_history: list[Any] = Field(
-        default_factory=list, description="Updated message history for next iteration"
-    )
-    continuation_prompt: str = Field(
-        default="", description="Prompt for next iteration"
-    )
-    steps: list[ReActStep] = Field(
-        default_factory=list, description="Steps from fallback execution"
-    )
-    tool_call_count: int = Field(
-        default=0, description="Number of tool calls executed in fallback"
     )

@@ -9,8 +9,9 @@ import asyncio
 import concurrent.futures
 import logging
 from dataclasses import dataclass
-from enum import Enum
 from typing import Any, Optional
+
+from .protocols import PermissionChoice
 
 from prompt_toolkit import Application
 from prompt_toolkit.formatted_text import HTML, FormattedText
@@ -46,13 +47,6 @@ from .picker_styles import (
 from .rich_console import console
 
 logger = logging.getLogger(__name__)
-
-class PermissionChoice(Enum):
-    """User's permission choice for a tool call."""
-    ALLOW = "allow"
-    ALWAYS_ALLOW = "always_allow"  # Allow all tools for this session
-    DENY = "deny"
-
 
 @dataclass
 class ToolPermissionRequest:

@@ -18,7 +18,8 @@ from rich import box
 from rich.table import Table
 
 from ..config_loader import assign_config_value, load_config, reload_config, save_config
-from ..constants import DEFAULT_MAX_RETRIES, SHELL_COMMAND_TIMEOUT
+from ..constants import SHELL_COMMAND_TIMEOUT
+from ._constants import DEFAULT_MAX_RETRIES
 from .commands import execute_command, _REBUILD_REQUIRED_SETTINGS, _RESTART_REQUIRED_SETTINGS
 from .config_picker import run_config_picker_async
 from .directory_browser import run_directory_browser_async, print_directory_changed
@@ -33,7 +34,7 @@ from .undo.picker_state import ACTION_FORK, ACTION_SWITCH
 
 if TYPE_CHECKING:
     from ..mcp.llm_tool_router import LLMToolRouter
-    from .filtering_toolset import LLMToolFilter
+    from .filtering_toolset import ToolFilter
     from pydantic_ai.toolsets import FilteredToolset
 
 
@@ -53,7 +54,6 @@ class CommandContext:
     root_directory: str = ""
     previous_directory: Optional[str] = None
     server: Any = None
-    toolset: Any = None
     # Study mode
     study_mode: bool = False
     study_topic: Optional[str] = None
@@ -64,7 +64,7 @@ class CommandContext:
     tool_filter_model: Optional[str] = None
     tool_router: Optional["LLMToolRouter"] = None
     filtering_toolset: Optional["FilteredToolset"] = None
-    llm_filter: Optional["LLMToolFilter"] = None
+    llm_filter: Optional["ToolFilter"] = None
     # Stashed by /config for the interactive config picker
     config_runtime_values: dict[str, str] = field(default_factory=dict)
 

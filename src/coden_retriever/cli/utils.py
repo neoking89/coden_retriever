@@ -65,13 +65,8 @@ class DefaultValueHelpFormatter(RawDescriptionRichHelpFormatter):
 
 def get_clone_mode(args: argparse.Namespace) -> Literal["combined", "semantic", "syntactic"]:
     """Determine clone detection mode from CLI flags."""
-    clone_semantic = getattr(args, "clone_semantic", False)
-    clone_syntactic = getattr(args, "clone_syntactic", False)
-
-    if clone_semantic and clone_syntactic:
-        return "combined"  # Both flags = combined (explicit)
-    if clone_semantic:
+    if getattr(args, "clone_semantic", False):
         return "semantic"
-    if clone_syntactic:
+    if getattr(args, "clone_syntactic", False):
         return "syntactic"
-    return "combined"  # Default
+    return "combined"

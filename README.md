@@ -10,7 +10,7 @@ pip install coden-retriever
 
 ### What's Included
 
-Everything ships in a single install — semantic search, clone detection, echo-comment detection, the MCP server, and the interactive agent are all bundled. The MiniLM ONNX embedding model is packaged inside the wheel, so semantic features work out of the box with no extra download step. There are no `[semantic]`, `[mcp]`, `[agent]`, or `[all]` extras anymore.
+Everything ships in a single install — semantic search, clone detection, echo-comment detection, the MCP server, and the interactive agent are all bundled. The MiniLM ONNX embedding model is packaged inside the wheel, so semantic features work out of the box with no extra download step.
 
 ```bash
 # Everything (search + analysis + MCP server + agent)
@@ -27,6 +27,7 @@ pip install 'coden-retriever[dev]'
 | BM25 keyword search | `coden /path -q "auth"` |
 | Semantic search | `coden /path -q "auth" --semantic` |
 | Code map & hotspots | `coden /path --map`, `coden /path -H` |
+| Architecture audit | `coden architecture /path` |
 | Propagation analysis | `coden /path -P` |
 | Dead code detection | `coden /path -D` |
 | Tramp data detection | `coden /path -T` |
@@ -86,6 +87,13 @@ coden /path/to/repo -K --min-constant-occurrences 5 --min-constant-files 3
 coden debug-availability
 coden debug-availability python
 coden debug-availability cpp --format json
+
+# Audit architecture: cycles, kitchen-sinks, oversized files, shallow packages, in-function imports
+coden architecture /path/to/repo
+coden architecture /path/to/repo --top 20        # Custom per-section limit
+coden architecture /path/to/repo --exclude tests,vendor  # Skip directories
+coden architecture /path/to/repo --lang python   # Force language (python, javascript, typescript, go, rust, java, kotlin, php, c_sharp, scala; auto-detected by default)
+coden architecture /path/to/repo --format json   # Output as JSON
 ```
 
 <img src="images/readme/coden_stats_reverzed.png" alt="Coden stats output showing directory tree and ranking metrics" width="700">
@@ -143,7 +151,45 @@ Results are ranked using Reciprocal Rank Fusion across:
 
 ## Supported Languages
 
-**Support:** Python, Go, Rust, Java, C, C++, C#, Kotlin, Javascript/Typescript, PHP, Scala, Bash
+**General Search & Analysis:** Python, Go, Rust, Java, C, C++, C#, Kotlin, Javascript/Typescript, PHP, Scala, Bash
+
+**Architecture Audit (`coden architecture`):** ten languages, each plugged in via one adapter under `src/coden_retriever/architecture/adapters/`. Adapters disagree on what a "package" is — the load-bearing concept the five rules audit against — so each one-liner below names that language's package model. Multi-workspace support is built-in for JavaScript, TypeScript, Cargo, Maven, Go, and .NET.
+
+- **Python** — package = any directory containing an `__init__.py`, or a PEP 420 namespace-package directory containing `.py` files.
+- **JavaScript** — package = directory with `package.json`, or any `index.{js,mjs,cjs}`-rooted subtree. Workspace: `package.json` `workspaces` field.
+- **TypeScript** — same as JavaScript plus `index.{ts,tsx}` / `.d.ts` entries; aliases from `tsconfig.json` `baseUrl` / `paths` are resolved when present. Workspace: `package.json` `workspaces` field.
+- **C#** — package = the namespace declared by `.cs` files (`namespace X { … }` block form or `namespace X;` file-scoped form); identity comes from the namespace header, not the directory name. Workspace: `.sln` files with `Project(...)` rows (legacy and SDK GUIDs).
+- **Go** — package = directory holding `.go` files; module boundary read from `go.mod`. Workspace: `go.work` with `use` directives.
+- **Java** — package = directory under the effective `src/main/java/` root containing `.java` files, named by its POSIX-relative path with `/` → `.`. Workspace: `pom.xml` `<modules>` in multi-module parent.
+- **Kotlin** — package = directory whose first `.kt` file declares a `package` header; identity comes from the header (Kotlin permits header / folder mismatch).
+- **PHP** — package = directory whose `.php` files declare a `namespace` header (effective root anchored by `composer.json`); `\` separators normalized to `.`.
+- **Rust** — package = `mod.rs` / sibling-`.rs` module tree rooted at `src/lib.rs` or `src/main.rs` under a `Cargo.toml`. Workspace: `Cargo.toml` `[workspace] members` field.
+- **Scala** — package = directory whose first `.scala` file declares a `package_clause` (top-level `package a.b.c` form or brace-block `package a.b.c { … }` form).
+
+### Workspace Audits
+
+Multi-module / workspace layouts are auto-discovered when a workspace manifest is present at the audit root:
+
+| Ecosystem | Manifest | Discovery |
+|-----------|----------|-----------|
+| Cargo | `Cargo.toml` `[workspace] members` | Each member's `src/` is audited |
+| Maven | `pom.xml` `<modules>` | Each module's `src/main/java/` is audited |
+| Go | `go.work` | Each `use` directive points to a module root |
+| .NET | `.sln` | Each `Project(...)` row whose path ends in `.csproj` (extension-based; the project-type GUID is ignored — Microsoft emits multiple SDK-style GUIDs across template versions) |
+| JavaScript / TypeScript | `package.json` `workspaces` | Each workspace member is audited |
+
+Workspace audits report cross-module call edges and cycles in the unified architecture report. The stat-line gains an optional `· N modules ·` segment when ≥1 module members are walked (e.g., `Rust · 2 modules · 4 packages · 14 files · 0.3k LOC`). Single-module audits emit no segment and are byte-identical to pre-feature output. JSON output gains a `"modules": N` field in the `stats` block (0 for single-module, ≥1 for workspaces).
+
+When a workspace is audited, stderr emits: `architecture audit: N modules walked; K members dropped out-of-root` (informational tripwire).
+
+Not supported by `coden architecture`:
+
+- **C and C++** — both languages have no language-level package construct; a unit of audit (header subtree? `#include` SCC? directory convention?) is a design choice that has not been made. Deferred until a concrete need surfaces.
+- **Bash** — bash has no class or package concept, so there is no structural unit for the audit to compare against. (Bash *is* supported by `code_map` and `find_identifier` at function granularity — see the **Bash:** note immediately below.)
+- **Gradle** (`settings.gradle.kts` `include(...)`) and **sbt** — multi-project layouts warn and fall back to single-root audit (separate ticket).
+- **Maven Polyglot** — custom `<sourceDirectory>`, aggregator `packaging=pom` without sources, and Java 9+ versioned dirs are silently skipped (covered by Maven multi-module, not separately).
+
+**Bash:** Output for bash sources is function-only by design — bash has no class or method concept, so `code_map` and `find_identifier` only surface function definitions and command calls.
 
 ## CLI Reference
 
@@ -153,6 +199,7 @@ coden /path/to/repo --map-mode simple        # Quick map ranked by git commits (
 coden /path/to/repo --query "auth"           # Keyword search
 coden /path/to/repo --query "auth" --semantic # Semantic search
 coden /path/to/repo --find "UserAuth"        # Find symbol
+coden architecture /path/to/repo             # Architecture audit (cycles, kitchen-sinks, oversized files, etc.)
 coden /path/to/repo --hotspots -n 20         # Top 20 refactoring hotspots
 coden /path/to/repo -H --stats -r            # Hotspots with stats, reversed
 coden /path/to/repo -C --clone-threshold 0.90      # Find code clones (90% similarity)
@@ -800,6 +847,7 @@ Reload VS Code (Ctrl+Shift+P -> "Developer: Reload Window").
 **Code Discovery**
 - **code_map** - Architectural overview with dependencies. Start here.
 - **code_search** - Keyword or semantic search.
+- **architecture** - Five-section architecture audit (cycles, kitchen-sinks, oversized files, shallow packages, in-function imports) for Python, JavaScript, TypeScript, Go, Rust, Java, Kotlin, PHP, C#, and Scala projects. CLI: `coden architecture /path`
 - **coupling_hotspots** - Find refactoring targets (high coupling + complexity). CLI: `-H`
 - **find_hotspots** - Git churn analysis (frequently changed files).
 - **clone_detection** - Find duplicate functions (combined/semantic/syntactic modes). CLI: `-C`

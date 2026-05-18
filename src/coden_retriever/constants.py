@@ -14,13 +14,9 @@ from enum import Enum
 # Network Constants - Centralized URLs, ports, hosts, and timeouts
 # =============================================================================
 
-# Provider URLs (OpenAI-compatible endpoints)
-OLLAMA_DEFAULT_URL = "http://localhost:11434/v1"
-LLAMACPP_DEFAULT_URL = "http://localhost:8080/v1"
-
-# Provider default API keys (for local servers that don't need real keys)
-OLLAMA_DEFAULT_API_KEY = "ollama"
-LLAMACPP_DEFAULT_API_KEY = "not-needed"
+# Provider URLs / default API keys for the agent live in
+# `coden_retriever.agent._constants` so the library-target files do not depend
+# on this project-wide module.
 
 # Daemon server defaults
 DEFAULT_DAEMON_HOST = "127.0.0.1"
@@ -84,16 +80,9 @@ DAP_ADAPTER_READY_WAIT_SECONDS: float = 0.5
 # is right here — 3s is plenty for every non-deferring adapter to ack.
 LAUNCH_REQUEST_SHORT_TIMEOUT_SECONDS: float = 3.0
 
-# Agent defaults
-# 30 tool calls: raised from 15 after observing that multi-file refactoring tasks
-# (read N files, edit N files, verify) regularly hit the old limit mid-task.
-DEFAULT_MAX_STEPS: int = 30
-# 5 retries: enough to recover from transient provider 400s (malformed tool calls)
-# while bounding runaway retry loops. Configurable via /config set max_retries.
-DEFAULT_MAX_RETRIES: int = 5
-
-# H:M:S format for wall-clock timestamps shown alongside token usage
-WALL_CLOCK_FORMAT: str = "%H:%M:%S"
+# Agent step/retry defaults and WALL_CLOCK_FORMAT live in
+# `coden_retriever.agent._constants` so the agent library has no
+# dependency on this project-wide module.
 
 # WHY "file:": allows referencing external template files in settings.json
 # instead of inlining large prompt templates as JSON strings

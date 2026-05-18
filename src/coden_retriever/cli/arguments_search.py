@@ -205,10 +205,11 @@ def create_search_parser(config: AppConfig) -> argparse.ArgumentParser:
                           help="Detect magic constants - repeated literal values across files")
 
     clones = parser.add_argument_group("Clone Options (use with -C)")
-    clones.add_argument("--clone-semantic", action="store_true",
-                        help="Semantic only (MiniLM ONNX embeddings)")
-    clones.add_argument("--clone-syntactic", action="store_true",
-                        help="Syntactic only (line-by-line Jaccard)")
+    mode_group = clones.add_mutually_exclusive_group()
+    mode_group.add_argument("--clone-semantic", action="store_true",
+                            help="Semantic only (MiniLM ONNX embeddings)")
+    mode_group.add_argument("--clone-syntactic", action="store_true",
+                            help="Syntactic only (line-by-line Jaccard)")
     clones.add_argument("--line-threshold", type=float, default=DEFAULT_SYNTACTIC_LINE_THRESHOLD,
                         help="Line similarity threshold (0.0-1.0)")
     clones.add_argument("--func-threshold", type=float, default=DEFAULT_SYNTACTIC_FUNC_THRESHOLD,
