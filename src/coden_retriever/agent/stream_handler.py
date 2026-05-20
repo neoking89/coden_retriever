@@ -10,7 +10,13 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterable, Protocol
 
 from pydantic_ai import AgentStreamEvent
-from pydantic_ai.messages import TextPartDelta, ThinkingPartDelta
+from pydantic_ai.messages import (
+    PartStartEvent,
+    TextPart,
+    TextPartDelta,
+    ThinkingPart,
+    ThinkingPartDelta,
+)
 
 from .protocols import (
     DebugLoggerProtocol,
@@ -93,16 +99,33 @@ class StreamEventHandler:
         self.state.accumulated_text += content
         self._notify_text_update()
 
+    def _handle_part_start(self, part: Any) -> None:
+        """Capture the opening chunk of a streamed text/thinking part.
+
+        pydantic-ai delivers the first segment of a part in the
+        ``PartStartEvent``, then only increments via ``PartDeltaEvent``.
+        Without this the first token (e.g. the leading word of the answer)
+        is dropped from the accumulator — masked in interactive mode, which
+        reprints the final ``result.output``, but exposed by ``-p`` mode,
+        which streams the accumulator verbatim with no reprint.
+        """
+        content = getattr(part, "content", None)
+        if not isinstance(content, str) or not content:
+            return
+        if isinstance(part, ThinkingPart):
+            self._handle_thinking_delta(content)
+        elif isinstance(part, TextPart):
+            self._handle_text_delta(content)
+
     def _handle_tool_call(self, event: ToolCallEvent) -> None:
         tool_name = event.part.tool_name
-        tool_args = event.part.args
         tool_call_id = getattr(event.part, "tool_call_id", None)
 
         # Flush partial content so debug logs stay in chronological order
         self._flush_thinking()
         self._flush_text(is_final=False)
 
-        args_dict = tool_args if isinstance(tool_args, dict) else {"raw": str(tool_args)}
+        args_dict = event.part.args_as_dict()
         self.debug_logger.log_tool_call(tool_name, args_dict, tool_call_id)
 
         if self.event_callbacks.on_tool_call:
@@ -172,6 +195,10 @@ class StreamEventHandler:
         """Dispatch a single stream event by delta or event_kind."""
         event_kind = getattr(event, "event_kind", None)
         delta = getattr(event, "delta", None)
+
+        if isinstance(event, PartStartEvent):
+            self._handle_part_start(event.part)
+            return
 
         if isinstance(delta, ThinkingPartDelta):
             thinking_delta = getattr(delta, "content_delta", None)

@@ -11,6 +11,7 @@ happened.
 
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass
 from types import TracebackType
@@ -31,6 +32,12 @@ from ..rich_console import console, set_active_live
 # Refresh budget for Rich's Live region. 4 fps stays smooth without
 # saturating slow Windows terminals.
 DEFAULT_REFRESH_PER_SECOND = 4
+
+# Result markers for the compact stderr tool log in `coden -a -p`. Unicode
+# check/cross keep each status line to one short token; stdout and stderr are
+# reconfigured to utf-8 in __main__ before any handler runs, so these are safe.
+PRINT_TOOL_OK_MARK = "✓"
+PRINT_TOOL_FAIL_MARK = "✗"
 
 
 @dataclass(frozen=True)
@@ -247,3 +254,76 @@ class StreamRenderer:
             if len(lines) > self.max_lines:
                 display = "\n".join(lines[-self.max_lines:])
         self._live.update(Text.from_markup(display))
+
+
+class StdoutStreamWriter:
+    """Streams answer-text deltas straight to ``sys.stdout`` for ``coden -a -p``.
+
+    The non-interactive print path needs token-by-token output on a plain,
+    pipe-safe stream — no Rich ``Live`` region (which is transient and emits
+    ANSI), no final-answer panel. Only answer text is written; thinking and
+    tool-call events are intentionally not wired so stdout stays clean for
+    `coden -a -p ... | other-tool`.
+
+    Uses the same cumulative-diff as :meth:`StreamRenderer.on_text`:
+    ``event.cumulative`` is the full answer so far, so we subtract the
+    last-seen length to recover the per-chunk delta.
+    """
+
+    def __init__(self) -> None:
+        self._answer_len = 0
+
+    @property
+    def wrote_any(self) -> bool:
+        """True once at least one answer-text delta has reached stdout.
+
+        Lets the print path decide whether a terminating newline is owed: a
+        partially-streamed line needs one, an error before the first token
+        does not (avoids a stray blank line in the pipe).
+        """
+        return self._answer_len > 0
+
+    def on_text(self, event: TextEvent) -> None:
+        delta = event.cumulative[self._answer_len:]
+        self._answer_len = len(event.cumulative)
+        if not delta:
+            return
+        sys.stdout.write(delta)
+        sys.stdout.flush()
+
+
+class StderrToolReporter:
+    """Compact, pipe-safe tool-call feedback on ``sys.stderr`` for ``-p`` mode.
+
+    stdout carries answer text only (see :class:`StdoutStreamWriter`), so a
+    ``coden -a -p ... | tool`` pipe stays clean. This writes one line per tool
+    call — icon, name, compact args — to stderr, then a ✓/✗ and elapsed time
+    when the tool returns, giving the human progress feedback that does not
+    contaminate the captured answer.
+    """
+
+    def __init__(self, style: StreamRendererStyle = DEFAULT_STREAM_STYLE) -> None:
+        self._style = style
+        self._tool_start: Optional[float] = None
+
+    def on_tool_call(self, event: ToolCallEvent) -> None:
+        self._tool_start = time.monotonic()
+        args = _format_tool_args(event.args, self._style)
+        sys.stderr.write(
+            f"{self._style.tool_call_indent}{self._style.tool_call_icon} {event.name}({args})\n"
+        )
+        sys.stderr.flush()
+
+    def on_tool_result(self, event: ToolResultEvent) -> None:
+        duration = self._pop_tool_duration()
+        mark = PRINT_TOOL_FAIL_MARK if (event.is_error and event.content) else PRINT_TOOL_OK_MARK
+        stats = f" {duration:.1f}s" if duration is not None else ""
+        sys.stderr.write(f"{self._style.tool_result_indent}{mark}{stats}\n")
+        sys.stderr.flush()
+
+    def _pop_tool_duration(self) -> Optional[float]:
+        if self._tool_start is None:
+            return None
+        duration = time.monotonic() - self._tool_start
+        self._tool_start = None
+        return duration

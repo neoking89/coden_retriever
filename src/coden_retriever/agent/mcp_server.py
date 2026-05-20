@@ -24,6 +24,7 @@ def create_mcp_server(
     disabled_tools: Optional[list[str]] = None,
     timeout: Optional[float] = None,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    tool_timeout: Optional[float] = None,
 ) -> MCPServerStdio:
     """Create an MCP server instance for coden-retriever.
 
@@ -32,8 +33,10 @@ def create_mcp_server(
 
     Args:
         disabled_tools: Optional list of tool names to disable.
-        timeout: Optional timeout in seconds.
+        timeout: Optional connection timeout in seconds (MCPServerStdio init).
         max_retries: Maximum retry attempts for tool calls (default: DEFAULT_MAX_RETRIES).
+        tool_timeout: Optional global per-call tool timeout (seconds), forwarded to
+            the server subprocess via CODEN_RETRIEVER_TOOL_TIMEOUT.
 
     Returns:
         Configured MCPServerStdio instance.
@@ -41,6 +44,8 @@ def create_mcp_server(
     env = os.environ.copy()
     if disabled_tools:
         env["CODEN_RETRIEVER_DISABLED_TOOLS"] = ",".join(disabled_tools)
+    if tool_timeout is not None:
+        env["CODEN_RETRIEVER_TOOL_TIMEOUT"] = str(tool_timeout)
 
     # Use -OO for optimized mode (faster startup, no docstrings/asserts)
     # Use -I for isolated mode (prevents debug output from site-packages)
@@ -58,17 +63,19 @@ async def mcp_server_context(
     disabled_tools: Optional[list[str]] = None,
     timeout: Optional[float] = None,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    tool_timeout: Optional[float] = None,
 ) -> AsyncIterator[MCPServerStdio]:
     """Context manager for MCP server with automatic cleanup.
 
     Args:
         disabled_tools: Optional list of tool names to disable.
-        timeout: Optional timeout in seconds.
+        timeout: Optional connection timeout in seconds (MCPServerStdio init).
         max_retries: Maximum retry attempts for tool calls (default: DEFAULT_MAX_RETRIES).
+        tool_timeout: Optional global per-call tool timeout (seconds).
 
     Yields:
         Connected MCPServerStdio instance.
     """
-    server = create_mcp_server(disabled_tools, timeout, max_retries)
+    server = create_mcp_server(disabled_tools, timeout, max_retries, tool_timeout)
     async with server:
         yield server

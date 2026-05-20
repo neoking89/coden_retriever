@@ -42,6 +42,12 @@ def create_agent_parser(config) -> argparse.ArgumentParser:
                         help="MCP server startup timeout (seconds)")
     parser.add_argument("--config", type=str, default=None, metavar="PATH",
                         help="Path to custom config JSON. Create via `coden config new <path>`.")
+    parser.add_argument("--print", "-p", dest="prompt", nargs="?", const="", default=None,
+                        metavar="PROMPT",
+                        help="Run a single prompt non-interactively, stream the answer, then exit. "
+                             "Reads stdin when given no value (e.g. `echo q | coden -a -p`).")
+    parser.add_argument("--no-daemon", dest="no_daemon", action="store_true",
+                        help="Skip auto-starting the daemon for this invocation.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     return parser
 

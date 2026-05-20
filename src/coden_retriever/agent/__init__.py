@@ -19,6 +19,7 @@ _LAZY_ATTRS: dict[str, str] = {
     "Thought": ".models",
     "CodingAgent": ".coding_agent",
     "run_interactive": ".coden_session",
+    "run_once": ".coden_session",
     "print_steps": ".rich_console",
     "console": ".rich_console",
     "get_user_input": ".rich_console",
@@ -45,6 +46,7 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "CodingAgent",
     "run_interactive",
+    "run_once",
     "AgentResponse",
     "ReActStep",
     "Thought",

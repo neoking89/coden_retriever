@@ -6,7 +6,6 @@ Tools are stored in ~/.coden-retriever/dynamic_tools.py for cross-platform persi
 """
 import ast
 import asyncio
-import functools
 import importlib
 import importlib.util
 import inspect
@@ -17,13 +16,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Annotated, Any, cast
 
-import anyio
 import mcp.types
-from anyio.to_thread import run_sync as _to_thread_run_sync
 from fastmcp.server.dependencies import get_context
 from pydantic import Field
-
-from coden_retriever.mcp.constants import get_dynamic_tool_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -176,73 +171,6 @@ def _get_dynamic_tools_module() -> ModuleType:
     if _manager._dynamic_tools_module is None:
         return _load_dynamic_tools_module()
     return _manager._dynamic_tools_module
-
-
-def _timeout_error_payload(name: str, timeout_s: float) -> dict[str, str]:
-    """Structured error payload returned when a dynamic tool exceeds its timeout.
-
-    Shape matches the existing error-dict convention used by create/remove so
-    the agent UI parses it the same way.
-    """
-    return {
-        "error": f"Tool '{name}' exceeded {timeout_s}s timeout",
-        "type": "TimeoutError",
-    }
-
-
-def _wrap_with_timeout(func: Callable[..., Any], timeout_s: float) -> Callable[..., Any]:
-    """Wrap a dynamic tool with a per-call timeout that surfaces a structured error.
-
-    Sync funcs are dispatched onto a worker thread (matching FastMCP's own
-    behavior for sync tool bodies); async funcs are awaited directly. In both
-    cases the call is bounded by `anyio.fail_after(timeout_s)`.
-
-    Note: `anyio.to_thread.run_sync` cannot interrupt a stuck blocking call
-    (Python cannot kill OS threads). The agent gets a clean structured error
-    after `timeout_s`, but the thread keeps running until the process exits.
-    For tools that spawn subprocesses, prefer the cancellable async helper at
-    `coden_retriever.agent.shell_exec.execute_shell` which is output-capped
-    and cancels cleanly.
-
-    Preserves __name__, __doc__, __annotations__, __signature__ so FastMCP's
-    schema generator continues to inspect the wrapper as if it were the
-    original function.
-    """
-    name = func.__name__
-    is_async = inspect.iscoroutinefunction(func)
-
-    if is_async:
-        @functools.wraps(func)
-        async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
-            try:
-                with anyio.fail_after(timeout_s):
-                    return await func(*args, **kwargs)
-            except TimeoutError:
-                return _timeout_error_payload(name, timeout_s)
-
-        # functools.wraps copies __wrapped__ but not __signature__ when the
-        # original was inspected via typing — set it explicitly so FastMCP's
-        # ParsedFunction sees the real signature.
-        async_wrapper.__signature__ = inspect.signature(func)  # type: ignore[attr-defined]
-        return async_wrapper
-
-    @functools.wraps(func)
-    async def sync_wrapper(*args: Any, **kwargs: Any) -> Any:
-        try:
-            with anyio.fail_after(timeout_s):
-                # abandon_on_cancel=True is required for fail_after to actually
-                # break out of the worker thread; without it the timeout would
-                # block until the sync body returns. The thread itself is not
-                # killable — see docstring caveat.
-                return await _to_thread_run_sync(
-                    functools.partial(func, *args, **kwargs),
-                    abandon_on_cancel=True,
-                )
-        except TimeoutError:
-            return _timeout_error_payload(name, timeout_s)
-
-    sync_wrapper.__signature__ = inspect.signature(func)  # type: ignore[attr-defined]
-    return sync_wrapper
 
 
 def _safe_remove_tool(mcp_instance: Any, name: str) -> None:
@@ -761,7 +689,7 @@ async def create_dynamic_tool(
                 "message": f"Tool saved to {dynamic_tools_path}; server instance not available for immediate registration.",
             }
 
-        mcp_instance.tool()(_wrap_with_timeout(func, get_dynamic_tool_timeout()))
+        mcp_instance.tool()(func)
         await _notify_tool_list_changed()
         return {
             "status": "success",
@@ -880,10 +808,9 @@ def load_and_register_dynamic_tools(mcp: Any) -> None:
     """Load and register all dynamic tools on the given MCP instance."""
     try:
         dynamic_tools = _get_dynamic_tools_module()
-        timeout_s = get_dynamic_tool_timeout()
         for tool in dynamic_tools.get_dynamic_tool_functions():
             try:
-                mcp.tool()(_wrap_with_timeout(tool, timeout_s))
+                mcp.tool()(tool)
                 logger.info(f"Registered dynamic tool: {tool.__name__}")
             except Exception as e:
                 logger.error(f"Failed to register dynamic tool {tool.__name__}: {e}")

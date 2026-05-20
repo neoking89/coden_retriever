@@ -164,11 +164,31 @@ coden flag clear                 # Remove all [CODEN] comments
 - **`!cmd @@ query`**: pipe a shell command's output straight into the agent prompt.
 - **`/config`**: interactive picker with inline editing.
 
+#### Interactive mode
+
 ```bash
 coden -a                                            # Current directory, default model
 coden -a --model ollama:gemma4:31b                  # Ollama
 coden -a --model openai:gpt-4o                      # OpenAI (needs OPENAI_API_KEY)
 coden -a --model my-model --base-url http://localhost:8000/v1  # vLLM, LM Studio, etc.
+```
+
+#### Print mode (one-shot, non-interactive)
+
+`-p/--print` runs a single prompt and exits. The answer streams to **stdout**; tool calls (with ✓/✗ and timing) go to **stderr**, so stdout stays pipe-safe. Tools are auto-allowed (no picker — there's no TTY in a pipe).
+
+```bash
+coden -a -p "What's the entry point?"                 # one-shot
+echo "How does caching work?" | coden -a -p           # prompt from stdin
+coden -a -p "Explain auth" > answer.txt               # stdout = answer only
+coden -a -p "Find bugs" --no-daemon                   # skip daemon auto-start
+```
+
+Pin a model/endpoint per run with a saved config: `coden config new` scaffolds a defaults file you edit and pass via `--config` (run-only overrides like `--model` are never persisted, unlike interactive mode):
+
+```bash
+coden config new qwen.json                            # scaffold (set your model)
+coden -a --config qwen.json -p "Summarize this repo"  # run with it
 ```
 
 <details>
@@ -250,7 +270,7 @@ coden cache clear        # Clear caches for the current directory
 coden cache clear --all  # Clear everything
 ```
 
-**Skip the daemon for a single invocation** with `--no-daemon` on `coden <root> -q ...`, `coden flag add`, or `coden flag clear`. The flag forces the in-process direct path without stopping a running daemon. For a process-wide switch, set `daemon.auto_start = false` in the config or export `CODEN_RETRIEVER_DAEMON_AUTO_START=false`; both CLI and MCP surfaces then honor it. Precedence is `--no-daemon` > env var > config > default (daemon on).
+**Skip the daemon for a single invocation** with `--no-daemon` on `coden <root> -q ...`, `coden -a`, `coden flag add`, or `coden flag clear`. The flag forces the in-process direct path without stopping a running daemon. For a process-wide switch, set `daemon.auto_start = false` in the config or export `CODEN_RETRIEVER_DAEMON_AUTO_START=false`; both CLI and MCP surfaces then honor it. Precedence is `--no-daemon` > env var > config > default (daemon on).
 
 ---
 
@@ -279,6 +299,7 @@ coden config set model.generation.temperature 0.5
 coden config set model.generation.api_key sk-...
 coden config set agent.max_steps 20
 coden config set agent.debug true
+coden config set agent.tool_timeout 120
 coden config set daemon.port 8080
 coden config set search.default_tokens 8000
 coden config set search.default_limit 50
@@ -293,7 +314,8 @@ coden config set search.default_limit 50
 | `CODEN_RETRIEVER_DAEMON_PORT` / `_HOST` | Daemon address |
 | `CODEN_RETRIEVER_DAEMON_AUTO_START` | `false` / `0` / `no` disables the daemon for CLI and MCP; the in-process direct path is used instead. Default `true`. |
 | `CODEN_RETRIEVER_MODEL_PATH` | Semantic model path |
-| `CODEN_RETRIEVER_MCP_TIMEOUT` | MCP timeout |
+| `CODEN_RETRIEVER_MCP_TIMEOUT` | MCP server connection timeout (seconds) |
+| `CODEN_RETRIEVER_TOOL_TIMEOUT` | Per-call timeout for MCP tools (seconds); default `120`. Applies globally to all tools (built-in and dynamic). |
 | `CODEN_RETRIEVER_ENABLE_DYNAMIC_TOOLS` | Enable dynamic tools (`1`, `true`, `yes`) |
 | `CODEN_RETRIEVER_DISABLED_TOOLS` | Comma-separated tool names |
 | `CODEN_RETRIEVER_TEMPERATURE` / `_MAX_TOKENS` / `_TIMEOUT` | Generation knobs |

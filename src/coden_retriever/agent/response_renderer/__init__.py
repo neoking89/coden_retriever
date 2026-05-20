@@ -14,11 +14,19 @@ from .answer import AnswerRenderer
 from .clipboard import copy_last_response
 from .latex import replace_latex_symbols
 from .markdown import normalize_markdown
-from .streaming import DEFAULT_STREAM_STYLE, StreamRenderer, StreamRendererStyle
+from .streaming import (
+    DEFAULT_STREAM_STYLE,
+    StderrToolReporter,
+    StdoutStreamWriter,
+    StreamRenderer,
+    StreamRendererStyle,
+)
 
 __all__ = [
     "AnswerRenderer",
     "DEFAULT_STREAM_STYLE",
+    "StderrToolReporter",
+    "StdoutStreamWriter",
     "StreamRenderer",
     "StreamRendererStyle",
     "copy_last_response",

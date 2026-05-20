@@ -180,34 +180,45 @@ Use absolute paths for all tool calls.
 """
 
 # Starter questions shown on Tab in agent mode.
-# Based on common developer onboarding challenges from:
-# - https://mannes.tech/10-questions-codebase/
-# - https://www.cortex.io/post/developer-onboarding-guide
-# - https://trstringer.com/20-questions-for-new-software-team/
+# Goal: build an accurate MENTAL MODEL of an unfamiliar codebase fast.
+# Grounded in program-comprehension research (what a developer must learn)
+# and constrained to what this tool can actually answer from its code graph
+# + git history (no questions that fish for rationale the tool can't retrieve):
+# - Pennington 1987 (program + situation model): trace one real operation.
+# - Soloway & Ehrlich 1984 (plans & discourse rules): recurring idioms, naming.
+# - Tornhill, Your Code as a Crime Scene (hotspots, change coupling, churn).
+# - LaToza & Myers 2010 (reachability / implications): blast radius, seams.
+# - Parnas / Ousterhout: stable interfaces vs volatile internals, deep modules.
+# Two phases: Phase 1 (orientation — what exists, how to run it) precedes
+# Phase 2 (system dynamics — flows, invariants, churn, blast radius), mirroring
+# the local -> global -> historical comprehension arc (Sillito et al. 2006).
 # 60 chars: keeps the completion menu readable on standard 80-col terminals
 # without wrapping or truncating too aggressively on typical terminal widths.
 STARTER_QUESTION_DISPLAY_LENGTH: int = 60
 
 DEFAULT_STARTER_QUESTIONS: list[str] = [
-    "How do I get started with this project? Walk me through setup, installation, and first steps.",
-    "What does this project do? Give me a high-level overview of its purpose and main features.",
-    "Explain the project structure. What are the main directories and what do they contain?",
-    "Where are the main entry points of this application? How does it start?",
-    "What architectural patterns does this codebase follow? (MVC, Clean Architecture, etc.)",
-    "What are the key components/modules and how do they interact?",
-    "How does data flow through the application? Trace a typical request/operation.",
-    "What technologies and frameworks are used? Check package.json, requirements.txt, or similar.",
-    "What are the main dependencies and what are they used for?",
-    "How do I find where a specific function or class is defined?",
-    "Where are the API endpoints defined? List them with their routes.",
-    "Where are the database models/schemas defined? What entities exist?",
-    "How do I build and run this project locally?",
-    "How do I run the tests? What testing framework is used?",
-    "How is the application configured? Where are config files and environment variables?",
-    "What functions have high coupling and should be refactored? Find code with many callers AND dependencies.",
-    "What are the architectural bottlenecks in this codebase? Find functions that many call paths flow through.",
-    "If I change <insert function here>, what code will be affected? Show me the blast radius.",
-    "Which parts of the codebase are most complex? Where should I focus code review efforts?",
+    # Phase 1 — orientation: what exists and how to run it.
+    "What real-world problem does this system solve, and what is explicitly out of scope?",
+    "What are the 10 domain terms (nouns and verbs) that appear everywhere, and what does each mean in this codebase?",
+    "What are the main directories/modules, and what does each one contain?",
+    "How do I build, run, and test this project locally, and what test framework is used?",
+    "How is the application configured (config files, env vars), and what are the main dependencies used for?",
+    # Phase 2 — system dynamics: flows, invariants, churn, blast radius.
+    "What are the core abstractions the system revolves around — the most-called functions / central modules (high fan-in, on the most call paths) — and which are load-bearing vs incidental?",
+    "Where are the entry points, and what is reachable from each?",
+    "What are the god classes/files (outsized fan-in AND fan-out) doing too much?",
+    "Which modules are stable public interfaces (high fan-in, low churn) vs volatile implementation details (high churn)?",
+    "Which modules look simple from the outside (small interface) but are complex inside (deep modules)?",
+    "Pick the single most common successful operation and trace it from entry point to exit (DB write / response), happy path only. What is the sequence, and what goal does each step serve?",
+    "Where does the primary data artifact enter, how is it transformed, and where does it leave?",
+    "What are the 5-10 recurring patterns/idioms (the 'plans') in this codebase, and what naming conventions signal them?",
+    "Where does the code violate its own conventions — where do names mislead?",
+    "What invariants does each major data structure maintain, and where are they enforced?",
+    "What are the hotspots — files high in BOTH complexity and change frequency?",
+    "Which files change together in commits but have no code/import dependency (hidden coupling)?",
+    "Which files have the most bug-fix commits, reverts, or repeated churn — and what does that history say about the fragile or contested parts of the system?",
+    "If I change function/module X, what breaks? Show the blast radius (transitive callers), and where are the seams to isolate it for a characterization test?",
+    "What would be hardest to rewrite correctly, and why? (high complexity + many callers + sparse tests + edge-case bug history)",
 ]
 
 # Tool workflow instructions appended to the system prompt when

@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Callable, Optional
 
@@ -38,6 +40,7 @@ from .filtering_toolset import create_filtered_toolset
 from .interactive_loop import CommandContext, InteractiveLoop
 from .mcp_server import create_mcp_server
 from .model_factory import ModelFactory
+from .models import AgentResponse
 from .permission_toolset import PermissionCapability
 from .prompt_builder import PromptBuilder
 from .protocols import (
@@ -50,7 +53,12 @@ from .protocols import (
 )
 from .query_executor import QueryExecutor
 from .react_loop import parse_messages_to_steps
-from .response_renderer import AnswerRenderer, StreamRenderer
+from .response_renderer import (
+    AnswerRenderer,
+    StderrToolReporter,
+    StdoutStreamWriter,
+    StreamRenderer,
+)
 from .rich_console import (
     console,
     format_exception_message,
@@ -278,6 +286,34 @@ async def _apply_tool_filtering(
     )
 
 
+async def _run_executor(
+    *,
+    coding_agent: CodingAgent,
+    pydantic_agent: "Agent[Any, str]",
+    prompt: str,
+    debug_logger: DebugLogger,
+    message_history: list[ModelMessage],
+    callbacks: EventCallbacks,
+) -> AgentResponse:
+    """Run one turn through `QueryExecutor`.
+
+    The shared execution unit behind both the interactive renderer
+    (`_execute_query`, Rich `StreamRenderer` callbacks) and the one-shot
+    print path (`run_once`, plain-stdout callback). Only the callbacks and
+    message history differ between the two; the executor wiring is identical.
+    """
+    executor = QueryExecutor(
+        max_steps=coding_agent.max_steps,
+        event_callbacks=callbacks,
+        debug_logger=debug_logger,
+    )
+    return await executor.execute(
+        pydantic_agent,
+        prompt,
+        message_history=message_history,
+    )
+
+
 async def _execute_query(
     *,
     coding_agent: CodingAgent,
@@ -299,20 +335,18 @@ async def _execute_query(
     mono_start = time.monotonic()
 
     with StreamRenderer() as renderer:
-        executor = QueryExecutor(
-            max_steps=coding_agent.max_steps,
-            event_callbacks=build_event_callbacks(
+        response = await _run_executor(
+            coding_agent=coding_agent,
+            pydantic_agent=pydantic_agent,
+            prompt=prompt,
+            debug_logger=debug_logger,
+            message_history=loop.history,
+            callbacks=build_event_callbacks(
                 on_text=renderer.on_text,
                 on_thinking=renderer.on_thinking,
                 on_tool_call=renderer.on_tool_call,
                 on_tool_result=renderer.on_tool_result,
             ),
-            debug_logger=debug_logger,
-        )
-        response = await executor.execute(
-            pydantic_agent,
-            prompt,
-            message_history=loop.history,
         )
 
     outcome = await maybe_compact_history(
@@ -379,7 +413,7 @@ async def _run_query(
     )
 
 
-async def _run_interactive_session(
+def _build_session(
     *,
     coding_agent: CodingAgent,
     prompt_builder: PromptBuilder,
@@ -388,18 +422,22 @@ async def _run_interactive_session(
     disabled_tools: list[str],
     debug_logger: DebugLogger,
     config,
-    first_input: str | None = None,
-) -> None:
-    """Run the main interactive session loop."""
-    available_tools = await server.list_tools()
+    available_tools: list,
+) -> tuple[CommandContext, Any]:
+    """Build the agent's per-session state, shared by interactive and print modes.
+
+    Wires the tool router / filtering toolset, the permission capability, the
+    `CommandContext`, the system prompt, and rebuilds the pydantic agent. The
+    `coding_agent` is mutated in place (toolsets / capabilities / system_prompt)
+    exactly as the interactive path did inline. Returns `(context, pydantic_agent)`.
+
+    `available_tools` is passed in so the caller lists tools once; this helper
+    does no I/O. `on_model_switch` is deliberately NOT built here — it uses
+    `nonlocal pydantic_agent` and must live in the caller's frame so the closure
+    rebinds the caller's local, not this helper's.
+    """
     max_retries = config.agent.max_retries
     ask_tool_permission = config.agent.ask_tool_permission
-
-    debug_logger.log_session_start(
-        model=coding_agent.model_str,
-        base_url=coding_agent.base_url,
-        max_steps=coding_agent.max_steps,
-    )
 
     tool_router = None
     filtering_toolset = None
@@ -516,6 +554,41 @@ async def _run_interactive_session(
     coding_agent.rebuild_pydantic_agent()
     pydantic_agent = coding_agent.pydantic_agent
 
+    return context, pydantic_agent
+
+
+async def _run_interactive_session(
+    *,
+    coding_agent: CodingAgent,
+    prompt_builder: PromptBuilder,
+    server,
+    root_directory: str,
+    disabled_tools: list[str],
+    debug_logger: DebugLogger,
+    config,
+    first_input: str | None = None,
+) -> None:
+    """Run the main interactive session loop."""
+    available_tools = await server.list_tools()
+    debug_logger.log_session_start(
+        model=coding_agent.model_str,
+        base_url=coding_agent.base_url,
+        max_steps=coding_agent.max_steps,
+    )
+
+    context, pydantic_agent = _build_session(
+        coding_agent=coding_agent,
+        prompt_builder=prompt_builder,
+        server=server,
+        root_directory=root_directory,
+        disabled_tools=disabled_tools,
+        debug_logger=debug_logger,
+        config=config,
+        available_tools=available_tools,
+    )
+
+    # `on_model_switch` lives here (not in `_build_session`) so its
+    # `nonlocal pydantic_agent` rebinds this frame's local on /model.
     def on_model_switch(new_model: str) -> None:
         nonlocal pydantic_agent
         coding_agent.model_str = new_model
@@ -621,44 +694,21 @@ async def _run_interactive_session(
             _handle_generic_error(e, debug_logger)
 
 
-async def run_interactive(
-    root_directory: str,
-    model: str,
-    base_url: Optional[str] = None,
-    max_steps: int = 10,
-    disabled_tools: list[str] | None = None,
-) -> None:
-    """Entry point for the agent CLI.
+@asynccontextmanager
+async def _serve_mcp(disabled_tools: list[str] | None, config):
+    """Run the MCP server in a background task; yield it once ready.
 
-    Args:
-        root_directory: Absolute path to the project root.
-        model: Model identifier string.
-        base_url: Optional base URL for OpenAI-compatible API.
-        max_steps: Maximum number of tool calls per query.
-        disabled_tools: Optional list of tool names to disable.
+    Owns the server-task / shutdown-event / cleanup lifecycle so both
+    `run_interactive` and `run_once` share one correct teardown:
+    - any startup error is re-raised *before* the server is yielded;
+    - the `finally` cancels the task even if the `async with` body raises,
+      so a model error in `run_once` never leaks the server task.
     """
-    from .input_prompt import create_prompt_session, get_user_input_async
-
-    config = load_config()
-
-    coding_agent = CodingAgent(
-        model=model,
-        base_url=base_url,
-        max_steps=max_steps,
-        settings_provider=lambda: get_config().model.generation,
-    )
-    prompt_builder = PromptBuilder(
-        include_tool_instructions=False,
-        use_config_for_tool_instructions=True,
-    )
-
-    debug_logger = create_debug_logger(root_directory, debug=config.agent.debug)
-    daemon_started = start_daemon_async()
-
     server = create_mcp_server(
         disabled_tools=disabled_tools,
         timeout=config.agent.mcp_server_timeout,
         max_retries=config.agent.max_retries,
+        tool_timeout=config.agent.tool_timeout,
     )
 
     server_ready = asyncio.Event()
@@ -680,37 +730,8 @@ async def run_interactive(
     if server_error[0] is not None:
         raise server_error[0]
 
-    available_tools = await server.list_tools()
-    print_welcome(
-        root_directory,
-        coding_agent.max_steps,
-        tool_count=len(available_tools),
-        model_name=coding_agent.model_str,
-        base_url=coding_agent.base_url,
-    )
-    _show_debug_notification(
-        debug_logger, config.agent.debug, config.agent.ask_tool_permission
-    )
-
-    prompt_session = create_prompt_session(lambda: root_directory)
-    first_input = await get_user_input_async(prompt_session)
-
     try:
-        await _run_interactive_session(
-            coding_agent=coding_agent,
-            prompt_builder=prompt_builder,
-            server=server,
-            root_directory=root_directory,
-            disabled_tools=disabled_tools or [],
-            debug_logger=debug_logger,
-            config=config,
-            first_input=first_input,
-        )
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        pass
-    except BaseException as e:
-        debug_logger.log_error(e, context="Session terminated")
-        print_fatal_error(e, show_traceback=True)
+        yield server
     finally:
         shutdown_event.set()
         try:
@@ -721,6 +742,79 @@ async def run_interactive(
                 await server_task
             except asyncio.CancelledError:
                 pass
+
+
+async def run_interactive(
+    root_directory: str,
+    model: str,
+    base_url: Optional[str] = None,
+    max_steps: int = 10,
+    disabled_tools: list[str] | None = None,
+    start_daemon: bool = True,
+) -> None:
+    """Entry point for the agent CLI.
+
+    Args:
+        root_directory: Absolute path to the project root.
+        model: Model identifier string.
+        base_url: Optional base URL for OpenAI-compatible API.
+        max_steps: Maximum number of tool calls per query.
+        disabled_tools: Optional list of tool names to disable.
+        start_daemon: Whether to auto-start the daemon (gated by
+            `daemon_enabled` upstream).
+    """
+    from .input_prompt import create_prompt_session, get_user_input_async
+
+    config = load_config()
+
+    coding_agent = CodingAgent(
+        model=model,
+        base_url=base_url,
+        max_steps=max_steps,
+        settings_provider=lambda: get_config().model.generation,
+    )
+    prompt_builder = PromptBuilder(
+        include_tool_instructions=False,
+        use_config_for_tool_instructions=True,
+    )
+
+    debug_logger = create_debug_logger(root_directory, debug=config.agent.debug)
+    daemon_started = start_daemon_async() if start_daemon else False
+
+    try:
+        async with _serve_mcp(disabled_tools, config) as server:
+            available_tools = await server.list_tools()
+            print_welcome(
+                root_directory,
+                coding_agent.max_steps,
+                tool_count=len(available_tools),
+                model_name=coding_agent.model_str,
+                base_url=coding_agent.base_url,
+            )
+            _show_debug_notification(
+                debug_logger, config.agent.debug, config.agent.ask_tool_permission
+            )
+
+            prompt_session = create_prompt_session(lambda: root_directory)
+            first_input = await get_user_input_async(prompt_session)
+
+            try:
+                await _run_interactive_session(
+                    coding_agent=coding_agent,
+                    prompt_builder=prompt_builder,
+                    server=server,
+                    root_directory=root_directory,
+                    disabled_tools=disabled_tools or [],
+                    debug_logger=debug_logger,
+                    config=config,
+                    first_input=first_input,
+                )
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                pass
+            except BaseException as e:
+                debug_logger.log_error(e, context="Session terminated")
+                print_fatal_error(e, show_traceback=True)
+    finally:
         debug_logger.close()
         print_goodbye()
         if daemon_started:
@@ -728,5 +822,110 @@ async def run_interactive(
                 stop_daemon()
             except KeyboardInterrupt:
                 pass
+
+
+async def run_once(
+    root_directory: str,
+    model: str,
+    base_url: Optional[str] = None,
+    max_steps: int = 10,
+    prompt: str = "",
+    *,
+    disabled_tools: list[str] | None = None,
+    start_daemon: bool = True,
+) -> int:
+    """Run a single prompt non-interactively, stream the answer, and exit.
+
+    The `coden -a -p` path. Reuses the interactive turn machinery
+    (`_serve_mcp`, `_build_session`, `_run_executor`) but renders to plain
+    stdout instead of a Rich `Live` region, auto-allows tools (no picker —
+    there's no TTY in a pipe), and keeps the daemon running for the next call.
+
+    Returns the process exit code: 0 on a produced answer, 1 otherwise.
+    """
+    # The cached singleton is the object the permission gate
+    # (`_coden_is_permission_enabled`) reads via `get_config()`. Mutating it
+    # here is what actually disables the picker; a fresh `load_config()` copy
+    # would not be observed by the gate. Process-local, never persisted.
+    config = get_config()
+    config.agent.ask_tool_permission = False
+
+    coding_agent = CodingAgent(
+        model=model,
+        base_url=base_url,
+        max_steps=max_steps,
+        settings_provider=lambda: get_config().model.generation,
+    )
+    prompt_builder = PromptBuilder(
+        include_tool_instructions=False,
+        use_config_for_tool_instructions=True,
+    )
+    debug_logger = create_debug_logger(root_directory, debug=config.agent.debug)
+
+    # Gated by daemon_enabled upstream; never stopped here so repeated `-p`
+    # calls reuse the warm daemon.
+    if start_daemon:
+        start_daemon_async()
+
+    # Tool filtering is skipped: it prints to the Rich console (would pollute
+    # stdout) and is an interactive-latency optimization only.
+    writer = StdoutStreamWriter()
+    tool_reporter = StderrToolReporter()
+    try:
+        try:
+            async with _serve_mcp(disabled_tools, config) as server:
+                available_tools = await server.list_tools()
+                context, pydantic_agent = _build_session(
+                    coding_agent=coding_agent,
+                    prompt_builder=prompt_builder,
+                    server=server,
+                    root_directory=root_directory,
+                    disabled_tools=disabled_tools or [],
+                    debug_logger=debug_logger,
+                    config=config,
+                    available_tools=available_tools,
+                )
+
+                built = build_query_prompt(
+                    prompt,
+                    root_directory,
+                    get_mode_from_context(context),
+                    context.study_topic,
+                )
+                response = await _run_executor(
+                    coding_agent=coding_agent,
+                    pydantic_agent=pydantic_agent,
+                    prompt=built,
+                    debug_logger=debug_logger,
+                    message_history=[],
+                    callbacks=build_event_callbacks(
+                        on_text=writer.on_text,
+                        on_tool_call=tool_reporter.on_tool_call,
+                        on_tool_result=tool_reporter.on_tool_result,
+                    ),
+                )
+        except Exception as exc:
+            # A model/network error (or an empty agent run) propagates out of
+            # the executor. A one-shot CLI must not surface a raw traceback:
+            # terminate any half-streamed line, report on stderr, exit non-zero.
+            # KeyboardInterrupt is BaseException, so Ctrl-C still propagates.
+            if writer.wrote_any:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            print(f"Agent run failed: {exc}", file=sys.stderr)
+            return 1
+
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+        if response.answer:
+            return 0
+        if response.reached_max_steps:
+            print("Reached max steps before producing an answer.", file=sys.stderr)
+        else:
+            print("No response text generated.", file=sys.stderr)
+        return 1
+    finally:
+        debug_logger.close()
 
 
