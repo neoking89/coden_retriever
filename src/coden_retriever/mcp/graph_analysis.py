@@ -22,6 +22,7 @@ from pydantic import Field
 from ..cache import CacheManager
 from ..constants import MAX_TOKEN_LIMIT, MIN_TOKEN_LIMIT
 from ._defaults import RESOLVED_DEFAULT_TOKEN_BUDGET
+from ..config_loader import daemon_enabled
 from ..daemon.client import try_daemon_graph_analysis as _daemon_graph_analysis
 from ..daemon.protocol import GraphAnalysisParams
 from .validation import validate_root_directory
@@ -132,7 +133,9 @@ async def change_impact_radius(
         min_importance=min_importance,
         token_limit=token_limit,
     )
-    daemon_result = _daemon_graph_analysis("change_impact_radius", daemon_params, auto_start=False)
+    daemon_result = None
+    if daemon_enabled():
+        daemon_result = _daemon_graph_analysis("change_impact_radius", daemon_params, auto_start=False)
     if daemon_result is not None:
         return daemon_result
 
@@ -279,7 +282,9 @@ async def coupling_hotspots(
         exclude_private=exclude_private,
         token_limit=token_limit,
     )
-    daemon_result = _daemon_graph_analysis("coupling_hotspots", daemon_params, auto_start=False)
+    daemon_result = None
+    if daemon_enabled():
+        daemon_result = _daemon_graph_analysis("coupling_hotspots", daemon_params, auto_start=False)
     if daemon_result is not None:
         return daemon_result
 
@@ -357,7 +362,9 @@ async def architectural_bottlenecks(
         exclude_tests=exclude_tests,
         token_limit=token_limit,
     )
-    daemon_result = _daemon_graph_analysis("architectural_bottlenecks", daemon_params, auto_start=False)
+    daemon_result = None
+    if daemon_enabled():
+        daemon_result = _daemon_graph_analysis("architectural_bottlenecks", daemon_params, auto_start=False)
     if daemon_result is not None:
         return daemon_result
 

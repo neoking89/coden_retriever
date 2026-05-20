@@ -7,7 +7,7 @@ from pathlib import Path
 
 from ...cache import CacheManager
 from ...config import MapMode, OutputFormat
-from ...config_loader import get_semantic_model_path
+from ...config_loader import daemon_enabled, get_semantic_model_path
 from ...constants import OUTPUT_SEPARATOR_WIDTH
 from ...daemon.client import try_daemon_search
 from ...daemon.protocol import SearchParams
@@ -188,6 +188,8 @@ def handle_search_command(args: argparse.Namespace, config) -> int:
         verbose=args.verbose,
     )
 
+    daemon_on = daemon_enabled(args)
+
     # Strategies that opt out of the daemon (currently `--map-mode simple`)
     # run a direct fallback. SIMPLE does parsing plus a bounded git-history
     # probe without the graph/centrality build; routing through the daemon
@@ -196,7 +198,7 @@ def handle_search_command(args: argparse.Namespace, config) -> int:
     # cache=None so the pipeline constructs a CacheManager with the
     # strategy's layout (the static-layout one built above is for the daemon
     # path).
-    if strategy_for(MapMode(args.map_mode)).bypasses_daemon:
+    if strategy_for(MapMode(args.map_mode)).bypasses_daemon or not daemon_on:
         return run_direct_search(args, root_path, cache=None)
 
     params = SearchParams(
@@ -215,7 +217,9 @@ def handle_search_command(args: argparse.Namespace, config) -> int:
         reverse=args.reverse,
         map_mode=args.map_mode,
     )
-    daemon_result = try_daemon_search(params, address=config.daemon.address)
+    daemon_result = try_daemon_search(
+        params, address=config.daemon.address, auto_start=daemon_on
+    )
 
     if daemon_result is not None:
         print_semantic_status(

@@ -19,8 +19,8 @@ _WARNING_SENTINEL = "is not yet supported"
 
 def supported_languages() -> tuple[str, ...]:
     """Names of adapters intended for end-user use, in registry order."""
-    from .runner import _ADAPTERS
-    return tuple(name for name in _ADAPTERS if name not in _INTERNAL_LANGUAGES)
+    from .runner import _ADAPTER_FACTORIES
+    return tuple(name for name in _ADAPTER_FACTORIES if name not in _INTERNAL_LANGUAGES)
 
 
 def unsupported_language_message(detected: str) -> str:

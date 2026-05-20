@@ -34,6 +34,7 @@ from ..constants import (
 )
 from ._defaults import RESOLVED_DEFAULT_TOKEN_BUDGET
 from .validation import validate_root_directory
+from ..config_loader import daemon_enabled
 from ..daemon.client import try_daemon_propagation_cost as _daemon_propagation_cost
 from ..daemon.protocol import PropagationCostParams
 from ..token_estimator import count_tokens
@@ -508,7 +509,9 @@ async def propagation_cost(
         token_limit=token_limit,
         approximate=approximate,
     )
-    daemon_result = _daemon_propagation_cost(daemon_params, auto_start=False)
+    daemon_result = None
+    if daemon_enabled():
+        daemon_result = _daemon_propagation_cost(daemon_params, auto_start=False)
     if daemon_result is not None:
         return daemon_result
 

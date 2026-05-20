@@ -7,7 +7,7 @@ import traceback
 from pathlib import Path
 
 from ...cli_metrics_contract import apply_defensive_limit, print_metric_output
-from ...config_loader import AppConfig
+from ...config_loader import AppConfig, daemon_enabled
 from ...daemon.client import try_daemon_sensitive_values
 from ...daemon.protocol import SensitiveValueParams
 from ...formatters import SensitiveValueFormatter
@@ -101,7 +101,9 @@ def handle_sensitive_values_command(
         whitelist=whitelist,
     )
 
-    daemon_result = try_daemon_sensitive_values(params, address=config.daemon.address)
+    daemon_result = None
+    if daemon_enabled(args):
+        daemon_result = try_daemon_sensitive_values(params, address=config.daemon.address)
     if daemon_result is not None:
         return _process_sensitive_value_result(daemon_result, formatter, args, start_time, "Daemon")
 

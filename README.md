@@ -250,6 +250,8 @@ coden cache clear        # Clear caches for the current directory
 coden cache clear --all  # Clear everything
 ```
 
+**Skip the daemon for a single invocation** with `--no-daemon` on `coden <root> -q ...`, `coden flag add`, or `coden flag clear`. The flag forces the in-process direct path without stopping a running daemon. For a process-wide switch, set `daemon.auto_start = false` in the config or export `CODEN_RETRIEVER_DAEMON_AUTO_START=false`; both CLI and MCP surfaces then honor it. Precedence is `--no-daemon` > env var > config > default (daemon on).
+
 ---
 
 ## Configuration
@@ -289,6 +291,7 @@ coden config set search.default_limit 50
 | `CODEN_RETRIEVER_MODEL` | Default model |
 | `CODEN_RETRIEVER_BASE_URL` | Base URL |
 | `CODEN_RETRIEVER_DAEMON_PORT` / `_HOST` | Daemon address |
+| `CODEN_RETRIEVER_DAEMON_AUTO_START` | `false` / `0` / `no` disables the daemon for CLI and MCP; the in-process direct path is used instead. Default `true`. |
 | `CODEN_RETRIEVER_MODEL_PATH` | Semantic model path |
 | `CODEN_RETRIEVER_MCP_TIMEOUT` | MCP timeout |
 | `CODEN_RETRIEVER_ENABLE_DYNAMIC_TOOLS` | Enable dynamic tools (`1`, `true`, `yes`) |

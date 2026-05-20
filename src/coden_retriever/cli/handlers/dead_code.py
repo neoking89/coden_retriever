@@ -7,7 +7,7 @@ import traceback
 from pathlib import Path
 
 from ...cli_metrics_contract import apply_defensive_limit, print_metric_output
-from ...config_loader import AppConfig
+from ...config_loader import AppConfig, daemon_enabled
 from ...daemon.client import try_daemon_dead_code
 from ...daemon.protocol import DeadCodeParams
 from ...formatters import DeadCodeFormatter
@@ -110,7 +110,9 @@ def handle_dead_code_command(
         token_limit=args.tokens,
     )
 
-    daemon_result = try_daemon_dead_code(params, address=config.daemon.address)
+    daemon_result = None
+    if daemon_enabled(args):
+        daemon_result = try_daemon_dead_code(params, address=config.daemon.address)
     if daemon_result is not None:
         return _process_dead_code_result(daemon_result, formatter, args, start_time, "Daemon")
 

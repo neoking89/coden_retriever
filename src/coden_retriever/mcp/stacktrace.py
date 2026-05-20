@@ -18,6 +18,7 @@ from typing import Annotated, Any
 from pydantic import Field
 
 from ..cache import CacheManager
+from ..config_loader import daemon_enabled
 from ..daemon.client import try_daemon_stacktrace as _daemon_stacktrace
 from ..daemon.protocol import StacktraceParams
 from ..search import SearchEngine
@@ -265,7 +266,9 @@ async def debug_stacktrace(
         context_lines=max_context_lines,
         show_dependencies=include_dependencies,
     )
-    daemon_result = _daemon_stacktrace(daemon_params, auto_start=False)
+    daemon_result = None
+    if daemon_enabled():
+        daemon_result = _daemon_stacktrace(daemon_params, auto_start=False)
     if daemon_result is not None:
         return daemon_result
 

@@ -5,20 +5,10 @@ import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from ...language import LANGUAGE_MAP, language_for_path
 from ...utils.source_walker import iter_source_files, path_hits_excludes
-from ..adapters._stub import StubAdapter
-from ..adapters.csharp import CSharpAdapter
-from ..adapters.go import GoAdapter
-from ..adapters.java import JavaAdapter
-from ..adapters.javascript import JavaScriptAdapter
-from ..adapters.kotlin import KotlinAdapter
-from ..adapters.php import PhpAdapter
-from ..adapters.python import PythonAdapter
-from ..adapters.rust import RustAdapter
-from ..adapters.scala import ScalaAdapter
-from ..adapters.typescript import TypeScriptAdapter
 from .files import OversizedFile, find_oversized_files
 from .messages import multi_module_warning_text, unsupported_language_message
 from .graph import (
@@ -37,6 +27,95 @@ from .metrics import (
     find_shallow_packages,
 )
 from .protocol import FileAnalysis, LanguageAdapter, PackageFacade
+
+
+def _make_python() -> LanguageAdapter:
+    from ..adapters.python import PythonAdapter
+    return PythonAdapter()
+
+
+def _make_javascript() -> LanguageAdapter:
+    from ..adapters.javascript import JavaScriptAdapter
+    return JavaScriptAdapter()
+
+
+def _make_typescript() -> LanguageAdapter:
+    from ..adapters.typescript import TypeScriptAdapter
+    return TypeScriptAdapter()
+
+
+def _make_csharp() -> LanguageAdapter:
+    from ..adapters.csharp import CSharpAdapter
+    return CSharpAdapter()
+
+
+def _make_go() -> LanguageAdapter:
+    from ..adapters.go import GoAdapter
+    return GoAdapter()
+
+
+def _make_java() -> LanguageAdapter:
+    from ..adapters.java import JavaAdapter
+    return JavaAdapter()
+
+
+def _make_kotlin() -> LanguageAdapter:
+    from ..adapters.kotlin import KotlinAdapter
+    return KotlinAdapter()
+
+
+def _make_php() -> LanguageAdapter:
+    from ..adapters.php import PhpAdapter
+    return PhpAdapter()
+
+
+def _make_rust() -> LanguageAdapter:
+    from ..adapters.rust import RustAdapter
+    return RustAdapter()
+
+
+def _make_scala() -> LanguageAdapter:
+    from ..adapters.scala import ScalaAdapter
+    return ScalaAdapter()
+
+
+def _make_stub() -> LanguageAdapter:
+    from ..adapters._stub import StubAdapter
+    return StubAdapter()
+
+
+_ADAPTER_FACTORIES: dict[str, Callable[[], LanguageAdapter]] = {
+    "python": _make_python,
+    "javascript": _make_javascript,
+    "typescript": _make_typescript,
+    "c_sharp": _make_csharp,
+    "go": _make_go,
+    "java": _make_java,
+    "kotlin": _make_kotlin,
+    "php": _make_php,
+    "rust": _make_rust,
+    "scala": _make_scala,
+    "stub": _make_stub,
+}
+
+# Per-language singleton cache: adapter instances are reused across run_audit
+# calls so the layout / parser / failed-grammars caches that live on the
+# adapter instance survive between invocations (same guarantee as the old
+# module-level _ADAPTERS dict).
+_ADAPTER_CACHE: dict[str, LanguageAdapter] = {}
+
+
+def _get_adapter(lang: str) -> LanguageAdapter | None:
+    """Resolve a language adapter, building + caching it on first request."""
+    cached = _ADAPTER_CACHE.get(lang)
+    if cached is not None:
+        return cached
+    factory = _ADAPTER_FACTORIES.get(lang)
+    if factory is None:
+        return None
+    instance = factory()
+    _ADAPTER_CACHE[lang] = instance
+    return instance
 
 
 @dataclass(frozen=True)
@@ -64,21 +143,6 @@ class Report:
     n_modules: int = 0
 
 
-_ADAPTERS: dict[str, LanguageAdapter] = {
-    "python": PythonAdapter(),
-    "javascript": JavaScriptAdapter(),
-    "typescript": TypeScriptAdapter(),
-    "c_sharp": CSharpAdapter(),
-    "go": GoAdapter(),
-    "java": JavaAdapter(),
-    "kotlin": KotlinAdapter(),
-    "php": PhpAdapter(),
-    "rust": RustAdapter(),
-    "scala": ScalaAdapter(),
-    "stub": StubAdapter(),
-}
-
-
 def run_audit(
     root: Path,
     lang: str | None,
@@ -91,14 +155,14 @@ def run_audit(
     language) — the handler should print `error_message` to stderr and exit 0.
     """
     if lang is not None:
-        adapter = _ADAPTERS.get(lang)
+        adapter = _get_adapter(lang)
         if adapter is None:
             return None, unsupported_language_message(lang)
     else:
         detected = _detect_language(root)
         if detected is None:
             return None, "no source files detected under given path"
-        adapter = _ADAPTERS.get(detected)
+        adapter = _get_adapter(detected)
         if adapter is None:
             return None, unsupported_language_message(detected)
 

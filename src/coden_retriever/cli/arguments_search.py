@@ -159,6 +159,8 @@ def add_flag_arguments(parser: argparse.ArgumentParser, config: AppConfig) -> No
                         help="Show summary statistics")
     parser.add_argument("-n", "--limit", type=int, default=config.search.default_limit,
                         help="Limit results (default: 20, use -n -1 for all; dry-run preview only)")
+    parser.add_argument("--no-daemon", dest="no_daemon", action="store_true",
+                        help="Skip the daemon for this invocation; use the in-process direct path.")
 
 
 def create_search_parser(config: AppConfig) -> argparse.ArgumentParser:
@@ -185,6 +187,8 @@ def create_search_parser(config: AppConfig) -> argparse.ArgumentParser:
     search.add_argument("--find", metavar="IDENT", help="Find specific identifier")
     search.add_argument("-s", "--semantic", dest="enable_semantic", action="store_true",
                         help="Enable semantic search (bundled MiniLM ONNX)")
+    search.add_argument("--no-daemon", dest="no_daemon", action="store_true",
+                        help="Skip the daemon for this invocation; use the in-process direct path.")
 
     analysis = parser.add_argument_group("Code Analysis")
     analysis.add_argument("-H", "--hotspots", action="store_true",

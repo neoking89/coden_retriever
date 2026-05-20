@@ -17,6 +17,7 @@ from ..constants import MAX_TOKEN_LIMIT, MIN_TOKEN_LIMIT
 from ._defaults import RESOLVED_DEFAULT_TOKEN_BUDGET
 from .validation import validate_root_directory
 from ..config import MapMode, OutputFormat
+from ..config_loader import daemon_enabled
 from ..daemon.client import try_daemon_search as _daemon_search, try_daemon_trace_dependency as _daemon_trace_dependency
 from ..daemon.protocol import SearchParams, TraceDependencyParams
 from ..formatters import get_formatter
@@ -110,7 +111,9 @@ async def _code_search_impl(
             dir_tree=show_tree,
             stats=True,
         )
-        daemon_result = await asyncio.to_thread(_daemon_search, params, auto_start=False)
+        daemon_result = None
+        if daemon_enabled():
+            daemon_result = await asyncio.to_thread(_daemon_search, params, auto_start=False)
 
         if daemon_result is not None:
             # Daemon returned results - reformat for MCP response
@@ -333,7 +336,9 @@ async def code_map(
             stats=True,
             map_mode=map_mode.value,
         )
-        daemon_result = await asyncio.to_thread(_daemon_search, params, auto_start=False)
+        daemon_result = None
+        if daemon_enabled():
+            daemon_result = await asyncio.to_thread(_daemon_search, params, auto_start=False)
 
         if daemon_result is not None:
             # Daemon returned results - reformat for MCP response
@@ -466,7 +471,9 @@ async def find_identifier(
             dir_tree=show_tree,
             stats=True,
         )
-        daemon_result = await asyncio.to_thread(_daemon_search, params, auto_start=False)
+        daemon_result = None
+        if daemon_enabled():
+            daemon_result = await asyncio.to_thread(_daemon_search, params, auto_start=False)
 
         if daemon_result is not None:
             # Daemon returned results - return formatted output
@@ -720,7 +727,9 @@ async def trace_dependency_path(
         max_depth=max_depth,
         limit_paths=limit_paths,
     )
-    daemon_result = _daemon_trace_dependency(daemon_params, auto_start=False)
+    daemon_result = None
+    if daemon_enabled():
+        daemon_result = _daemon_trace_dependency(daemon_params, auto_start=False)
     if daemon_result is not None:
         return daemon_result
 

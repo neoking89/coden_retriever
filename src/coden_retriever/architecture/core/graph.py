@@ -3,8 +3,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-
-import networkx as nx
+from typing import TYPE_CHECKING
 
 from .constants import (
     KITCHEN_SINK_FANOUT,
@@ -12,6 +11,9 @@ from .constants import (
     KITCHEN_SINK_LOC,
 )
 from .protocol import FileAnalysis
+
+if TYPE_CHECKING:
+    import networkx as nx
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,7 @@ def build_package_graph(file_analyses: list[FileAnalysis]) -> nx.DiGraph:
     appears as a cycle in this graph; the workaround count attached to each
     `Cycle` tells the user how many of its edges are lazy.
     """
+    import networkx as nx
     graph: nx.DiGraph = nx.DiGraph()
     for fa in file_analyses:
         if fa.package is None:
@@ -65,6 +68,7 @@ def find_cycles(
     for entangled groups (a 5-node SCC has 84 simple cycles but only one
     real entanglement). Each SCC = one architectural problem to fix.
     """
+    import networkx as nx
     cycles: list[Cycle] = []
     for scc in nx.strongly_connected_components(graph):
         if len(scc) <= 1:

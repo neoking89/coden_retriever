@@ -405,11 +405,7 @@ Code intelligence server with tools for working with codebases.
 
 Use tools to get real information - never make up code or file contents.
 Each tool's description explains when to use it.
-All paths must be absolute.
-
-Debugging workflow: to set breakpoints by function name, use find_identifier to resolve
-the name to a line number, then pass that line to debug_breakpoint.
-On program termination, check breakpoint_summary to see which breakpoints were hit or missed."""
+All paths must be absolute."""
 
 # =============================================================================
 # Architecture Analysis Thresholds (MacCormack et al., 2006)

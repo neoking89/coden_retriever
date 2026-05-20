@@ -6,6 +6,7 @@ import time
 import traceback
 from pathlib import Path
 
+from ...config_loader import daemon_enabled
 from ...constants import MILLISECONDS_PER_SECOND
 from ...daemon.client import try_daemon_flag, try_daemon_flag_clear
 from ...daemon.protocol import FlagClearParams
@@ -51,7 +52,9 @@ def handle_flag_command(args: argparse.Namespace, root_path: Path, config) -> in
 
     params = build_flag_params(args, root_path)
 
-    daemon_result = try_daemon_flag(params, address=config.daemon.address)
+    daemon_result = None
+    if daemon_enabled(args):
+        daemon_result = try_daemon_flag(params, address=config.daemon.address)
     if daemon_result is not None:
         return process_flag_result(daemon_result, args, formatter, start_time, "Daemon mode")
 
@@ -101,7 +104,9 @@ def handle_flag_clear_command(args: argparse.Namespace, root_path: Path, config)
         verbose=args.verbose,
     )
 
-    daemon_result = try_daemon_flag_clear(params, address=config.daemon.address)
+    daemon_result = None
+    if daemon_enabled(args):
+        daemon_result = try_daemon_flag_clear(params, address=config.daemon.address)
 
     if daemon_result is not None:
         if "error" in daemon_result:

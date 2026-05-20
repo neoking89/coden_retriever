@@ -34,7 +34,7 @@ from ..clone import (
     detect_clones_semantic,
     detect_clones_syntactic,
 )
-from ..config_loader import get_semantic_model_path
+from ..config_loader import get_semantic_model_path, daemon_enabled
 from ..daemon.client import try_daemon_clones as _daemon_clones
 from ..daemon.protocol import CloneDetectionParams
 from .validation import validate_root_directory
@@ -148,7 +148,9 @@ async def detect_clones(
         semantic_weight=semantic_weight,
         syntactic_weight=syntactic_weight,
     )
-    daemon_result = _daemon_clones(daemon_params, auto_start=False)
+    daemon_result = None
+    if daemon_enabled():
+        daemon_result = _daemon_clones(daemon_params, auto_start=False)
     if daemon_result is not None:
         return daemon_result
 

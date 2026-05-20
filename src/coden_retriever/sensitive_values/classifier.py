@@ -13,6 +13,7 @@ import importlib
 import logging
 import warnings
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -21,14 +22,19 @@ from ..constants import SENSITIVE_VALUE_CLASSIFIER_REGULARIZATION
 from . import features as _features_mod
 from . import golden_data as _golden_data_mod
 
-# sklearn imported at module level — importing inside asyncio.to_thread
-# on Windows causes DLL loader deadlocks in the MCP server subprocess
-from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVC
+if TYPE_CHECKING:
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.svm import SVC
 
 logger = logging.getLogger(__name__)
 
-# Module-level singleton state for lazy initialization
+# Module-level singleton state for lazy initialization.
+# sklearn is imported inside _ensure_trained() (not at module top) so MCP
+# server startup doesn't pay ~3s + drag onnxruntime/numpy dependencies.
+# `mcp/sensitive_values.py::detect_sensitive_values_tool` calls the public
+# `ensure_trained()` wrapper on the main event loop BEFORE dispatching to
+# asyncio.to_thread, preserving the Windows DLL-load-must-be-main-thread
+# guarantee that the previous module-top import enforced.
 _model: SVC | None = None
 _scaler: StandardScaler | None = None
 
@@ -81,6 +87,9 @@ def _ensure_trained() -> bool:
     if sources_changed and _model is not None:
         _reload_source_modules()
 
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.svm import SVC
+
     all_values = (
         list(_golden_data_mod.SENSITIVE_VALUES)
         + list(_golden_data_mod.SAFE_VALUES)
@@ -107,6 +116,14 @@ def _ensure_trained() -> bool:
         _model.fit(features_scaled, labels)
 
     return True
+
+
+def ensure_trained() -> bool:
+    """Public prewarm wrapper. Call from the main event loop before any
+    thread/worker uses classify_value/classify_batch — on Windows, first
+    sklearn DLL load inside asyncio.to_thread deadlocks the MCP subprocess.
+    """
+    return _ensure_trained()
 
 
 def classify_value(text: str) -> float:

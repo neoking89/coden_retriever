@@ -312,6 +312,7 @@ def _build_runtime_values(
         "port": str(config.daemon.port),
         "daemon_timeout": str(config.daemon.daemon_timeout),
         "max_projects": str(config.daemon.max_projects),
+        "auto_start": str(config.daemon.auto_start).lower(),
         "default_tokens": str(config.search.default_tokens),
         "default_limit": str(config.search.default_limit),
         "semantic_model_path": semantic_display,

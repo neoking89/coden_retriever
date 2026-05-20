@@ -11,15 +11,12 @@ from `.agent._constants`), causing an `ImportError: cannot import name
 import importlib
 from typing import Any
 
-from .models import (
-    Action,
-    AgentResponse,
-    Observation,
-    ReActStep,
-    Thought,
-)
-
 _LAZY_ATTRS: dict[str, str] = {
+    "Action": ".models",
+    "AgentResponse": ".models",
+    "Observation": ".models",
+    "ReActStep": ".models",
+    "Thought": ".models",
     "CodingAgent": ".coding_agent",
     "run_interactive": ".coden_session",
     "print_steps": ".rich_console",

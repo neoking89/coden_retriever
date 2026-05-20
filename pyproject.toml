@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "coden-retriever"
-version = "2.1.1"
+version = "2.2.0"
 description = "Retriever for finding most relevant code"
 readme = "README.md"
 requires-python = ">=3.10, <3.13"
@@ -26,7 +26,7 @@ dependencies = [
     "onnxruntime>=1.16.0",
     "scipy>=1.10.0",
     "fastmcp>=3.0",
-    "pydantic-ai-slim[mcp,openai]>=0.1.0",
+    "pydantic-ai-slim[mcp,openai]>=1.71.0",
 ]
 
 [tool.setuptools.packages.find]

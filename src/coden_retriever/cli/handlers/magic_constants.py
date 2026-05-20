@@ -7,7 +7,7 @@ import traceback
 from pathlib import Path
 
 from ...cli_metrics_contract import apply_defensive_limit, print_metric_output
-from ...config_loader import AppConfig
+from ...config_loader import AppConfig, daemon_enabled
 from ...constants import MAGIC_CONSTANT_DEFAULT_RESULT_LIMIT, MAGIC_CONSTANT_MAX_RESULTS
 from ...daemon.client import try_daemon_magic_constants
 from ...daemon.protocol import MagicConstantParams
@@ -132,9 +132,11 @@ def handle_magic_constants_command(
         exclude_tests=True,
     )
 
-    daemon_result = try_daemon_magic_constants(
-        params, address=config.daemon.address,
-    )
+    daemon_result = None
+    if daemon_enabled(args):
+        daemon_result = try_daemon_magic_constants(
+            params, address=config.daemon.address,
+        )
     if daemon_result is not None:
         return _process_result(daemon_result, formatter, args, start_time, "Daemon")
 

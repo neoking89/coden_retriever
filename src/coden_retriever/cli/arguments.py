@@ -40,6 +40,8 @@ def create_agent_parser(config) -> argparse.ArgumentParser:
                         help="Max tool calls per query")
     parser.add_argument("--mcp-timeout", type=float, default=config.agent.mcp_server_timeout,
                         help="MCP server startup timeout (seconds)")
+    parser.add_argument("--config", type=str, default=None, metavar="PATH",
+                        help="Path to custom config JSON. Create via `coden config new <path>`.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose logging")
     return parser
 
@@ -155,5 +157,7 @@ def create_flag_parser(config) -> argparse.ArgumentParser:
                               help="Reverse output order")
     clear_parser.add_argument("--stats", action="store_true",
                               help="Show summary statistics")
+    clear_parser.add_argument("--no-daemon", dest="no_daemon", action="store_true",
+                              help="Skip the daemon for this invocation; use the in-process direct path.")
 
     return parser

@@ -7,7 +7,7 @@ import traceback
 from pathlib import Path
 
 from ...cli_metrics_contract import apply_defensive_limit, print_metric_output
-from ...config_loader import AppConfig
+from ...config_loader import AppConfig, daemon_enabled
 from ...daemon.client import try_daemon_tramp_data
 from ...daemon.protocol import TrampDataParams
 from ...formatters import TrampDataFormatter
@@ -109,7 +109,9 @@ def handle_tramp_data_command(
         min_group_size=args.min_group_size,
     )
 
-    daemon_result = try_daemon_tramp_data(params, address=config.daemon.address)
+    daemon_result = None
+    if daemon_enabled(args):
+        daemon_result = try_daemon_tramp_data(params, address=config.daemon.address)
     if daemon_result is not None:
         return _process_tramp_data_result(daemon_result, formatter, args, start_time, "Daemon")
 

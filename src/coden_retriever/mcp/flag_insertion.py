@@ -1185,6 +1185,7 @@ def register_flag_tools(mcp, disabled_tools: set[str] | None = None) -> None:
             When remove_comments=True with echo_comments=True, echo comments are
             directly removed instead of being flagged.
             """
+            from ..config_loader import daemon_enabled
             from ..daemon.client import try_daemon_flag
             from ..daemon.protocol import FlagParams
             from ..cache import CacheManager
@@ -1212,7 +1213,9 @@ def register_flag_tools(mcp, disabled_tools: set[str] | None = None) -> None:
                 remove_comments=remove_comments,
             )
 
-            daemon_result = try_daemon_flag(params)
+            daemon_result = None
+            if daemon_enabled():
+                daemon_result = try_daemon_flag(params)
             if daemon_result is not None:
                 return daemon_result
 
@@ -1240,6 +1243,7 @@ def register_flag_tools(mcp, disabled_tools: set[str] | None = None) -> None:
             Scans all source files in the directory and removes any lines
             containing the [CODEN] marker, cleaning up flags from previous runs.
             """
+            from ..config_loader import daemon_enabled
             from ..daemon.client import try_daemon_flag_clear
             from ..daemon.protocol import FlagClearParams
             import asyncio
@@ -1250,7 +1254,9 @@ def register_flag_tools(mcp, disabled_tools: set[str] | None = None) -> None:
                 verbose=False,
             )
 
-            daemon_result = try_daemon_flag_clear(params)
+            daemon_result = None
+            if daemon_enabled():
+                daemon_result = try_daemon_flag_clear(params)
             if daemon_result is not None:
                 return daemon_result
 

@@ -5,6 +5,7 @@ Priority: CLI args > config file > environment variables > hardcoded defaults
 
 Configuration is stored at ~/.coden-retriever/settings.json
 """
+import argparse
 import json
 import logging
 import os
@@ -168,6 +169,15 @@ SETTING_METADATA: dict[str, SettingMeta] = {
         "Maximum number of projects to keep in daemon cache",
         "int",
     ),
+    "auto_start": SettingMeta(
+        "auto_start",
+        "Auto-start the daemon on first use",
+        "When false, CLI and MCP surfaces skip the daemon and run in-process. "
+        "Useful for debugging, eval/benchmark runs, or keeping a deterministic "
+        "cold path (default: true).",
+        "bool",
+        "CODEN_RETRIEVER_DAEMON_AUTO_START",
+    ),
     "default_tokens": SettingMeta(
         "default_tokens",
         "Default token budget",
@@ -218,6 +228,7 @@ SETTING_LOCATIONS: dict[str, tuple[str, str, Optional[str]]] = {
     "port": ("daemon", "port", None),
     "daemon_timeout": ("daemon", "daemon_timeout", None),
     "max_projects": ("daemon", "max_projects", None),
+    "auto_start": ("daemon", "auto_start", None),
     "default_tokens": ("search", "default_tokens", None),
     "default_limit": ("search", "default_limit", None),
     "semantic_model_path": ("search", "semantic_model_path", None),
@@ -467,8 +478,30 @@ def get_config_dir() -> Path:
 
 
 def get_config_file() -> Path:
-    """Get the path to the settings.json file."""
+    """Get the path to the active config file.
+
+    Returns the override set by set_config_file() when active, else the
+    default ~/.coden-retriever/settings.json.
+    """
+    if _active_config_file is not None:
+        return _active_config_file
     return get_config_dir() / "settings.json"
+
+
+def set_config_file(path: Optional[Path]) -> None:
+    """Override the active config file path for this process.
+
+    Passing None clears the override. Clears the cached config so the next
+    get_config() reloads from disk against the new target.
+    """
+    global _active_config_file, _cached_config
+    _active_config_file = path
+    _cached_config = None
+
+
+def has_config_override() -> bool:
+    """True iff set_config_file() established an explicit override."""
+    return _active_config_file is not None
 
 
 @dataclass
@@ -530,6 +563,7 @@ class DaemonConfig:
     port: int = DEFAULT_DAEMON_PORT
     daemon_timeout: float = DEFAULT_DAEMON_TIMEOUT
     max_projects: int = DEFAULT_MAX_PROJECTS
+    auto_start: bool = True
 
     @property
     def address(self) -> "DaemonAddress":
@@ -725,12 +759,26 @@ def load_config() -> AppConfig:
 
     Priority: environment variables > config file > hardcoded defaults
 
+    When an explicit override is active (set_config_file was called),
+    a missing or unreadable file raises rather than silently falling back
+    to defaults — the user named that file, so honoring it is load-bearing.
+
     Returns:
         AppConfig object with all settings.
+
+    Raises:
+        FileNotFoundError: override active and file missing.
+        OSError / json.JSONDecodeError: override active and file unreadable.
     """
     config_file = get_config_file()
+    strict = has_config_override()
 
     if not config_file.exists():
+        if strict:
+            raise FileNotFoundError(
+                f"Config file not found: {config_file}. "
+                f"Create it with: coden config new {config_file}"
+            )
         config = AppConfig()
         _apply_env_overrides(config)
         return config
@@ -746,25 +794,30 @@ def load_config() -> AppConfig:
         return config
 
     except (json.JSONDecodeError, OSError) as e:
+        if strict:
+            raise
         logger.warning(f"Could not load config: {e}, using defaults")
         config = AppConfig()
         _apply_env_overrides(config)
         return config
 
 
-def save_config(config: AppConfig) -> bool:
+def save_config(config: AppConfig, path: Optional[Path] = None) -> bool:
     """Save configuration to disk.
 
     Args:
         config: The configuration to save.
+        path: Optional explicit target path. When None, writes to the active
+            config file (default or override). Used by `coden config new` to
+            seed a fresh file without disturbing the active override.
 
     Returns:
         True if save was successful, False otherwise.
     """
-    config_file = get_config_file()
+    target = path if path is not None else get_config_file()
 
     try:
-        with open(config_file, "w", encoding="utf-8") as f:
+        with open(target, "w", encoding="utf-8") as f:
             json.dump(_config_to_dict(config), f, indent=2)
         return True
     except OSError as e:
@@ -778,12 +831,16 @@ def get_default_config() -> AppConfig:
 
 
 def reset_config() -> bool:
-    """Reset configuration to defaults by removing the config file.
+    """Reset configuration to defaults by removing the default config file.
+
+    Always targets ~/.coden-retriever/settings.json — never the override
+    set by set_config_file(). A future in-process /reset slash command
+    must not be able to delete a user's custom config.
 
     Returns:
         True if reset was successful or file didn't exist, False otherwise.
     """
-    config_file = get_config_file()
+    config_file = get_config_dir() / "settings.json"
 
     if not config_file.exists():
         return True
@@ -798,6 +855,11 @@ def reset_config() -> bool:
 
 # Singleton instance for caching
 _cached_config: Optional[AppConfig] = None
+
+# Override target for `coden -a --config <path>`. When set, get_config_file()
+# returns this instead of the default ~/.coden-retriever/settings.json, and
+# load_config() runs in strict mode (no silent fallback to defaults).
+_active_config_file: Optional[Path] = None
 
 
 def get_config() -> AppConfig:
@@ -816,6 +878,21 @@ def reload_config() -> AppConfig:
     global _cached_config
     _cached_config = load_config()
     return _cached_config
+
+
+def daemon_enabled(args: Optional[argparse.Namespace] = None) -> bool:
+    """Return True if the daemon should be attempted for this invocation.
+
+    Precedence: `args.no_daemon` (CLI flag) > env CODEN_RETRIEVER_DAEMON_AUTO_START
+    > config daemon.auto_start > default (True).
+
+    CLI handlers pass the argparse Namespace; MCP callers omit it.
+    The env var is folded into `get_config()` via `_apply_env_overrides`;
+    this helper does not re-read it.
+    """
+    if args is not None and args.no_daemon:
+        return False
+    return get_config().daemon.auto_start
 
 
 def get_semantic_model_path() -> str:

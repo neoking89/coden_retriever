@@ -7,6 +7,7 @@ import traceback
 from pathlib import Path
 
 from ...cli_metrics_contract import apply_defensive_limit, print_metric_output
+from ...config_loader import daemon_enabled
 from ...daemon.client import try_daemon_hotspots
 from ...daemon.protocol import GraphAnalysisParams
 from ...formatters.hotspots_formatter import (
@@ -44,7 +45,9 @@ def handle_hotspots_command(args: argparse.Namespace, root_path: Path, config) -
         exclude_private=False,
     )
 
-    daemon_result = try_daemon_hotspots(params, address=config.daemon.address)
+    daemon_result = None
+    if daemon_enabled(args):
+        daemon_result = try_daemon_hotspots(params, address=config.daemon.address)
 
     if daemon_result is not None:
         return _process_hotspots_result(daemon_result, args, start_time, "Daemon")

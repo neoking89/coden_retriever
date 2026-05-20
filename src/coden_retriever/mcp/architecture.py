@@ -8,7 +8,6 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
-from ..architecture import render_text, run_audit
 from ..architecture.core.constants import TOP_FINDINGS_DEFAULT
 from ..architecture.core.messages import (
     is_unsupported_language_message,
@@ -74,6 +73,8 @@ async def architecture(
     if validation_error:
         return validation_error
 
+    from ..architecture import run_audit
+
     excludes_tuple = tuple(part.strip() for part in excludes.split(",") if part.strip())
     root = Path(root_directory).resolve()
 
@@ -100,6 +101,7 @@ async def architecture(
 
 def _report_to_dict(report: Any) -> dict[str, Any]:
     """Mirror `render_json`'s field shape, plus a `text_report` for human display."""
+    from ..architecture import render_text
     return {
         "stats": {
             "language": report.language,

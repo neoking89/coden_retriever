@@ -7,6 +7,7 @@ import traceback
 from pathlib import Path
 
 from ...cli_metrics_contract import print_metric_output
+from ...config_loader import daemon_enabled
 from ...daemon.client import try_daemon_propagation_cost
 from ...daemon.protocol import PropagationCostParams
 from ...formatters import PropagationFormatter
@@ -57,7 +58,9 @@ def handle_propagation_command(args: argparse.Namespace, root_path: Path, config
         approximate=args.approximate,
     )
 
-    daemon_result = try_daemon_propagation_cost(params, address=config.daemon.address)
+    daemon_result = None
+    if daemon_enabled(args):
+        daemon_result = try_daemon_propagation_cost(params, address=config.daemon.address)
 
     if daemon_result is not None:
         if "error" in daemon_result:

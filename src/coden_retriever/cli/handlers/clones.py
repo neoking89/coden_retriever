@@ -13,6 +13,7 @@ from ...constants import (
     DEFAULT_SYNTACTIC_FUNC_THRESHOLD,
     DEFAULT_SYNTACTIC_LINE_THRESHOLD,
 )
+from ...config_loader import daemon_enabled
 from ...daemon.client import try_daemon_clones
 from ...daemon.protocol import CloneDetectionParams
 from ...formatters import CloneFormatter
@@ -65,11 +66,13 @@ def handle_clones_command(args: argparse.Namespace, root_path: Path, config) -> 
         syntactic_weight=syntactic_weight,
     )
 
-    daemon_result = try_daemon_clones(
-        params, address=config.daemon.address,
-        timeout=max(config.daemon.daemon_timeout, _MIN_CLONE_TIMEOUT),
-        auto_start=False,
-    )
+    daemon_result = None
+    if daemon_enabled(args):
+        daemon_result = try_daemon_clones(
+            params, address=config.daemon.address,
+            timeout=max(config.daemon.daemon_timeout, _MIN_CLONE_TIMEOUT),
+            auto_start=False,
+        )
 
     if daemon_result is not None:
         if "error" in daemon_result:

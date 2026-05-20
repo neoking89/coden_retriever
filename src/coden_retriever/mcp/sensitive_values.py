@@ -19,11 +19,6 @@ from ..constants import (
 )
 from .validation import validate_root_directory
 
-# Pre-import classifier (and its sklearn dependency) at module level.
-# On Windows, first importing sklearn DLLs inside asyncio.to_thread
-# causes a deadlock in the MCP subprocess.
-from ..sensitive_values import classifier  # noqa: F401
-
 logger = logging.getLogger(__name__)
 
 
@@ -74,6 +69,13 @@ async def detect_sensitive_values_tool(
     """Detect hardcoded sensitive values (secrets, credentials, API keys) in source code."""
     if err := validate_root_directory(root_directory):
         return err
+
+    # Prewarm the classifier on the main event loop. On Windows, first
+    # sklearn DLL load inside asyncio.to_thread deadlocks the MCP subprocess.
+    # Subsequent calls short-circuit at _ensure_trained's `_model is not None`
+    # check, so the only cost is on the first invocation.
+    from ..sensitive_values import classifier
+    classifier.ensure_trained()
 
     return await asyncio.to_thread(
         _load_and_detect,
