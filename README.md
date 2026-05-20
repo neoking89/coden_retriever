@@ -299,7 +299,6 @@ coden config set model.generation.temperature 0.5
 coden config set model.generation.api_key sk-...
 coden config set agent.max_steps 20
 coden config set agent.debug true
-coden config set agent.tool_timeout 120
 coden config set daemon.port 8080
 coden config set search.default_tokens 8000
 coden config set search.default_limit 50
@@ -314,8 +313,7 @@ coden config set search.default_limit 50
 | `CODEN_RETRIEVER_DAEMON_PORT` / `_HOST` | Daemon address |
 | `CODEN_RETRIEVER_DAEMON_AUTO_START` | `false` / `0` / `no` disables the daemon for CLI and MCP; the in-process direct path is used instead. Default `true`. |
 | `CODEN_RETRIEVER_MODEL_PATH` | Semantic model path |
-| `CODEN_RETRIEVER_MCP_TIMEOUT` | MCP server connection timeout (seconds) |
-| `CODEN_RETRIEVER_TOOL_TIMEOUT` | Per-call timeout for MCP tools (seconds); default `120`. Applies globally to all tools (built-in and dynamic). |
+| `CODEN_RETRIEVER_MCP_TIMEOUT` | MCP timeout |
 | `CODEN_RETRIEVER_ENABLE_DYNAMIC_TOOLS` | Enable dynamic tools (`1`, `true`, `yes`) |
 | `CODEN_RETRIEVER_DISABLED_TOOLS` | Comma-separated tool names |
 | `CODEN_RETRIEVER_TEMPERATURE` / `_MAX_TOKENS` / `_TIMEOUT` | Generation knobs |

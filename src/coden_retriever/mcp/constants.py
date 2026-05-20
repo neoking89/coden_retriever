@@ -11,55 +11,39 @@ logger = logging.getLogger(__name__)
 # Server name
 SERVER_NAME_FULL = "CodenRetriever"
 
-# Global per-call timeout applied to EVERY MCP tool (built-in + dynamic).
-# 120 s — generous enough that a legitimately slow whole-repo built-in
-# (dead-code / graph / propagation analysis on a large repo) completes, while
-# still bounding an obviously-wedged tool within a normal conversation turn.
-DEFAULT_TOOL_TIMEOUT_S: float = 120.0
+# Default per-tool timeout for dynamic tools.
+# 30 s — long enough for legitimate shell calls and HTTP fetches, short enough
+# that an obviously-wedged tool surfaces within a normal conversation turn
+# instead of hanging the agent indefinitely.
+DEFAULT_DYNAMIC_TOOL_TIMEOUT_S: float = 30.0
 
 # Env var name follows the existing CODEN_RETRIEVER_DISABLED_TOOLS convention.
-TOOL_TIMEOUT_ENV_VAR: str = "CODEN_RETRIEVER_TOOL_TIMEOUT"
-
-# pydantic-ai MCPServerStdio per-call ceiling (`read_timeout` default, mcp.py:314).
-# Our structured timeout payload only reaches the agent if the tool timeout
-# fires BEFORE this client-side transport timeout — i.e. the load-bearing
-# invariant is `get_tool_timeout() < MCP_CLIENT_READ_TIMEOUT_S`.
-MCP_CLIENT_READ_TIMEOUT_S: float = 300.0
+DYNAMIC_TOOL_TIMEOUT_ENV_VAR: str = "CODEN_DYNAMIC_TOOL_TIMEOUT_S"
 
 
-def get_tool_timeout() -> float:
-    """Read the global tool timeout from env, falling back to the default.
+def get_dynamic_tool_timeout() -> float:
+    """Read the dynamic-tool timeout from env, falling back to the default.
 
     Invalid or non-positive values fall back to the default (with a warning)
     so a typo in the environment can never silently disable the timeout layer.
-    A value at/above the client read-timeout ceiling is honored but warned
-    about, since the transport would time out first and the structured error
-    would never surface.
     """
-    raw = os.environ.get(TOOL_TIMEOUT_ENV_VAR)
+    raw = os.environ.get(DYNAMIC_TOOL_TIMEOUT_ENV_VAR)
     if raw is None or raw == "":
-        return DEFAULT_TOOL_TIMEOUT_S
+        return DEFAULT_DYNAMIC_TOOL_TIMEOUT_S
     try:
         value = float(raw)
     except ValueError:
         logger.warning(
             "Invalid %s=%r; falling back to %.1fs.",
-            TOOL_TIMEOUT_ENV_VAR, raw, DEFAULT_TOOL_TIMEOUT_S,
+            DYNAMIC_TOOL_TIMEOUT_ENV_VAR, raw, DEFAULT_DYNAMIC_TOOL_TIMEOUT_S,
         )
-        return DEFAULT_TOOL_TIMEOUT_S
+        return DEFAULT_DYNAMIC_TOOL_TIMEOUT_S
     if value <= 0:
         logger.warning(
             "Non-positive %s=%r; falling back to %.1fs.",
-            TOOL_TIMEOUT_ENV_VAR, raw, DEFAULT_TOOL_TIMEOUT_S,
+            DYNAMIC_TOOL_TIMEOUT_ENV_VAR, raw, DEFAULT_DYNAMIC_TOOL_TIMEOUT_S,
         )
-        return DEFAULT_TOOL_TIMEOUT_S
-    if value >= MCP_CLIENT_READ_TIMEOUT_S:
-        logger.warning(
-            "%s=%r is at/above the MCP client read-timeout ceiling (%.1fs); "
-            "the transport will time out first and the structured tool-timeout "
-            "error will not surface.",
-            TOOL_TIMEOUT_ENV_VAR, raw, MCP_CLIENT_READ_TIMEOUT_S,
-        )
+        return DEFAULT_DYNAMIC_TOOL_TIMEOUT_S
     return value
 
 # Note: the server "instructions" string is user-configurable. The default lives

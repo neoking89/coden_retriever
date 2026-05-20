@@ -10,7 +10,7 @@ from fastmcp import FastMCP
 
 from ..config_loader import get_config, resolve_or_default
 from ..constants import DEFAULT_FULL_SERVER_INSTRUCTIONS_TEMPLATE
-from .constants import SERVER_NAME_FULL, _is_dynamic_tools_enabled, get_tool_timeout
+from .constants import SERVER_NAME_FULL, _is_dynamic_tools_enabled
 from .server_factory import create_mcp_server_with_config
 
 
@@ -77,5 +77,4 @@ def create_mcp_server() -> FastMCP:
             "full_server_instructions_template",
         ),
         register_functions=register_functions,
-        tool_timeout=get_tool_timeout(),
     )

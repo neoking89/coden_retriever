@@ -36,7 +36,6 @@ from .constants import (
     DEFAULT_TOOL_ROUTER_PROMPT_TEMPLATE,
     FILE_PATH_PREFIX,
 )
-from .mcp.constants import DEFAULT_TOOL_TIMEOUT_S
 
 logger = logging.getLogger(__name__)
 
@@ -541,7 +540,6 @@ class AgentConfig:
     debug: bool = False
     disabled_tools: list[str] = field(default_factory=lambda: DEFAULT_DISABLED_TOOLS.copy())
     mcp_server_timeout: float = 30.0
-    tool_timeout: float = DEFAULT_TOOL_TIMEOUT_S
     tool_instructions: bool = False
     ask_tool_permission: bool = True
     dynamic_tool_filtering: bool = False
@@ -700,9 +698,6 @@ def _dict_to_config(data: dict[str, Any]) -> AppConfig:
         if "mcp_server_timeout" in agent_data:
             config.agent.mcp_server_timeout = agent_data["mcp_server_timeout"]
 
-        if "tool_timeout" in agent_data:
-            config.agent.tool_timeout = float(agent_data["tool_timeout"])
-
         # starter_questions: None/missing means use defaults, list overrides
         saved_questions = agent_data.get("starter_questions")
         if saved_questions is not None and isinstance(saved_questions, list):
@@ -757,12 +752,6 @@ def _apply_env_overrides(config: AppConfig) -> None:
             config.agent.mcp_server_timeout = float(env_mcp_timeout)
         except ValueError:
             logger.warning(f"Invalid CODEN_RETRIEVER_MCP_TIMEOUT: {env_mcp_timeout}")
-
-    if env_tool_timeout := os.environ.get("CODEN_RETRIEVER_TOOL_TIMEOUT"):
-        try:
-            config.agent.tool_timeout = float(env_tool_timeout)
-        except ValueError:
-            logger.warning(f"Invalid CODEN_RETRIEVER_TOOL_TIMEOUT: {env_tool_timeout}")
 
 
 def load_config() -> AppConfig:
