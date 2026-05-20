@@ -242,10 +242,30 @@ def fresh_venv_smoke(version: str) -> None:
             cli = venv_dir / "bin" / "coden"
 
         print(f">>> pip install {PACKAGE}=={version}")
-        subprocess.run(
-            [str(py), "-m", "pip", "install", "--quiet", f"{PACKAGE}=={version}"],
-            check=True,
-        )
+        # PyPI's simple index is fronted by a multi-edge CDN (Fastly). Our Step 9
+        # poll can see the new version on one edge while pip's request lands on a
+        # still-stale edge, yielding "No matching distribution found". Retry with
+        # backoff and --no-cache-dir (the pip HTTP cache is shared across venvs and
+        # can also serve a stale listing) so transient edge lag doesn't fail release.
+        attempts = 6
+        for i in range(1, attempts + 1):
+            r = subprocess.run(
+                [str(py), "-m", "pip", "install", "--no-cache-dir", "--quiet",
+                 f"{PACKAGE}=={version}"],
+            )
+            if r.returncode == 0:
+                if i > 1:
+                    print(f"    pip install succeeded on attempt {i}")
+                break
+            if i == attempts:
+                raise RuntimeError(
+                    f"pip install {PACKAGE}=={version} failed after {attempts} attempts "
+                    f"(CDN edge likely still stale); the version IS uploaded — re-run "
+                    f"with --force --skip-sync once propagation completes, or finish manually."
+                )
+            wait = 15 * i  # 15, 30, 45, 60, 75s — ~3.75 min total headroom
+            print(f"    attempt {i}/{attempts} failed (stale CDN edge?); retrying in {wait}s")
+            time.sleep(wait)
 
         check_version = subprocess.run(
             [str(py), "-c",
