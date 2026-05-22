@@ -1,3 +1,80 @@
+# Release Notes - Version 2.3.2
+
+**Release Date:** May 20, 2026
+
+## New Features
+
+- **Non-interactive agent mode (`-a -p` / `--print`)**: Run a single prompt against the agent, stream the answer, then exit — no interactive session.
+  - `coden -a -p "summarize the auth flow"` — answer one prompt and quit
+  - `echo "what does parse_args do?" | coden -a -p` — read the prompt from stdin when `-p` is given no value
+  - Model/base-URL/MCP-timeout overrides apply for the run but are **not** persisted, so scripted one-shots never rewrite your config.
+
+## Improvements
+
+- MCP tools now run under a timeout so a slow or hung tool fails cleanly instead of stalling the server. The implementation was consolidated into the dynamic-tool layer in 2.3.2 (2.3.1 was a packaging-only bump).
+- Streaming responses in the agent and over the MCP server were reworked for steadier incremental output.
+
+---
+
+# Release Notes - Version 2.2.0
+
+**Release Date:** May 20, 2026
+
+## New Features
+
+- **`--no-daemon` flag**: Skip the background daemon for a single invocation and run in-process via the direct path. Available on search, `flag`, `flag --clear`, and `agent`.
+  - `coden /path -s --no-daemon`
+- **`coden config new <path>`**: Write a fresh defaults config JSON to a chosen location, then point any command at it.
+  - `coden config new ./settings.json` — refuses to overwrite an existing file or write into a missing parent directory
+  - `coden -a --config ./settings.json` — run the agent with a custom config file (`--config PATH` added to the agent command)
+
+## Improvements
+
+- Config loading and per-command error handling were unified across all CLI handlers and MCP tools for more consistent messages and exit behavior.
+
+---
+
+# Release Notes - Version 2.1.1
+
+**Release Date:** May 18, 2026
+
+## Bug Fixes
+
+- Fixes to the PHP architecture adapter and search help text.
+
+---
+
+# Release Notes - Version 2.1.0
+
+**Release Date:** May 18, 2026
+
+## New Features
+
+- **Architecture audit (`coden architecture <path>`)**: A new read-only subcommand that audits a codebase for architectural drift:
+  - **Cycles** between packages (and the in-function "workaround" imports used to break them)
+  - **Kitchen-sink packages** — oversized, high-fan-out modules doing too much
+  - **Oversized files**, **shallow packages**, and **imports moved inside functions**
+  - `--top N` to cap rows per section, `--exclude` for extra directories to skip, `--lang` to force an adapter, `--json` for machine-readable output, `-v` for verbose logging
+  - Exits `1` when import cycles are found, so it can gate CI
+  - Language adapters: Python, JavaScript, TypeScript, Java, Kotlin, Scala, Go, Rust, PHP, C#, plus an npm package-graph adapter (auto-detected, with a stub fallback for unsupported languages)
+- **Architecture over MCP**: the same audit is exposed as an `architecture` tool via `coden serve`.
+
+## Improvements
+
+- Tree-sitter parsing and the source walker were extended to feed the multi-language architecture adapters.
+
+---
+
+# Release Notes - Version 2.0.1
+
+**Release Date:** May 11, 2026
+
+## Improvements
+
+- Search command help-text wording corrections. No behavior changes.
+
+---
+
 # Release Notes - Version 2.0.0
 
 **Release Date:** May 11, 2026
