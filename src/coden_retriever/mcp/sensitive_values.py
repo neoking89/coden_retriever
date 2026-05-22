@@ -12,11 +12,14 @@ from pydantic import Field
 if TYPE_CHECKING:
     from fastmcp import FastMCP
 
+from ..config_loader import daemon_enabled
 from ..constants import (
     SENSITIVE_VALUE_DEFAULT_LIMIT,
     SENSITIVE_VALUE_DEFAULT_THRESHOLD,
     SENSITIVE_VALUE_MAX_RESULTS,
 )
+from ..daemon.client import try_daemon_sensitive_values
+from ..daemon.protocol import SensitiveValueParams
 from .validation import validate_root_directory
 
 logger = logging.getLogger(__name__)
@@ -70,10 +73,28 @@ async def detect_sensitive_values_tool(
     if err := validate_root_directory(root_directory):
         return err
 
-    # Prewarm the classifier on the main event loop. On Windows, first
-    # sklearn DLL load inside asyncio.to_thread deadlocks the MCP subprocess.
-    # Subsequent calls short-circuit at _ensure_trained's `_model is not None`
-    # check, so the only cost is on the first invocation.
+    # Try the daemon first: it keeps the index + classifier warm across calls,
+    # avoiding the cold cache rebuild + first-call classifier training that
+    # otherwise pushes large repos past the client read-timeout.
+    if daemon_enabled():
+        daemon_result = try_daemon_sensitive_values(
+            SensitiveValueParams(
+                source_dir=str(Path(root_directory).resolve()),
+                confidence_threshold=confidence_threshold,
+                limit=limit,
+                exclude_tests=exclude_tests,
+                replace_value=replace_value,
+                whitelist=whitelist,
+            ),
+            auto_start=False,
+        )
+        if daemon_result is not None:
+            return daemon_result
+
+    # In-process fallback. Prewarm the classifier on the main event loop. On
+    # Windows, first sklearn DLL load inside asyncio.to_thread deadlocks the
+    # MCP subprocess. Subsequent calls short-circuit at _ensure_trained's
+    # `_model is not None` check, so the only cost is on the first invocation.
     from ..sensitive_values import classifier
     classifier.ensure_trained()
 

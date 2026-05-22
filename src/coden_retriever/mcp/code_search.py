@@ -326,6 +326,10 @@ async def code_map(
     if err := validate_root_directory(root_directory):
         return err
 
+    # fastmcp >=3 passes enum-typed params as bare strings, so coerce to a
+    # MapMode member before any `.value`/strategy access downstream.
+    map_mode = MapMode(map_mode)
+
     try:
         # Try daemon first for fast sub-200ms response
         params = SearchParams(
