@@ -1,3 +1,14 @@
+# Release Notes - Version 2.4.0
+
+**Release Date:** May 22, 2026
+
+## Improvements
+
+- The agent's `edit_file` tool now uses exact-substring editing — literal `old_string`/`new_string` with `replace_all`, replacing the SEARCH/REPLACE + SYMBOL protocol. Matches must be unique unless `replace_all` is set, and edits are tolerant of CRLF/LF differences — fewer corrupted files from smaller models.
+- Small bugfixes
+
+---
+
 # Release Notes - Version 2.3.2
 
 **Release Date:** May 20, 2026
@@ -11,7 +22,7 @@
 
 ## Improvements
 
-- MCP tools now run under a timeout so a slow or hung tool fails cleanly instead of stalling the server. The implementation was consolidated into the dynamic-tool layer in 2.3.2 (2.3.1 was a packaging-only bump).
+- MCP tools now have an additional global timeout configiuration.
 - Streaming responses in the agent and over the MCP server were reworked for steadier incremental output.
 
 ---
