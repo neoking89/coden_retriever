@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Annotated, Any
 from pydantic import Field
 
 from ..constants import DEFAULT_DEAD_CODE_CONFIDENCE_THRESHOLD, DEFAULT_DEAD_CODE_RESULT_LIMIT
+from .tool_timeout import worker_safe
 from .validation import validate_root_directory
 
 if TYPE_CHECKING:
@@ -51,6 +52,7 @@ def _load_and_detect(
     )
 
 
+@worker_safe
 async def detect_dead_code(
     root_directory: Annotated[str, Field(description="Project root directory")],
     confidence_threshold: Annotated[

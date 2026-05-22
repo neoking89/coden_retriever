@@ -1,10 +1,9 @@
 """
 File Editing MCP Tools module.
 
-Provides high-fidelity file manipulation tools following the Autonomous File Manipulation
-Protocol (AFMP) for surgical code modifications. Implements:
+Provides high-fidelity file manipulation tools for surgical code modifications. Implements:
 - write_file: Create or overwrite files with absolute path resolution
-- edit_file: SEARCH/REPLACE or SYMBOL-based surgical editing (Cline/RooCode + Windsurf style)
+- edit_file: Exact old_string -> new_string replacement (structured fields, no diff syntax)
 - delete_file: Remove files with read-before-delete verification
 - undo_file_change: Revert the last change to a file (one-step undo per file)
 
@@ -21,26 +20,21 @@ Architecture Note:
     - FileCache: Thread-safe LRU cache for tracking read files
     - PathPermissions: Path boundary checking and permission management
     - UndoManager: One-step undo buffer management
-    - PatternMatcher: Regex pattern matching for SEARCH/REPLACE blocks
 """
 import asyncio
 import difflib
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any
+from typing import Annotated, Any
 
 from pydantic import Field
 
 from .file_edit_core import (
     get_file_cache,
     get_path_permissions,
-    get_pattern_matcher,
     get_undo_manager,
 )
-
-if TYPE_CHECKING:
-    from ..models import CodeEntity
 
 logger = logging.getLogger(__name__)
 
@@ -167,105 +161,6 @@ def was_file_read(file_path: str) -> bool:
     return get_file_cache().was_read(file_path)
 
 
-def _find_symbol_in_file(
-    file_path: str,
-    symbol_name: str,
-    source_code: str,
-) -> tuple["CodeEntity | None", list[str]]:
-    """Find a symbol (function, class, method) in a file using Tree-sitter AST.
-
-    Args:
-        file_path: Absolute path to the file.
-        symbol_name: Symbol to find. Can be:
-            - "function_name" for top-level functions
-            - "ClassName" for classes
-            - "ClassName.method_name" for methods within a class
-        source_code: The source code content to parse.
-
-    Returns:
-        Tuple of (matched_entity, available_symbols).
-        If no match, entity is None and available_symbols lists what's available.
-    """
-    try:
-        from ..parsers.tree_sitter_parser import RepoParser
-    except ImportError:
-        logger.warning("Tree-sitter parser not available for symbol lookup")
-        return None, []
-
-    parser = RepoParser()
-    try:
-        entities, _, _ = parser.parse_file(file_path, source_code)
-    except Exception as e:
-        logger.warning(f"Tree-sitter parsing failed for {file_path}: {e}")
-        return None, []
-
-    if not entities:
-        return None, []
-
-    # Build list of available symbols for error messages
-    available: list[str] = []
-    for ent in entities:
-        if ent.parent_class:
-            available.append(f"{ent.parent_class}.{ent.name}")
-        else:
-            available.append(ent.name)
-
-    # Parse symbol_name for class.method pattern
-    if "." in symbol_name:
-        parts = symbol_name.split(".", 1)
-        if len(parts) == 2:
-            class_name, method_name = parts
-            for entity in entities:
-                if entity.name == method_name and entity.parent_class == class_name:
-                    return entity, available
-    else:
-        # Look for exact match (function or class)
-        for entity in entities:
-            if entity.name == symbol_name and entity.parent_class is None:
-                return entity, available
-
-    return None, available
-
-
-def _extract_symbol_source(
-    source_code: str,
-    entity: "CodeEntity",
-) -> str:
-    """Extract the full source code of a symbol from the file.
-
-    Args:
-        source_code: The full file content.
-        entity: The CodeEntity with line range information.
-
-    Returns:
-        The source code for just that symbol (from line_start to line_end).
-    """
-    lines = source_code.split('\n')
-    # line_start and line_end are 1-indexed
-    start_idx = entity.line_start - 1
-    end_idx = entity.line_end  # inclusive, so no -1 on end
-    return '\n'.join(lines[start_idx:end_idx])
-
-
-def _parse_edit_blocks(
-    diff_content: str,
-) -> list[tuple[int, str, str, str]]:
-    """Parse SEARCH/REPLACE and SYMBOL/REPLACE blocks from diff content.
-
-    Delegates to PatternMatcher class.
-
-    Args:
-        diff_content: The normalized diff content containing edit blocks.
-
-    Returns:
-        List of tuples: (position, block_type, search_content, replace_content)
-        Sorted by position in the original diff_content.
-    """
-    blocks = get_pattern_matcher().parse_edit_blocks(diff_content)
-    # Convert EditBlock objects to tuples for backwards compatibility
-    return [(b.position, b.block_type, b.search_content, b.replace_content) for b in blocks]
-
-
 def _find_closest_match(
     search_text: str,
     file_lines: list[str],
@@ -344,115 +239,69 @@ def _find_closest_match(
     return best_ratio, best_start
 
 
-def _resolve_symbol_blocks(
-    all_blocks: list[tuple[int, str, str, str]],
-    file_path: str,
-    file_content: str,
-) -> tuple[list[tuple[str, str, str]], dict[str, Any] | None]:
-    """Resolve SYMBOL blocks to their source code using Tree-sitter.
-
-    Args:
-        all_blocks: Parsed blocks from _parse_edit_blocks.
-        file_path: Absolute path to the file being edited.
-        file_content: The normalized file content.
-
-    Returns:
-        Tuple of (resolved_blocks, error_or_none).
-        resolved_blocks: List of (search_text, replace_text, block_type).
-        If error is not None, resolution failed.
-    """
-    resolved_blocks: list[tuple[str, str, str]] = []
-
-    for _, block_type, content, replace_text in all_blocks:
-        if block_type == 'symbol':
-            entity, available = _find_symbol_in_file(file_path, content, file_content)
-            if entity is None:
-                error_response: dict[str, Any] = {
-                    "error": f"Symbol '{content}' not found in file",
-                    "hint": "Use ClassName.method_name for methods, or just function_name for top-level functions.",
-                }
-                if available:
-                    error_response["available_symbols"] = available[:20]
-                else:
-                    error_response["hint"] = (
-                        "No symbols could be parsed from this file. "
-                        "Ensure the file has valid syntax and Tree-sitter support for this language."
-                    )
-                return [], error_response
-            search_text = _extract_symbol_source(file_content, entity)
-            resolved_blocks.append((search_text, replace_text, 'symbol'))
-        else:
-            resolved_blocks.append((content, replace_text, 'search'))
-
-    return resolved_blocks, None
+# A close-match similarity above this ratio is worth showing as a diff hint;
+# below it we fall back to listing lines that merely share the first line.
+_CLOSE_MATCH_RATIO = 0.5
+# Cap how many helper lines we put in an error so responses stay small.
+_MAX_HINT_LINES = 30
+_MAX_PARTIAL_MATCHES = 5
 
 
 def _build_no_match_error(
     search_text: str,
     file_lines: list[str],
-    block_type: str,
-    block_idx: int,
 ) -> dict[str, Any]:
-    """Build detailed error response when a search block doesn't match.
+    """Build a detailed error when `old_string` is not found in the file.
 
     Args:
         search_text: The text that failed to match.
         file_lines: The file content split into lines.
-        block_type: Either 'search' or 'symbol'.
-        block_idx: The 0-based index of the block.
 
     Returns:
-        Error dict with helpful debugging information.
+        Error dict with the closest match and a unified-diff hint to help the
+        caller correct its `old_string`.
     """
     search_lines = search_text.split('\n')
     search_len = len(search_lines)
-    block_label = "SYMBOL" if block_type == "symbol" else "SEARCH"
 
     error_msg: dict[str, Any] = {
-        "error": f"{block_label} block {block_idx + 1} not found - no exact match in file",
-        "block_type": block_type,
-        "search_block_preview": search_text[:300] + "..." if len(search_text) > 300 else search_text,
+        "error": "old_string not found - no exact match in file",
+        "old_string_preview": search_text[:300] + "..." if len(search_text) > 300 else search_text,
         "hint": (
-            "The resolved content must match character-for-character. "
+            "old_string must match the file character-for-character. "
             "Check whitespace, indentation, and invisible trailing spaces."
-            if block_type == "search" else
-            "The symbol was found but its source doesn't match the file. "
-            "The file may have been modified since it was read."
         ),
     }
 
-    # Find closest match for helpful error messages
     best_ratio, best_start = _find_closest_match(search_text, file_lines)
 
-    if best_ratio > 0.5:
-        # Show unified diff for reasonably close matches
+    if best_ratio > _CLOSE_MATCH_RATIO:
         closest_match = '\n'.join(file_lines[best_start:best_start + search_len])
         diff_lines = list(difflib.unified_diff(
             search_text.splitlines(keepends=True),
             closest_match.splitlines(keepends=True),
-            fromfile='your_search_block',
+            fromfile='your_old_string',
             tofile='actual_file_content',
             lineterm=''
         ))
         if diff_lines:
-            error_msg["diff_hint"] = ''.join(diff_lines[:30])
+            error_msg["diff_hint"] = ''.join(diff_lines[:_MAX_HINT_LINES])
             error_msg["match_location"] = f"Lines {best_start + 1}-{best_start + search_len}"
             error_msg["match_similarity"] = f"{best_ratio:.1%}"
         error_msg["suggestion"] = (
-            f"The diff above shows exactly where your {block_label} block "
-            "differs from the file. Re-read the file to get exact content."
+            "The diff above shows where your old_string differs from the file. "
+            "Re-read the file to get exact content."
         )
     else:
-        # Fall back to partial line matching for very low similarity
         first_line = search_lines[0].strip() if search_lines else ""
         partial_matches = []
         for i, line in enumerate(file_lines):
             if first_line and first_line in line:
                 partial_matches.append(f"Line {i+1}: {line[:100]}")
-                if len(partial_matches) >= 5:
+                if len(partial_matches) >= _MAX_PARTIAL_MATCHES:
                     break
         if partial_matches:
-            error_msg["possible_matches"] = partial_matches[:5]
+            error_msg["possible_matches"] = partial_matches
             error_msg["suggestion"] = (
                 "Found lines containing similar text. "
                 "Re-read the file to get exact content."
@@ -568,58 +417,8 @@ async def write_file(
     return await asyncio.to_thread(_write_sync)
 
 
-def _no_blocks_error(diff_content: str) -> dict[str, Any]:
-    """Build the error for a diff payload that contains no SEARCH/SYMBOL blocks."""
-    received = diff_content[:500] + "..." if len(diff_content) > 500 else diff_content
-    return {
-        "error": "No valid SEARCH/REPLACE or SYMBOL/REPLACE blocks found",
-        "hint": "Format must be:\n"
-               "<<<<<<< SEARCH\n[text]\n=======\n[replacement]\n>>>>>>> REPLACE\n"
-               "OR\n"
-               "<<<<<<< SYMBOL\n[symbol_name]\n=======\n[replacement]\n>>>>>>> REPLACE",
-        "received": received,
-    }
-
-
-def _apply_edit_blocks(
-    resolved_blocks: list[tuple[str, str, str]],
-    content: str,
-) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None]:
-    """Validate and apply each block atomically. Returns (new_content, change_log, error_or_none).
-
-    On error, returns the content as last successfully modified and the partial change log.
-    Callers MUST check the error slot before treating the new content as authoritative.
-    """
-    modified = content
-    applied: list[dict[str, Any]] = []
-    for idx, (search_text, replace_text, block_type) in enumerate(resolved_blocks):
-        if search_text not in modified:
-            return modified, applied, _build_no_match_error(
-                search_text, modified.split('\n'), block_type, idx
-            )
-        occurrences = modified.count(search_text)
-        if occurrences > 1:
-            block_label = "SYMBOL" if block_type == "symbol" else "SEARCH"
-            preview = search_text[:200] + "..." if len(search_text) > 200 else search_text
-            return modified, applied, {
-                "error": f"{block_label} block {idx + 1} is ambiguous - found {occurrences} matches",
-                "block_type": block_type,
-                "search_block_preview": preview,
-                "hint": "Expand the block to include more surrounding context "
-                        "to make it unique, or use multiple smaller edits."
-            }
-        match_start = modified.find(search_text)
-        line_number = modified[:match_start].count('\n') + 1
-        modified = modified.replace(search_text, replace_text, 1)
-        applied.append({
-            "block": idx + 1,
-            "block_type": block_type,
-            "line": line_number,
-            "search_preview": (search_text[:50] + "...") if len(search_text) > 50 else search_text,
-            "lines_removed": search_text.count('\n') + 1,
-            "lines_added": replace_text.count('\n') + 1,
-        })
-    return modified, applied, None
+# How much of old_string to echo back in an ambiguous-match error.
+_PREVIEW_CHARS = 200
 
 
 def _write_with_endings(
@@ -637,106 +436,81 @@ def _write_with_endings(
         f.write(out)
 
 
+def _ambiguous_match_error(search_text: str, occurrences: int) -> dict[str, Any]:
+    """Build the error when old_string matches more than once and replace_all is off."""
+    preview = (
+        search_text[:_PREVIEW_CHARS] + "..."
+        if len(search_text) > _PREVIEW_CHARS
+        else search_text
+    )
+    return {
+        "error": f"old_string is not unique - found {occurrences} matches",
+        "old_string_preview": preview,
+        "hint": "Add surrounding lines to old_string to make it match exactly once, "
+                "or pass replace_all=True to replace every occurrence.",
+    }
+
+
 async def edit_file(
     file_path: Annotated[
         str,
         Field(description="MUST be the absolute path to the file to edit")
     ],
-    diff_content: Annotated[
+    old_string: Annotated[
         str,
         Field(
-            description="One or more edit blocks. Two formats supported:\n\n"
-                       "TEXT-BASED (SEARCH/REPLACE):\n"
-                       "<<<<<<< SEARCH\n"
-                       "[exact content to find]\n"
-                       "=======\n"
-                       "[new content]\n"
-                       ">>>>>>> REPLACE\n\n"
-                       "AST-BASED (SYMBOL) - for functions/classes/methods:\n"
-                       "<<<<<<< SYMBOL\n"
-                       "[symbol_name or ClassName.method_name]\n"
-                       "=======\n"
-                       "[new content for entire symbol]\n"
-                       ">>>>>>> REPLACE"
+            description="The exact text to replace. Must match the file "
+                        "character-for-character, including whitespace and indentation. "
+                        "Include enough surrounding lines to be unique in the file."
         )
     ],
-    dry_run: Annotated[
+    new_string: Annotated[
+        str,
+        Field(description="The text to replace old_string with.")
+    ],
+    replace_all: Annotated[
         bool,
-        Field(description="If True, only validate the edit without applying changes")
+        Field(
+            description="Replace every occurrence. If False (default), old_string "
+                        "must occur exactly once."
+        )
     ] = False,
 ) -> dict[str, Any]:
-    """Apply surgical edits to a file using SEARCH/REPLACE or SYMBOL blocks.
+    """Replace an exact string in a file. This is the tool for changing existing files.
 
-    This is the precision editing tool following the Cline/RooCode protocol,
-    enhanced with Windsurf-style AST-aware symbol targeting.
+    Provide the literal text to find (`old_string`) and the literal text to put in
+    its place (`new_string`) - plain code, not a diff and not any kind of marker
+    syntax. The match is exact, so copy `old_string` straight from a prior read.
 
-    TWO EDITING MODES:
-
-    1. TEXT-BASED (SEARCH/REPLACE) - for exact text matching:
-    ```
-    <<<<<<< SEARCH
-    [exact content to find - must match character-for-character]
-    =======
-    [new content to replace with]
-    >>>>>>> REPLACE
-    ```
-
-    2. SYMBOL-BASED (AST-aware) - for replacing entire functions/classes/methods:
-    ```
-    <<<<<<< SYMBOL
-    function_name
-    =======
-    def function_name(new_args):
-        # entirely new implementation
-    >>>>>>> REPLACE
-    ```
-
-    For methods within a class, use "ClassName.method_name" notation.
-
-    WHEN TO USE TEXT-BASED:
-    - Making small, targeted changes within functions
-    - Changing specific lines or expressions
-    - When you need precise control over what gets replaced
-
-    WHEN TO USE SYMBOL-BASED:
-    - Replacing an entire function implementation
-    - Rewriting a method completely
-    - Moving/refactoring code at the function level
-    - When text matching is fragile due to whitespace/formatting
+    WHEN TO USE:
+    - Any targeted change to an existing file: a line, an expression, or a whole
+      function body.
 
     WHEN NOT TO USE:
-    - Creating entirely new files (use write_file instead)
-    - For wholesale file replacement (use write_file instead)
+    - Creating a new file or replacing a file wholesale (use write_file).
 
-    CRITICAL RULES:
-    1. For SEARCH: content must match EXACTLY - character-for-character
-    2. For SYMBOL: the symbol must exist and be unique
-    3. Each block must be UNIQUE in the file
-    4. You MUST read the file first to ensure your blocks match
-
-    MULTIPLE EDITS:
-    You can include multiple blocks (SEARCH or SYMBOL) in a single call.
-    They are applied in order. If any block fails, the entire operation fails
-    and no changes are made (atomic operation).
+    RULES:
+    1. old_string must match the file EXACTLY - character-for-character.
+    2. old_string must be unique unless replace_all=True; otherwise include more
+       surrounding lines so it matches exactly once.
+    3. You MUST read the file first so old_string reflects the current content.
 
     OUTPUT:
-    Returns success with number of changes applied, or detailed error if
-    a block fails to match.
+    Returns success with the number of replacements, or a detailed error (with the
+    closest near-match) if old_string is not found or is not unique.
     """
     abs_path, error = _validate_path_for_write(file_path)
     if error:
         return error
 
-    # Check file exists
     if not os.path.isfile(abs_path):
         return {"error": f"File not found: {abs_path}"}
 
-    # Enforce read-before-write requirement
     if not was_file_read(abs_path):
         return {
             "error": f"Read-before-write violation: You must read the file before editing it. "
                      f"Use read_source_range or similar to read '{abs_path}' first.",
-            "hint": "Reading the file first ensures your SEARCH blocks match the current "
+            "hint": "Reading the file first ensures old_string matches the current "
                     "file state and prevents editing stale content."
         }
 
@@ -746,49 +520,42 @@ async def edit_file(
             with open(abs_path, 'rb') as f:
                 raw_content = f.read()
             original_line_ending = '\r\n' if b'\r\n' in raw_content else '\n'
-            normalized_content = _normalize_line_endings(raw_content.decode('utf-8'))
+            content = _normalize_line_endings(raw_content.decode('utf-8'))
+            search = _normalize_line_endings(old_string)
+            replacement = _normalize_line_endings(new_string)
 
-            all_blocks = _parse_edit_blocks(_normalize_line_endings(diff_content))
-            if not all_blocks:
-                return _no_blocks_error(diff_content)
-
-            resolved_blocks, resolve_error = _resolve_symbol_blocks(
-                all_blocks, abs_path, normalized_content
-            )
-            if resolve_error:
-                return resolve_error
-
-            modified_content, applied_changes, apply_error = _apply_edit_blocks(
-                resolved_blocks, normalized_content
-            )
-            if apply_error:
-                return apply_error
-
-            if dry_run:
-                preview = (
-                    modified_content[:1000] + "..."
-                    if len(modified_content) > 1000
-                    else modified_content
-                )
+            if search == "":
                 return {
-                    "status": "dry_run",
-                    "message": f"Validation passed - {len(resolved_blocks)} change(s) would be applied",
-                    "file_path": abs_path,
-                    "changes": applied_changes,
-                    "preview": preview,
+                    "error": "old_string is empty.",
+                    "hint": "Use write_file to create a file or replace its whole content.",
                 }
 
-            # Save undo state AFTER validation passes so failed edits don't overwrite history
+            if search == replacement:
+                return {"error": "old_string and new_string are identical - nothing to change."}
+
+            occurrences = content.count(search)
+            if occurrences == 0:
+                return _build_no_match_error(search, content.split('\n'))
+            if occurrences > 1 and not replace_all:
+                return _ambiguous_match_error(search, occurrences)
+
+            match_start = content.find(search)
+            line_number = content[:match_start].count('\n') + 1
+            count = occurrences if replace_all else 1
+            new_content = content.replace(search, replacement, -1 if replace_all else 1)
+
+            # Save undo state only after validation passes so a failed edit can't
+            # overwrite the undo history.
             _save_for_undo(abs_path, was_new_file=False)
-            _write_with_endings(abs_path, modified_content, original_line_ending)
-            mark_file_as_read(abs_path, modified_content)
+            _write_with_endings(abs_path, new_content, original_line_ending)
+            mark_file_as_read(abs_path, new_content)
 
             return {
                 "status": "success",
-                "message": f"Applied {len(resolved_blocks)} change(s) to {abs_path}",
+                "message": f"Replaced {count} occurrence(s) in {abs_path}",
                 "file_path": abs_path,
-                "changes_applied": len(resolved_blocks),
-                "changes": applied_changes,
+                "replacements": count,
+                "line": line_number,
             }
 
         except PermissionError:

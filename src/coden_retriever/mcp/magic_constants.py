@@ -17,6 +17,7 @@ from ..constants import (
     MAGIC_CONSTANT_DEFAULT_RESULT_LIMIT,
     MAGIC_CONSTANT_MAX_RESULTS,
 )
+from .tool_timeout import worker_safe
 from .validation import validate_root_directory
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,7 @@ def _load_and_detect(
     )
 
 
+@worker_safe
 async def detect_magic_constants_tool(
     root_directory: Annotated[str, Field(description="Project root directory")],
     min_occurrences: Annotated[

@@ -15,6 +15,7 @@ from pydantic import Field
 from ..cache import CacheManager
 from ..constants import MAX_TOKEN_LIMIT, MIN_TOKEN_LIMIT
 from ._defaults import RESOLVED_DEFAULT_TOKEN_BUDGET
+from .tool_timeout import worker_safe
 from .validation import validate_root_directory
 from ..config import MapMode, OutputFormat
 from ..config_loader import daemon_enabled
@@ -185,6 +186,7 @@ async def _code_search_impl(
         return {"error": str(e)}
 
 
+@worker_safe
 async def code_search(
     root_directory: Annotated[
         str,
@@ -262,6 +264,7 @@ async def code_search(
     )
 
 
+@worker_safe
 async def code_map(
     root_directory: Annotated[
         str,
@@ -414,6 +417,7 @@ async def code_map(
         return {"error": str(e)}
 
 
+@worker_safe
 async def find_identifier(
     root_directory: Annotated[
         str,
@@ -665,6 +669,7 @@ async def get_python_package_path(
     return {"error": f"Package '{package_name}' not found."}
 
 
+@worker_safe
 async def trace_dependency_path(
     root_directory: Annotated[
         str,

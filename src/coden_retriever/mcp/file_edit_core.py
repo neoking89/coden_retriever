@@ -4,13 +4,11 @@ This module provides SOLID-compliant abstractions for:
 - FileCache: Thread-safe LRU cache for tracking read files
 - PathPermissions: Path boundary checking and permission management
 - UndoManager: One-step undo buffer management
-- PatternMatcher: Regex pattern matching for SEARCH/REPLACE blocks
 
 These classes follow the Single Responsibility Principle and can be tested independently.
 """
 import logging
 import os
-import re
 import threading
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -325,87 +323,10 @@ class UndoManager:
             self._buffer.clear()
 
 
-@dataclass
-class EditBlock:
-    """Represents a parsed edit block from diff content."""
-    position: int
-    block_type: str  # 'search' or 'symbol'
-    search_content: str
-    replace_content: str
-
-
-class PatternMatcher:
-    """Encapsulates regex pattern matching for SEARCH/REPLACE blocks.
-
-    Pre-compiles patterns at initialization for performance.
-    Supports both strict and flexible whitespace matching.
-
-    Follows Single Responsibility Principle: only handles pattern matching.
-    """
-
-    # Strict patterns
-    SEARCH_PATTERN = re.compile(
-        r'<<<<<<< SEARCH\n(.*?)\n?=======\n(.*?)\n?>>>>>>> REPLACE',
-        re.DOTALL
-    )
-    SYMBOL_PATTERN = re.compile(
-        r'<<<<<<< SYMBOL\n(.*?)\n?=======\n(.*?)\n?>>>>>>> REPLACE',
-        re.DOTALL
-    )
-
-    # Alternative patterns with more flexible whitespace
-    ALT_SEARCH_PATTERN = re.compile(
-        r'<{7}\s*SEARCH\s*\n(.*?)={7}\s*\n(.*?)>{7}\s*REPLACE',
-        re.DOTALL
-    )
-    ALT_SYMBOL_PATTERN = re.compile(
-        r'<{7}\s*SYMBOL\s*\n(.*?)={7}\s*\n(.*?)>{7}\s*REPLACE',
-        re.DOTALL
-    )
-
-    def parse_edit_blocks(self, diff_content: str) -> list[EditBlock]:
-        """Parse SEARCH/REPLACE and SYMBOL/REPLACE blocks from diff content.
-
-        Args:
-            diff_content: The normalized diff content containing edit blocks.
-
-        Returns:
-            List of EditBlock objects sorted by position in the original content.
-        """
-        # Parse both SEARCH and SYMBOL blocks using pre-compiled patterns
-        search_blocks = [
-            EditBlock(m.start(), 'search', m.group(1), m.group(2))
-            for m in self.SEARCH_PATTERN.finditer(diff_content)
-        ]
-        symbol_blocks = [
-            EditBlock(m.start(), 'symbol', m.group(1).strip(), m.group(2))
-            for m in self.SYMBOL_PATTERN.finditer(diff_content)
-        ]
-
-        # Combine and sort by position to maintain order
-        all_blocks = sorted(search_blocks + symbol_blocks, key=lambda x: x.position)
-
-        if not all_blocks:
-            # Try alternative patterns with more flexible whitespace
-            search_blocks = [
-                EditBlock(m.start(), 'search', m.group(1), m.group(2))
-                for m in self.ALT_SEARCH_PATTERN.finditer(diff_content)
-            ]
-            symbol_blocks = [
-                EditBlock(m.start(), 'symbol', m.group(1).strip(), m.group(2))
-                for m in self.ALT_SYMBOL_PATTERN.finditer(diff_content)
-            ]
-            all_blocks = sorted(search_blocks + symbol_blocks, key=lambda x: x.position)
-
-        return all_blocks
-
-
-# Singleton instances for backwards compatibility
-# These are used by the facade functions in file_edit.py
+# Singleton instances used by the facade functions in file_edit.py.
 _default_file_cache: FileCache | None = None
 _default_path_permissions: PathPermissions | None = None
 _default_undo_manager: UndoManager | None = None
-_default_pattern_matcher: PatternMatcher | None = None
 _init_lock = threading.Lock()
 
 
@@ -439,23 +360,12 @@ def get_undo_manager() -> UndoManager:
     return _default_undo_manager
 
 
-def get_pattern_matcher() -> PatternMatcher:
-    """Get the default PatternMatcher singleton instance."""
-    global _default_pattern_matcher
-    if _default_pattern_matcher is None:
-        with _init_lock:
-            if _default_pattern_matcher is None:
-                _default_pattern_matcher = PatternMatcher()
-    return _default_pattern_matcher
-
-
 # WHY KEPT: Not called in production, but every test in test_file_edit_core.py
 # depends on this via autouse fixture to isolate singleton state between tests.
 def reset_singletons() -> None:
     """Reset all singleton instances. Used by test fixtures to isolate state between test cases."""
-    global _default_file_cache, _default_path_permissions, _default_undo_manager, _default_pattern_matcher
+    global _default_file_cache, _default_path_permissions, _default_undo_manager
     with _init_lock:
         _default_file_cache = None
         _default_path_permissions = None
         _default_undo_manager = None
-        _default_pattern_matcher = None

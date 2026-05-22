@@ -25,6 +25,7 @@ from ._defaults import RESOLVED_DEFAULT_TOKEN_BUDGET
 from ..config_loader import daemon_enabled
 from ..daemon.client import try_daemon_graph_analysis as _daemon_graph_analysis
 from ..daemon.protocol import GraphAnalysisParams
+from .tool_timeout import worker_safe
 from .validation import validate_root_directory
 from ..graph_utils import (
     AUTO_MIN_IMPORTANCE,
@@ -70,6 +71,7 @@ async def _load_cached_indices(root_directory: str) -> "CachedIndices":
     return await asyncio.to_thread(_load_sync)
 
 
+@worker_safe
 async def change_impact_radius(
     root_directory: Annotated[
         str,
@@ -221,6 +223,7 @@ async def change_impact_radius(
     return result
 
 
+@worker_safe
 async def coupling_hotspots(
     root_directory: Annotated[
         str,
@@ -307,6 +310,7 @@ async def coupling_hotspots(
     )
 
 
+@worker_safe
 async def architectural_bottlenecks(
     root_directory: Annotated[
         str,

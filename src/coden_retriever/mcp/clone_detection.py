@@ -37,6 +37,7 @@ from ..clone import (
 from ..config_loader import get_semantic_model_path, daemon_enabled
 from ..daemon.client import try_daemon_clones as _daemon_clones
 from ..daemon.protocol import CloneDetectionParams
+from .tool_timeout import worker_safe
 from .validation import validate_root_directory
 
 if TYPE_CHECKING:
@@ -58,6 +59,7 @@ async def _load_cached_indices(
     return await asyncio.to_thread(_load_sync)
 
 
+@worker_safe
 async def detect_clones(
     root_directory: Annotated[
         str,

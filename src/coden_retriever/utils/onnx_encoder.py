@@ -98,21 +98,23 @@ def onnx_encode(
 ) -> np.ndarray:
     """Encode texts into L2-normalized embeddings using MiniLM ONNX.
 
-    When *on_batch_done* is provided and the input exceeds _ENCODE_BATCH_SIZE,
-    texts are split into mini-batches so the caller can report progress.
+    Texts are always processed in mini-batches of _ENCODE_BATCH_SIZE so peak memory
+    is bounded by the batch size, not the corpus size. A single session.run() over the
+    whole corpus allocates activation/attention tensors sized to N: measured ~10.9 MB of
+    commit per text at the 256-token padding, so a cold whole-repo run (~7k texts) wanted
+    ~77 GB and thrashed the box. Batching caps every session.run() at _ENCODE_BATCH_SIZE
+    regardless of N. *on_batch_done*, when given, fires once per mini-batch for progress.
     """
     model_dir = model_dir or _DEFAULT_MODEL_DIR
     session, tok = _get_onnx_resources(model_dir)
 
-    if on_batch_done is None or len(texts) <= _ENCODE_BATCH_SIZE:
-        result = _run_inference(texts, session, tok)
-        if on_batch_done:
-            on_batch_done(len(texts))
-        return result
+    if not texts:
+        return np.empty((0, EMBEDDING_DIM), dtype=np.float32)
 
     parts: list[np.ndarray] = []
     for i in range(0, len(texts), _ENCODE_BATCH_SIZE):
         batch = texts[i : i + _ENCODE_BATCH_SIZE]
         parts.append(_run_inference(batch, session, tok))
-        on_batch_done(len(batch))
+        if on_batch_done:
+            on_batch_done(len(batch))
     return np.vstack(parts)

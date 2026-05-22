@@ -708,6 +708,7 @@ async def _serve_mcp(disabled_tools: list[str] | None, config):
         disabled_tools=disabled_tools,
         timeout=config.agent.mcp_server_timeout,
         max_retries=config.agent.max_retries,
+        tool_timeout=config.agent.tool_timeout,
     )
 
     server_ready = asyncio.Event()

@@ -14,11 +14,13 @@ from ..architecture.core.messages import (
     parse_unsupported_language,
     supported_languages,
 )
+from .tool_timeout import worker_safe
 from .validation import validate_root_directory
 
 logger = logging.getLogger(__name__)
 
 
+@worker_safe
 async def architecture(
     root_directory: Annotated[
         str,

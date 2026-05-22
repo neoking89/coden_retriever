@@ -28,6 +28,7 @@ from ..constants import (
     MAX_TOKEN_LIMIT,
     MIN_TOKEN_LIMIT,
 )
+from .tool_timeout import worker_safe
 from .validation import validate_root_directory
 from ..language import LanguageLoader
 from ..cache.embedding_cache import encode_with_cache
@@ -484,6 +485,7 @@ async def _load_cached_indices(
     return await asyncio.to_thread(_load_sync)
 
 
+@worker_safe
 async def detect_echo_comments(
     root_directory: Annotated[
         str,

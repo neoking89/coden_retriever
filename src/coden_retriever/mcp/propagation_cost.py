@@ -33,6 +33,7 @@ from ..constants import (
     PC_THRESHOLD_WARNING,
 )
 from ._defaults import RESOLVED_DEFAULT_TOKEN_BUDGET
+from .tool_timeout import worker_safe
 from .validation import validate_root_directory
 from ..config_loader import daemon_enabled
 from ..daemon.client import try_daemon_propagation_cost as _daemon_propagation_cost
@@ -445,6 +446,7 @@ def compute_propagation_cost(
     return result
 
 
+@worker_safe
 async def propagation_cost(
     root_directory: Annotated[
         str,
